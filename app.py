@@ -163,8 +163,8 @@ if excluded:
 fnr=attach(fnr,base); mc=attach(mc,base); s=summary(base,fnr,mc)
 
 with st.sidebar:
-    pickers=["Todos"]+sorted(s.PICKER.astype(str).unique())
-    turns=["Todos"]+sorted(s.TURNO.astype(str).unique())
+    pickers=["Todos"]+sorted(s.PICKER.astype(str).unique().tolist())
+    turns=["Todos"]+sorted(s.TURNO.astype(str).unique().tolist())
     sp=st.selectbox("Picker",pickers); stn=st.selectbox("Turno",turns)
 
 a,b,c,d,e,f=st.tabs(["🏠 Bodega","👤 Picker","🏷️ Artículos","📦 Pedidos","🌙 Turnos / Áreas","📥 Exportar"])
