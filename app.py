@@ -287,16 +287,42 @@ with d:
     st.caption("PICKERS indica cuántos pickers aparecen en el mismo pedido.")
 
 with e:
-  if roster is not None and not roster.empty:
+    if roster is not None and not roster.empty:
         st.success("Los turnos mostrados aquí provienen del maestro de personas cargado en ④.")
     else:
-        st.info("Puedes cargar un maestro de personas por turno en ④ para asignar el turno de cada picker y cruzarlo con FNR/MC.")
-    st.subheader("FNR por turno"); st.dataframe(groups(fnr,base,"TURNO"),use_container_width=True,hide_index=True)
-    st.subheader("MC por turno"); st.dataframe(groups(mc,base,"TURNO"),use_container_width=True,hide_index=True)
-    st.subheader("FNR por área"); st.dataframe(groups(fnr,base,"AREA"),use_container_width=True,hide_index=True)
-    st.subheader("MC por área"); st.dataframe(groups(mc,base,"AREA"),use_container_width=True,hide_index=True)
-    st.warning("El % / líneas por área solo aparece si existe un denominador real de líneas por área.")
+        st.info("Puedes cargar el maestro de personas por turno en ④ para asignar el turno de cada picker y cruzarlo con FNR/MC.")
 
+    st.subheader("FNR por turno")
+    st.dataframe(
+        groups(fnr,base,"TURNO"),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.subheader("MC por turno")
+    st.dataframe(
+        groups(mc,base,"TURNO"),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.subheader("FNR por área")
+    st.dataframe(
+        groups(fnr,base,"AREA"),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.subheader("MC por área")
+    st.dataframe(
+        groups(mc,base,"AREA"),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.warning(
+        "El % / líneas por área solo aparece si existe un denominador real de líneas por área."
+    )
 with g:
     st.subheader("Retroalimentación por turno")
     if roster is None or roster.empty:
