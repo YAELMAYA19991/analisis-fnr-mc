@@ -287,7 +287,7 @@ with d:
     st.caption("PICKERS indica cuántos pickers aparecen en el mismo pedido.")
 
 with e:
-    if ut:
+  if roster is not None and not roster.empty:
         st.success("Los turnos mostrados aquí provienen del maestro de personas cargado en ④.")
     else:
         st.info("Puedes cargar un maestro de personas por turno en ④ para asignar el turno de cada picker y cruzarlo con FNR/MC.")
