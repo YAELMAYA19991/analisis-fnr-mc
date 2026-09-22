@@ -202,8 +202,7 @@ with e:
 with f:
     st.download_button("📥 Descargar Excel completo",export(s,fnr,mc,None if sp=="Todos" else sp),f"Analisis_FNR_MC_{periodo}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     st.info("La V2 analiza el periodo cargado. Para histórico permanente entre sesiones agregaremos una base de datos o archivo histórico controlado en V3.")
-Lista para Streamlit Community Cloud.
-
+Lista para Streamlit Community Cloud
 Incluye:
 - FNR y MC por picker / líneas.
 - Semáforo: FNR 1.50%, MC 1.00%.
