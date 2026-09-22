@@ -79,8 +79,13 @@ def summary(base,fnr,mc):
     m=mc.groupby("PICKER",as_index=False).INCIDENCIAS.sum().rename(columns={"INCIDENCIAS":"MC"})
     s=s.merge(f,on="PICKER",how="left").merge(m,on="PICKER",how="left")
     s[["FNR","MC"]]=s[["FNR","MC"]].fillna(0)
-    s["FNR_%"]=(s.FNR/s.LINEAS.replace(0,pd.NA)*100).round(2)
-    s["MC_%"]=(s.MC/s.LINEAS.replace(0,pd.NA)*100).round(2)
+    # Asegurar columnas numéricas y evitar pd.NA + round() incompatibles con algunas versiones de pandas
+    s["LINEAS"]=pd.to_numeric(s["LINEAS"],errors="coerce").fillna(0.0)
+    s["FNR"]=pd.to_numeric(s["FNR"],errors="coerce").fillna(0.0)
+    s["MC"]=pd.to_numeric(s["MC"],errors="coerce").fillna(0.0)
+    den=s["LINEAS"].where(s["LINEAS"].ne(0), float("nan"))
+    s["FNR_%"]=pd.to_numeric(s["FNR"].div(den)*100,errors="coerce").round(2)
+    s["MC_%"]=pd.to_numeric(s["MC"].div(den)*100,errors="coerce").round(2)
     def sem(r):
         if (pd.notna(r["FNR_%"]) and r["FNR_%"]>=FNR_OBJ) or (pd.notna(r["MC_%"]) and r["MC_%"]>=MC_OBJ):
             return "🔴 FUERA DE OBJETIVO"
@@ -112,7 +117,9 @@ def groups(inc,base,key):
     g["% DEL TOTAL"]=(g.INCIDENCIAS/g.INCIDENCIAS.sum()*100).round(2)
     if den is not None:
         g=g.merge(den,on="GRUPO",how="left")
-        g["% / LINEAS"]=(g.INCIDENCIAS/g.LINEAS.replace(0,pd.NA)*100).round(2)
+        g["LINEAS"]=pd.to_numeric(g["LINEAS"],errors="coerce").fillna(0.0)
+        den=g["LINEAS"].where(g["LINEAS"].ne(0), float("nan"))
+        g["% / LINEAS"]=pd.to_numeric(g.INCIDENCIAS.div(den)*100,errors="coerce").round(2)
     return g.sort_values("INCIDENCIAS",ascending=False)
 
 def export(summary,fnr,mc,picker):
