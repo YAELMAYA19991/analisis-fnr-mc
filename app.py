@@ -202,21 +202,3 @@ with e:
 with f:
     st.download_button("📥 Descargar Excel completo",export(s,fnr,mc,None if sp=="Todos" else sp),f"Analisis_FNR_MC_{periodo}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     st.info("La V2 analiza el periodo cargado. Para histórico permanente entre sesiones agregaremos una base de datos o archivo histórico controlado en V3.")
-Lista para Streamlit Community Cloud
-Incluye:
-- FNR y MC por picker / líneas.
-- Semáforo: FNR 1.50%, MC 1.00%.
-- Seguimiento individual y artículos completos.
-- Pedidos repetidos y múltiples pickers.
-- Turnos y áreas.
-- Exclusión de pedidos operativos.
-- Exportación Excel.
-- Detección automática de columnas comunes.
-
-La V2 todavía no conserva permanentemente los archivos cargados entre sesiones.
-La V3 puede agregar histórico persistente, usuarios/permisos y reglas de responsabilidad por proceso.
-
-streamlit>=1.40
-pandas>=2.2
-openpyxl>=3.1
-xlrd>=2.0
