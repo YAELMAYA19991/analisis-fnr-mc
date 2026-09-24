@@ -1,4 +1,3 @@
-
 import io, re, json, os
 from datetime import datetime
 import pandas as pd
@@ -72,19 +71,18 @@ def parse_base(df):
 
 
 def parse_roster(df, turno_fijo=None):
-    """Maestro de personal.
-    Requiere PICKER y opcionalmente SUPERVISOR/AREA_BASE.
-    Si turno_fijo viene de la pantalla de carga, ese turno manda.
-    """
+    """Maestro consolidado de personal: PICKER, TURNO, CORREO, SUPERVISOR y AREA."""
     p=col(df,["picker","picker_nombre","email_picker","nombre","persona"])
     sh=col(df,["turno","shift"])
+    em=col(df,["codigo_correo","codigo + correo","correo","email","usuario"])
     sup=col(df,["supervisor","supervisor_nombre","jefe","responsable"])
     ar=col(df,["area_base","area","departamento","department"])
     if not p:
-        raise ValueError("La plantilla de personal necesita la columna PICKER.")
+        raise ValueError("La hoja de personal necesita la columna PICKER.")
     x=pd.DataFrame({
         "PICKER":df[p].astype(str).str.strip(),
         "TURNO_MAESTRO":(df[sh].astype(str).str.strip() if sh and not turno_fijo else turno_fijo or ""),
+        "CORREO":df[em].astype(str).str.strip() if em else "",
         "SUPERVISOR":df[sup].astype(str).str.strip() if sup else "No asignado",
         "AREA_MAESTRO":df[ar].astype(str).str.strip() if ar else ""
     })
@@ -94,7 +92,8 @@ def parse_roster(df, turno_fijo=None):
 
 def apply_roster(base, roster):
     if roster is None or roster.empty: return base
-    r=roster[["PICKER","TURNO_MAESTRO","SUPERVISOR","AREA_MAESTRO"]].copy()
+    cols=["PICKER","TURNO_MAESTRO","CORREO","SUPERVISOR","AREA_MAESTRO"]
+    r=roster[[c for c in cols if c in roster.columns]].copy()
     x=base.merge(r,on="PICKER",how="left")
     tm=x["TURNO_MAESTRO"].fillna("").astype(str).str.strip()
     tb=x["TURNO"].fillna("").astype(str).str.strip()
@@ -103,7 +102,8 @@ def apply_roster(base, roster):
     ab=x["AREA_BASE"].fillna("").astype(str).str.strip()
     x["AREA_BASE"]=am.where(am.ne(""),ab)
     x["SUPERVISOR"]=x["SUPERVISOR"].fillna("No asignado").astype(str).str.strip()
-    return x.drop(columns=["TURNO_MAESTRO","AREA_MAESTRO"])
+    x["CORREO"]=x["CORREO"].fillna("").astype(str).str.strip()
+    return x.drop(columns=["TURNO_MAESTRO","AREA_MAESTRO"],errors="ignore")
 
 def roster_from_uploads(uploads):
     frames=[]
@@ -219,33 +219,30 @@ st.caption("Dashboard automático por picker, turno, área, producto y pedido")
 
 with st.sidebar:
     st.header("Carga")
-    ub=st.file_uploader("① Base de líneas / pickers",type=["xlsx","xls"])
-    uf=st.file_uploader("② Detalle FNR",type=["xlsx","xls"])
-    um=st.file_uploader("③ Detalle Mala Calidad",type=["xlsx","xls"])
-    st.subheader("Personal por turno")
-    st.caption("Carga una plantilla por turno. La app asigna automáticamente el turno del archivo.")
-    u_mat=st.file_uploader("① Matutino",type=["xlsx","xls"],key="roster_mat")
-    u_int=st.file_uploader("② Intermedio",type=["xlsx","xls"],key="roster_int")
-    u_ves=st.file_uploader("③ Vespertino",type=["xlsx","xls"],key="roster_ves")
-    u_noc=st.file_uploader("④ Nocturno",type=["xlsx","xls"],key="roster_noc")
-    st.caption("Cada plantilla requiere PICKER. SUPERVISOR y AREA_BASE son opcionales.")
+    uc=st.file_uploader("📤 Excel consolidado",type=["xlsx","xls"])
+    st.caption("Un solo archivo con las hojas Base_Pickers, Detalle_FNR, Detalle_MC y Maestro_Personal.")
     st.divider(); periodo=st.text_input("Periodo",datetime.now().strftime("%Y-%m"))
     ex=st.text_area("Pedidos operativos a excluir (uno por línea)")
     excluded={x.strip() for x in ex.splitlines() if x.strip()}
 
-if not (ub and uf and um):
-    st.info("Carga los 3 Excel para comenzar.")
-    st.markdown("**La V4 incluye:** FNR/MC sobre líneas, seguimiento individual, artículos, pedidos repetidos, turnos, áreas, exclusiones operativas, exportación Excel y maestro de personas por turno.")
+if not uc:
+    st.info("Carga un solo Excel consolidado para comenzar.")
+    st.markdown("**Formato:** Base_Pickers + Detalle_FNR + Detalle_MC + Maestro_Personal. El maestro permite filtrar por picker, turno, correo, supervisor y área.")
     st.stop()
 
 try:
-    base=parse_base(choose(sheets(ub),["picker","lineas","resumen"]))
-    roster = roster_from_uploads({"Matutino":u_mat,"Intermedio":u_int,"Vespertino":u_ves,"Nocturno":u_noc})
-    base = apply_roster(base, roster)
-    fnr=parse_inc(choose(sheets(uf),["fnr","detalle"]),"FNR")
-    mc=parse_inc(choose(sheets(um),["mc","mala"]),"MC")
+    ss=sheets(uc)
+    base_df=choose(ss,["base_pickers","picker","lineas","resumen"])
+    fnr_df=choose({k:v for k,v in ss.items() if "fnr" in norm(k)},["fnr","detalle"])
+    mc_df=choose({k:v for k,v in ss.items() if "mc" in norm(k) or "mala" in norm(k)},["mc","mala"])
+    roster_df=choose({k:v for k,v in ss.items() if "maestro" in norm(k) or "personal" in norm(k)},["maestro_personal","personal","maestro"])
+    base=parse_base(base_df)
+    roster=parse_roster(roster_df)
+    base=apply_roster(base,roster)
+    fnr=parse_inc(fnr_df,"FNR")
+    mc=parse_inc(mc_df,"MC")
 except Exception as e:
-    st.error(str(e)); st.stop()
+    st.error(f"Error en el Excel consolidado: {e}"); st.stop()
 
 if excluded:
     fnr=fnr[~fnr.ORDER_NUMBER.isin(excluded)].copy()
@@ -260,40 +257,55 @@ if roster is not None:
     matched=base["PICKER"].isin(roster["PICKER"]).sum()
     total=len(base); unmatched=total-matched
     with st.sidebar:
-        st.success(f"Personal cruzado: {matched}/{total} pickers.")
-        if unmatched: st.warning(f"{unmatched} pickers de la base no aparecen en las plantillas.")
+        st.success(f"Personal cruzado: {matched}/{total} pickers desde el Excel consolidado.")
+        if unmatched: st.warning(f"{unmatched} pickers de la base no aparecen en Maestro_Personal.")
 
 with st.sidebar:
-    pickers = ["Todos"]
-    pickers.extend(sorted({str(x) for x in s["PICKER"].tolist() if str(x).strip()}))
-    turns = ["Todos"]
-    turns.extend(sorted({str(x) for x in s["TURNO"].tolist() if str(x).strip()}))
-    sp=st.selectbox("Picker",pickers); stn=st.selectbox("Turno",turns)
+    st.subheader("Filtros de personal")
+    pickers=["Todos"]+sorted({str(x) for x in s["PICKER"].tolist() if str(x).strip()})
+    turns=["Todos"]+sorted({str(x) for x in s["TURNO"].tolist() if str(x).strip()})
+    sups=["Todos"]+sorted({str(x) for x in s["SUPERVISOR"].tolist() if str(x).strip() and str(x)!="No asignado"})
+    areas=["Todos"]+sorted({str(x) for x in s["AREA_BASE"].tolist() if str(x).strip() and str(x)!="No especificada"})
+    sp=st.selectbox("Picker",pickers)
+    stn=st.selectbox("Turno",turns)
+    ssup=st.selectbox("Supervisor",sups)
+    sar=st.selectbox("Área",areas)
+
+# Filtros combinados de personal. Los KPI se recalculan sobre la selección.
+s_view=s.copy()
+if sp!="Todos": s_view=s_view[s_view.PICKER==sp]
+if stn!="Todos": s_view=s_view[s_view.TURNO==stn]
+if ssup!="Todos": s_view=s_view[s_view.SUPERVISOR==ssup]
+if sar!="Todos": s_view=s_view[s_view.AREA_BASE==sar]
+base_view=base[base.PICKER.isin(s_view.PICKER)]
+fnr_view=fnr[fnr.PICKER.isin(s_view.PICKER)]
+mc_view=mc[mc.PICKER.isin(s_view.PICKER)]
 
 a,b,c,d,e,g,h,f=st.tabs(["🏠 Bodega","👤 Picker","🏷️ Artículos","📦 Pedidos","🌙 Turnos / Áreas","👥 Supervisores","🛡️ Seguimiento","📥 Exportar"])
 
 with a:
-    lines=base.LINEAS.sum(); F=fnr.INCIDENCIAS.sum(); M=mc.INCIDENCIAS.sum()
-    total_pedidos,fnr_pedidos,mc_pedidos,fnr_rate,mc_rate=monthly_kpis(base,fnr,mc)
+    lines=base_view.LINEAS.sum(); F=fnr_view.INCIDENCIAS.sum(); M=mc_view.INCIDENCIAS.sum()
+    total_pedidos,fnr_pedidos,mc_pedidos,fnr_rate,mc_rate=monthly_kpis(base_view,fnr_view,mc_view)
     st.subheader(f"Resumen de bodega — {periodo}")
     q=st.columns(6)
     q[0].metric("Líneas",f"{lines:,.0f}")
     q[1].metric("Pedidos",f"{total_pedidos:,.0f}")
     q[2].metric("FNR mensual",f"{fnr_rate:.2f}%" if fnr_rate is not None else "N/D", "Objetivo < 1.50%")
     q[3].metric("MC mensual",f"{mc_rate:.2f}%" if mc_rate is not None else "N/D", "Objetivo < 1.00%")
-    q[4].metric("Pickers",len(s))
-    q[5].metric("Fuera objetivo",(s.ESTADO=="🔴 FUERA DE OBJETIVO").sum())
+    q[4].metric("Pickers",len(s_view))
+    q[5].metric("Fuera objetivo",(s_view.ESTADO=="🔴 FUERA DE OBJETIVO").sum())
     st.caption(f"KPI mensual: {fnr_pedidos:,} pedidos con FNR / {total_pedidos:,} pedidos = {fnr_rate:.2f}% · {mc_pedidos:,} pedidos con MC / {total_pedidos:,} pedidos = {mc_rate:.2f}%" if fnr_rate is not None and mc_rate is not None else "No hay suficientes pedidos para calcular el KPI mensual.")
     st.divider()
     st.subheader("Indicador operativo por líneas")
     k=st.columns(2); k[0].metric("FNR / líneas",f"{F/lines*100:.2f}%" if lines else "N/D"); k[1].metric("MC / líneas",f"{M/lines*100:.2f}%" if lines else "N/D")
-    st.dataframe(s,use_container_width=True,hide_index=True)
+    st.dataframe(s_view,use_container_width=True,hide_index=True)
 
 with b:
     if sp=="Todos": st.info("Selecciona un picker.")
     else:
         r=s[s.PICKER==sp].iloc[0]
         q=st.columns(4); q[0].metric("Líneas",f"{r.LINEAS:,.0f}"); q[1].metric("FNR",f"{r.FNR:,.0f}",f"{r['FNR_%']:.2f}%")
+        st.caption(f"Turno: {r.TURNO} · Correo/usuario: {r.CORREO} · Supervisor: {r.SUPERVISOR} · Área: {r.AREA_BASE}")
         q[2].metric("MC",f"{r.MC:,.0f}",f"{r['MC_%']:.2f}%"); q[3].metric("Estado",r.ESTADO)
         st.subheader("Artículos FNR"); st.dataframe(products(fnr,sp),use_container_width=True,hide_index=True)
         st.subheader("Artículos MC"); st.dataframe(products(mc,sp),use_container_width=True,hide_index=True)
@@ -326,19 +338,19 @@ with d:
 
 with e:
     if roster is not None:
-        st.success("Los turnos mostrados aquí provienen del maestro de personas cargado en ④.")
+        st.success("Los turnos, correos, supervisores y áreas provienen del Maestro_Personal del único Excel cargado.")
     else:
-        st.info("Puedes cargar un maestro de personas por turno en ④ para asignar el turno de cada picker y cruzarlo con FNR/MC.")
-    st.subheader("FNR por turno"); st.dataframe(groups(fnr,base,"TURNO"),use_container_width=True,hide_index=True)
-    st.subheader("MC por turno"); st.dataframe(groups(mc,base,"TURNO"),use_container_width=True,hide_index=True)
-    st.subheader("FNR por área"); st.dataframe(groups(fnr,base,"AREA"),use_container_width=True,hide_index=True)
-    st.subheader("MC por área"); st.dataframe(groups(mc,base,"AREA"),use_container_width=True,hide_index=True)
+        st.info("El Maestro_Personal del Excel consolidado asigna turno, correo, supervisor y área a cada picker.")
+    st.subheader("FNR por turno"); st.dataframe(groups(fnr_view,base_view,"TURNO"),use_container_width=True,hide_index=True)
+    st.subheader("MC por turno"); st.dataframe(groups(mc_view,base_view,"TURNO"),use_container_width=True,hide_index=True)
+    st.subheader("FNR por área"); st.dataframe(groups(fnr_view,base_view,"AREA"),use_container_width=True,hide_index=True)
+    st.subheader("MC por área"); st.dataframe(groups(mc_view,base_view,"AREA"),use_container_width=True,hide_index=True)
     st.warning("El % / líneas por área solo aparece si existe un denominador real de líneas por área.")
 
 with g:
     st.subheader("Retroalimentación por turno")
     if roster is None or roster.empty:
-        st.info("Carga las plantillas de Matutino, Intermedio, Vespertino y/o Nocturno en el panel lateral.")
+        st.info("Elige el turno directamente desde el filtro del Excel consolidado.")
     else:
         turnos=[x for x in ["Matutino","Intermedio","Vespertino","Nocturno"] if x in set(roster["TURNO_MAESTRO"])]
         turno_sel=st.selectbox("Turno",turnos if turnos else ["Sin turno"])
