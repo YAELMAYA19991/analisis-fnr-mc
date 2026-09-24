@@ -1,3 +1,4 @@
+
 import io, re, json, os
 from difflib import SequenceMatcher
 from datetime import datetime
@@ -630,6 +631,7 @@ store.setdefault("feedback_rows", [])
 store.setdefault("master_overrides", {})
 store.setdefault("master_excluded", [])
 store.setdefault("procesos", [])
+store.setdefault("recursos_formatos", [])
 
 with st.sidebar:
     st.header("Control operativo")
@@ -959,6 +961,34 @@ with b:
                 if st.form_submit_button("Guardar llamada / acta", type="primary"):
                     rec["acciones"].append({"fecha":datetime.now().strftime("%Y-%m-%d %H:%M"),"accion":act_type,"supervisor":act_sup.strip() or "No especificado","motivo":act_motivo.strip()})
                     save_store(store); st.success("Seguimiento guardado."); st.rerun()
+
+        st.markdown("### 🔗 Formatos y recursos rápidos")
+        st.caption("Accede desde aquí a tus formatos de retroalimentación, llamadas de atención, actas y seguimiento.")
+        recursos=store.get("recursos_formatos",[])
+        if recursos:
+            cols=st.columns(min(3,max(1,len(recursos))))
+            for idx,recurso in enumerate(recursos):
+                with cols[idx % len(cols)]:
+                    titulo=str(recurso.get("titulo","Formato")); tipo=str(recurso.get("tipo","Recurso")); url=str(recurso.get("url",""))
+                    st.markdown(f"<div class='justo-card'><div class='justo-kicker'>{tipo}</div><div class='justo-title' style='font-size:1rem'>{titulo}</div></div>",unsafe_allow_html=True)
+                    if url: st.link_button("🔗 Abrir formato",url,use_container_width=True)
+                    if st.button("🗑️ Quitar",key=f"delete_recurso_{idx}",use_container_width=True):
+                        store["recursos_formatos"].pop(idx); save_store(store); st.rerun()
+        else:
+            st.info("Todavía no hay formatos configurados. Puedes agregar aquí enlaces de Google Forms, Drive, Excel, Word u otra plataforma.")
+
+        with st.expander("⚙️ Administrar formatos / enlaces", expanded=False):
+            with st.form(f"recurso_form_{sp}", clear_on_submit=True):
+                rr1,rr2=st.columns([1,2])
+                with rr1: recurso_tipo=st.selectbox("Tipo",["Retroalimentación","Seguimiento","Llamada de atención","Acta","Otro"])
+                with rr2: recurso_titulo=st.text_input("Nombre del formato",placeholder="Ej. Formato de retroalimentación semanal")
+                recurso_url=st.text_input("Enlace",placeholder="https://...")
+                if st.form_submit_button("➕ Guardar enlace",type="primary"):
+                    url=recurso_url.strip()
+                    if not recurso_titulo.strip() or not url.startswith(("http://","https://")):
+                        st.error("Captura un nombre y un enlace válido que comience con http:// o https://.")
+                    else:
+                        store.setdefault("recursos_formatos",[]).append({"tipo":recurso_tipo,"titulo":recurso_titulo.strip(),"url":url,"fecha":datetime.now().strftime("%Y-%m-%d %H:%M")}); save_store(store); st.success("Enlace guardado."); st.rerun()
 
         picker_fb=[x for x in store.get("feedback_rows",[]) if str(x.get("PICKER",""))==sp]
         if picker_fb:
