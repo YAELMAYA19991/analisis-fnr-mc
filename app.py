@@ -1,4 +1,3 @@
-
 import io, re, json, os
 from difflib import SequenceMatcher
 from datetime import datetime
@@ -109,55 +108,121 @@ def parse_roster(df, turno_fijo=None):
     x=x.drop_duplicates("_KEY",keep="last")
     return x
 
+def _match_master_row(value, roster, code_value=""):
+    """Encuentra el picker del Master de forma robusta.
+    Orden: nombre exacto, mismas palabras, código/correo y similitud segura.
+    """
+    if roster is None or roster.empty:
+        return None
+    key=person_key(value)
+    tkey=token_key(value)
+    code=norm(str(code_value).split(".",1)[0]) if str(code_value).strip() else ""
+    # exacto por nombre normalizado
+    for _,rr in roster.iterrows():
+        if key and key==rr.get("_KEY",""):
+            return rr
+    # mismas palabras, independientemente del orden
+    for _,rr in roster.iterrows():
+        if tkey and tkey==rr.get("_TOKEN_KEY",""):
+            return rr
+    # código / usuario antes del correo (ej. 1188502.nombre@justo.mx)
+    if code:
+        hits=roster[roster["_CODE_KEY"].astype(str)==code]
+        if len(hits): return hits.iloc[0]
+    # coincidencia por conjunto de palabras; evita que un nombre muy corto genere falsos positivos
+    toks=set([t for t in norm(value).split("_") if t])
+    if len(toks)>=2:
+        best=None; best_score=0.0; second=0.0
+        for _,rr in roster.iterrows():
+            rtoks=set([t for t in norm(rr["PICKER"]).split("_") if t])
+            inter=len(toks & rtoks); union=len(toks | rtoks) or 1
+            j=inter/union
+            seq=SequenceMatcher(None,key,str(rr.get("_KEY","") or "")).ratio()
+            # Jaccard pesa más cuando el orden de nombres cambia.
+            score=0.65*j+0.35*seq
+            if score>best_score:
+                second=best_score; best_score=score; best=rr
+            elif score>second:
+                second=score
+        if best is not None and best_score>=0.84 and (best_score-second>=0.04 or best_score>=0.93):
+            return best
+    return None
+
 def apply_roster(base, roster):
     if roster is None or roster.empty: return base
     x=base.copy()
-    r=roster.copy()
-    # Primero por nombre normalizado; luego por palabras del nombre; finalmente por código.
-    exact=r.drop_duplicates("_KEY").set_index("_KEY")
-    token_map=r.drop_duplicates("_TOKEN_KEY").set_index("_TOKEN_KEY")
-    code_map=r[r["_CODE_KEY"].astype(str).str.strip().ne("")].drop_duplicates("_CODE_KEY").set_index("_CODE_KEY")
+    matched=[]
+    for _,row in x.iterrows():
+        rr=_match_master_row(row.get("PICKER",""),roster,row.get("CORREO",""))
+        matched.append(rr)
+    out=[]
+    for row,rr in zip(x.to_dict("records"),matched):
+        if rr is None:
+            row["_MASTER_MATCH"]=False
+            row["_MASTER_PICKER"]=""
+            row["_MASTER_TURNO"]=""
+            row["_MASTER_CORREO"]=""
+            row["_MASTER_SUPERVISOR"]="No asignado"
+            row["_MASTER_AREA"]=""
+        else:
+            row["_MASTER_MATCH"]=True
+            row["_MASTER_PICKER"]=str(rr.get("PICKER","")).strip()
+            row["_MASTER_TURNO"]=str(rr.get("TURNO_MAESTRO","")).strip()
+            row["_MASTER_CORREO"]=str(rr.get("CORREO","")).strip()
+            row["_MASTER_SUPERVISOR"]=str(rr.get("SUPERVISOR","No asignado")).strip()
+            row["_MASTER_AREA"]=str(rr.get("AREA_MAESTRO","")).strip()
+        out.append(row)
+    x=pd.DataFrame(out)
+    # El Master es la fuente oficial de identidad, turno, correo, supervisor y área.
+    ok=x["_MASTER_MATCH"]
+    x.loc[ok,"PICKER"]=x.loc[ok,"_MASTER_PICKER"]
+    x.loc[ok,"TURNO"]=x.loc[ok,"_MASTER_TURNO"]
+    x.loc[ok,"CORREO"]=x.loc[ok,"_MASTER_CORREO"]
+    x.loc[ok,"SUPERVISOR"]=x.loc[ok,"_MASTER_SUPERVISOR"]
+    x.loc[ok,"AREA_BASE"]=x.loc[ok,"_MASTER_AREA"]
+    return x.drop(columns=["_KEY","_TOKEN_KEY","_CODE_KEY","_MASTER_PICKER","_MASTER_TURNO","_MASTER_CORREO","_MASTER_SUPERVISOR","_MASTER_AREA"],errors="ignore")
 
-    master_rows=r.to_dict("records")
-    def lookup(row):
-        # 1) nombre exacto normalizado, 2) mismas palabras aunque estén en otro orden,
-        # 3) código/usuario, 4) coincidencia aproximada para diferencias menores de escritura.
-        for key,mp in [(row.get("_KEY",""),exact),(row.get("_TOKEN_KEY",""),token_map),(row.get("_CODE_KEY",""),code_map)]:
-            if key and key in mp.index:
-                rr=mp.loc[key]
-                if isinstance(rr,pd.DataFrame): rr=rr.iloc[0]
-                return pd.Series([rr.get("PICKER",""),rr.get("TURNO_MAESTRO",""),rr.get("CORREO",""),rr.get("SUPERVISOR","No asignado"),rr.get("AREA_MAESTRO","")])
-        # Fuzzy conservador: solo si hay una coincidencia claramente alta.
-        name_key=str(row.get("_KEY","") or "")
-        if name_key:
-            best=None; best_score=0.0; second=0.0
-            for rr in master_rows:
-                score=SequenceMatcher(None,name_key,str(rr.get("_KEY","") or "")).ratio()
-                if score>best_score:
-                    second=best_score; best_score=score; best=rr
-                elif score>second:
-                    second=score
-            if best is not None and best_score>=0.90 and (best_score-second>=0.03 or best_score>=0.96):
-                return pd.Series([best.get("PICKER",""),best.get("TURNO_MAESTRO",""),best.get("CORREO",""),best.get("SUPERVISOR","No asignado"),best.get("AREA_MAESTRO","")])
-        return pd.Series(["","","","No asignado",""])
-
-    vals=x.apply(lookup,axis=1)
-    vals.columns=["PICKER_MASTER","TURNO_MAESTRO","CORREO_MASTER","SUPERVISOR_MASTER","AREA_MAESTRO"]
-    x=pd.concat([x.reset_index(drop=True),vals.reset_index(drop=True)],axis=1)
-    tm=x["TURNO_MAESTRO"].fillna("").astype(str).str.strip()
-    tb=x["TURNO"].fillna("").astype(str).str.strip()
-    x["TURNO"]=tm.where(tm.ne(""),tb)
-    # El nombre del Master es el nombre canónico para que FNR/MC y los filtros
-    # trabajen sobre la misma identidad del picker.
-    pm=x["PICKER_MASTER"].fillna("").astype(str).str.strip()
-    x["PICKER"]=pm.where(pm.ne(""),x["PICKER"].astype(str).str.strip())
-    am=x["AREA_MAESTRO"].fillna("").astype(str).str.strip()
-    ab=x["AREA_BASE"].fillna("").astype(str).str.strip()
-    x["AREA_BASE"]=am.where(am.ne(""),ab)
-    x["SUPERVISOR"]=x["SUPERVISOR_MASTER"].fillna("No asignado").astype(str).str.strip()
-    master_email=x["CORREO_MASTER"].fillna("").astype(str).str.strip()
-    x["CORREO"]=master_email.where(master_email.ne(""),x["CORREO"].fillna("").astype(str).str.strip())
-    return x.drop(columns=["_KEY","_TOKEN_KEY","_CODE_KEY","PICKER_MASTER","TURNO_MAESTRO","CORREO_MASTER","SUPERVISOR_MASTER","AREA_MAESTRO"],errors="ignore")
+def canonicalize_incidents(inc, base):
+    """Alinea FNR/MC al nombre canónico de la base ya cruzada con Master."""
+    if inc is None or inc.empty or base is None or base.empty:
+        return inc
+    out=inc.copy()
+    b=base.copy()
+    b["_KEY2"]=b["PICKER"].map(person_key)
+    b["_TOKEN2"]=b["PICKER"].map(token_key)
+    b["_CODE2"]=b["CORREO"].map(lambda v:norm(str(v).split(".",1)[0]) if str(v).strip() else "")
+    records=b.to_dict("records")
+    canonical=[]
+    for _,row in out.iterrows():
+        k=person_key(row.get("PICKER","")); tk=token_key(row.get("PICKER",""))
+        hit=b[b["_KEY2"]==k]
+        if hit.empty:
+            hit=b[b["_TOKEN2"]==tk]
+        if hit.empty:
+            code=norm(str(row.get("PICKER","")).split(".",1)[0])
+            if code:
+                hit=b[b["_CODE2"]==code]
+        if not hit.empty:
+            canonical.append(str(hit.iloc[0]["PICKER"]).strip())
+            continue
+        # Similaridad conservadora para diferencias menores de escritura.
+        toks=set(t for t in norm(row.get("PICKER","")).split("_") if t)
+        best=None; best_score=0.0; second=0.0
+        for rr in records:
+            rtoks=set(t for t in norm(rr.get("PICKER","")).split("_") if t)
+            j=len(toks & rtoks)/(len(toks | rtoks) or 1)
+            seq=SequenceMatcher(None,person_key(row.get("PICKER","")),person_key(rr.get("PICKER",""))).ratio()
+            score=.65*j+.35*seq
+            if score>best_score:
+                second=best_score; best_score=score; best=rr
+            elif score>second:
+                second=score
+        if best is not None and best_score>=.84 and (best_score-second>=.04 or best_score>=.93):
+            canonical.append(str(best["PICKER"]).strip())
+        else:
+            canonical.append(str(row.get("PICKER","")).strip())
+    out["PICKER"]=canonical
+    return out
 
 def roster_from_uploads(uploads):
     frames=[]
@@ -340,6 +405,9 @@ try:
     base=apply_roster(base,roster)
     if roster.empty:
         raise ValueError("El Excel maestro no contiene pickers válidos.")
+    # Normaliza FNR/MC contra los pickers canónicos de la base.
+    fnr=canonicalize_incidents(fnr,base)
+    mc=canonicalize_incidents(mc,base)
 except Exception as e:
     st.error(f"Error en los archivos cargados: {e}"); st.stop()
 
@@ -347,19 +415,26 @@ if excluded:
     fnr=fnr[~fnr.ORDER_NUMBER.isin(excluded)].copy()
     mc=mc[~mc.ORDER_NUMBER.isin(excluded)].copy()
 fnr=attach(fnr,base); mc=attach(mc,base); s=summary(base,fnr,mc)
+# Columna técnica de cruce: se usa para diagnóstico, no para mostrarla en el dashboard.
+master_match=base.get("_MASTER_MATCH",pd.Series(False,index=base.index)).copy()
+base_display=base.drop(columns=["_MASTER_MATCH"],errors="ignore")
+s=s.drop(columns=["_MASTER_MATCH"],errors="ignore")
 store = load_store()
 # Registrar automáticamente pickers vistos en la operación, sin alterar su estado histórico.
 for _p in base["PICKER"].astype(str).str.strip().unique(): picker_record(store, _p)
 save_store(store)
 
 if roster is not None:
-    matched=base["PICKER"].isin(roster["PICKER"]).sum()
+    matched=int(base.get("_MASTER_MATCH",pd.Series(False,index=base.index)).sum())
     total=len(base); unmatched=total-matched
     with st.sidebar:
         st.success(f"Personal cruzado: {matched}/{total} pickers desde el Excel consolidado.")
-        if unmatched: st.warning(f"{unmatched} pickers de la base no aparecen en Maestro_Personal.")
-        matched_turn=(base["TURNO"].astype(str).str.strip().ne("") & base["TURNO"].astype(str).str.strip().ne("No especificado")).sum()
+        if unmatched: st.warning(f"{unmatched} pickers de la base no tienen coincidencia en Master_Pickers.")
+        matched_turn=int((base["TURNO"].astype(str).str.strip().ne("") & base["TURNO"].astype(str).str.strip().ne("No especificado") & base.get("_MASTER_MATCH",False)).sum())
         st.caption(f"Turnos asignados desde Master: {matched_turn}/{total}")
+
+# Retira columnas técnicas antes de mostrar/exportar.
+base=base.drop(columns=["_MASTER_MATCH"],errors="ignore")
 
 with st.sidebar:
     st.subheader("Filtros de personal")
