@@ -1,4 +1,3 @@
-
 import io, re, json, os
 from difflib import SequenceMatcher
 from datetime import datetime
@@ -8,6 +7,43 @@ import streamlit as st
 st.set_page_config(page_title="Control FNR & MC", page_icon="📊", layout="wide")
 FNR_OBJ, MC_OBJ = 1.50, 1.00
 STORE_FILE = "picker_seguimiento.json"
+PERSIST_DIR = "app_data"
+PERSIST_FILES = {
+    "base_picker": os.path.join(PERSIST_DIR, "base_picker.xlsx"),
+    "detalle_fnr": os.path.join(PERSIST_DIR, "detalle_fnr.xlsx"),
+    "detalle_mc": os.path.join(PERSIST_DIR, "detalle_mc.xlsx"),
+    "plantilla_personal": os.path.join(PERSIST_DIR, "master_pickers.xlsx"),
+}
+
+def ensure_persist_dir():
+    os.makedirs(PERSIST_DIR, exist_ok=True)
+
+def persist_upload(upload, key):
+    """Guarda físicamente el Excel cargado para que sobreviva a un rerun/refresh."""
+    if upload is None:
+        return None
+    ensure_persist_dir()
+    path=PERSIST_FILES[key]
+    with open(path, "wb") as f:
+        f.write(upload.getvalue())
+    return io.BytesIO(upload.getvalue())
+
+def load_persisted_upload(key):
+    """Recupera el último Excel guardado cuando el uploader está vacío."""
+    path=PERSIST_FILES[key]
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            data=f.read()
+        if not data:
+            return None
+        return io.BytesIO(data)
+    except Exception:
+        return None
+
+def persisted_status():
+    return {k: os.path.exists(v) and os.path.getsize(v) > 0 for k,v in PERSIST_FILES.items()}
 
 def load_store():
     if os.path.exists(STORE_FILE):
@@ -480,16 +516,42 @@ def export(summary,fnr,mc,picker,roster=None):
 st.title("📊 Control FNR & Mala Calidad")
 st.caption("Dashboard automático por picker, turno, área, producto y pedido")
 
+# Estado persistente: se carga antes de construir los widgets.
+store=load_store()
+store.setdefault("excluded_orders", [])
+store.setdefault("feedback_rows", [])
+store.setdefault("master_overrides", {})
+store.setdefault("master_excluded", [])
+
 with st.sidebar:
     st.header("Carga")
-    ub=st.file_uploader("① Base de Pickers / Líneas",type=["xlsx","xls"],key="base_picker")
-    uf=st.file_uploader("② Detalle FNR",type=["xlsx","xls"],key="detalle_fnr")
-    um=st.file_uploader("③ Detalle Mala Calidad",type=["xlsx","xls"],key="detalle_mc")
-    up=st.file_uploader("④ Plantilla consolidada de personal",type=["xlsx","xls"],key="plantilla_personal")
-    st.caption("Los 3 archivos operativos siguen separados. El Excel maestro concentra PICKER, TURNO, CODIGO + CORREO, SUPERVISOR y AREA_BASE.")
-    st.divider(); periodo=st.text_input("Periodo",datetime.now().strftime("%Y-%m"))
-    ex=st.text_area("Pedidos operativos a excluir (uno por línea)")
+    ub_upload=st.file_uploader("① Base de Pickers / Líneas",type=["xlsx","xls"],key="base_picker")
+    uf_upload=st.file_uploader("② Detalle FNR",type=["xlsx","xls"],key="detalle_fnr")
+    um_upload=st.file_uploader("③ Detalle Mala Calidad",type=["xlsx","xls"],key="detalle_mc")
+    up_upload=st.file_uploader("④ Plantilla consolidada de personal",type=["xlsx","xls"],key="plantilla_personal")
+
+    # Cada archivo nuevo reemplaza automáticamente al guardado. Si solo se recarga
+    # la página, la app recupera la última versión guardada sin pedir volver a subirla.
+    ub=persist_upload(ub_upload,"base_picker") if ub_upload else load_persisted_upload("base_picker")
+    uf=persist_upload(uf_upload,"detalle_fnr") if uf_upload else load_persisted_upload("detalle_fnr")
+    um=persist_upload(um_upload,"detalle_mc") if um_upload else load_persisted_upload("detalle_mc")
+    up=persist_upload(up_upload,"plantilla_personal") if up_upload else load_persisted_upload("plantilla_personal")
+
+    status=persisted_status()
+    labels={"base_picker":"Pickers/Líneas","detalle_fnr":"FNR","detalle_mc":"Mala Calidad","plantilla_personal":"Master Pickers"}
+    guardados=[labels[k] for k,v in status.items() if v]
+    if guardados:
+        st.success("Archivos guardados: " + ", ".join(guardados))
+    st.caption("Los 3 archivos operativos siguen separados. El Excel maestro concentra PICKER, TURNO, CODIGO + CORREO, SUPERVISOR y AREA_BASE. Los archivos quedan guardados para los siguientes recargados de la página.")
+    st.divider()
+    periodo=st.text_input("Periodo",value=str(store.get("periodo",datetime.now().strftime("%Y-%m"))),key="periodo_persistente")
+    saved_excluded="\n".join(str(x) for x in store.get("excluded_orders",[]) if str(x).strip())
+    ex=st.text_area("Pedidos operativos a excluir (uno por línea)",value=saved_excluded,key="pedidos_excluidos_persistentes")
     excluded={x.strip() for x in ex.splitlines() if x.strip()}
+    # Guardar automáticamente preferencias y exclusiones.
+    store["periodo"]=periodo.strip() or datetime.now().strftime("%Y-%m")
+    store["excluded_orders"]=sorted(excluded)
+    save_store(store)
 
 if not (ub and uf and um and up):
     st.info("Carga los 3 Excel operativos y la plantilla consolidada de personal para comenzar.")
@@ -510,7 +572,6 @@ try:
     roster=parse_roster(master_df)
     if roster.empty:
         raise ValueError("El Excel maestro no contiene pickers válidos.")
-    store=load_store()
     base=apply_roster(base,roster)
     base=apply_manual_personnel(base,store)
     roster=effective_roster(roster,store)
@@ -708,13 +769,15 @@ with g:
             fecha=st.date_input("Fecha de retroalimentación",key=f"fecha_{picker_sel}")
             if st.button("Guardar retroalimentación",key=f"save_{picker_sel}"):
                 row={"FECHA":str(fecha),"SUPERVISOR":supervisor_actual,"TURNO":turno_sel,"PICKER":picker_sel,"FNR_LINEAS_%":float(r["FNR_%"]),"MC_LINEAS_%":float(r["MC_%"]),"ESTADO":r["ESTADO"],"FORTALEZAS":fortalezas,"PUNTO_MEJORA":mejora,"ACUERDO":acuerdo}
-                st.session_state.setdefault("feedback_rows",[]).append(row)
-                st.success("Retroalimentación guardada en esta sesión.")
-        if st.session_state.get("feedback_rows"):
-            st.subheader("Retroalimentaciones capturadas en esta sesión")
-            fb=pd.DataFrame(st.session_state["feedback_rows"])
+                store.setdefault("feedback_rows",[]).append(row)
+                save_store(store)
+                st.success("Retroalimentación guardada permanentemente.")
+                st.rerun()
+        if store.get("feedback_rows"):
+            st.subheader("Retroalimentaciones guardadas")
+            fb=pd.DataFrame(store["feedback_rows"])
             st.dataframe(fb,use_container_width=True,hide_index=True)
-            st.download_button("📥 Descargar retroalimentaciones",feedback_export(st.session_state["feedback_rows"]),f"Retroalimentacion_{periodo}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.download_button("📥 Descargar retroalimentaciones",feedback_export(store["feedback_rows"]),f"Retroalimentacion_{periodo}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 with h:
     st.subheader("🛡️ Seguimiento de Pickers")
@@ -839,3 +902,4 @@ with i:
 with f:
     st.download_button("📥 Descargar Excel completo",export(s,fnr,mc,None if sp=="Todos" else sp,roster),f"Analisis_FNR_MC_{periodo}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     st.info("La app utiliza 3 Excel operativos separados (Pickers, FNR y MC) y una sola plantilla consolidada para turno, correo, supervisor y área.")
+    st.success(f"Persistencia activa: {len(store.get('excluded_orders',[]))} pedidos excluidos · {len(store.get('master_overrides',{}))} asignaciones manuales · {len(store.get('master_excluded',[]))} exclusiones de personal · {len(store.get('feedback_rows',[]))} retroalimentaciones guardadas.")
