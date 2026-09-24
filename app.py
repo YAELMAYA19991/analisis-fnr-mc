@@ -1,4 +1,3 @@
-
 import io, re, json, os
 from difflib import SequenceMatcher
 from datetime import datetime
@@ -955,6 +954,14 @@ with b:
         with cc[0]: st.dataframe(products(fnr,sp).head(15),use_container_width=True,hide_index=True)
         with cc[1]: st.dataframe(products(mc,sp).head(15),use_container_width=True,hide_index=True)
         st.subheader("Pedidos FNR")
+        st.warning(
+            "⚠️ **Antes de tomar en cuenta los FNR, revisa si la factura/orden tiene algún reporte o incidencia registrada.** "
+            "Valida primero la orden en Backoffice para confirmar si el faltante corresponde realmente a un FNR."
+        )
+        st.markdown(
+            "🔎 **Revisar factura / orden en Backoffice:** "
+            "[Abrir órdenes en Backoffice](https://orders.backoffice.justo.cloud/es/orders)"
+        )
         st.dataframe(orders(fnr,sp).head(25),use_container_width=True,hide_index=True)
 
         rec=picker_record(store,sp)
