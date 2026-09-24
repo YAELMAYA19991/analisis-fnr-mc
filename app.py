@@ -1,3 +1,4 @@
+
 import io, re, json, os
 from difflib import SequenceMatcher
 from datetime import datetime
@@ -501,16 +502,53 @@ def groups(inc,base,key):
         g["% / LINEAS"]=pd.to_numeric(g["INCIDENCIAS"].div(den_lineas)*100,errors="coerce").round(2)
     return g.sort_values("INCIDENCIAS",ascending=False)
 
+def _excel_safe_df(df):
+    """Prepara DataFrames para exportación robusta a Excel/OpenPyXL."""
+    if df is None:
+        return pd.DataFrame()
+    x=df.copy()
+    # Evita errores por nombres de columnas duplicados.
+    cols=[]; seen={}
+    for c in x.columns:
+        base=str(c) if str(c).strip() else "Columna"
+        n=seen.get(base,0)
+        cols.append(base if n==0 else f"{base}_{n}")
+        seen[base]=n+1
+    x.columns=cols
+    # Excel/OpenPyXL no admite NaN/inf ni algunos objetos pandas directamente.
+    x=x.replace([float("inf"),float("-inf")],pd.NA)
+    for c in x.columns:
+        if pd.api.types.is_object_dtype(x[c]) or pd.api.types.is_string_dtype(x[c]):
+            x[c]=x[c].map(lambda v: "" if pd.isna(v) else (str(v) if isinstance(v,(dict,list,set,tuple)) else v))
+    return x
+
+def _write_sheet(writer, df, sheet_name):
+    x=_excel_safe_df(df)
+    # Mantener nombres de hoja válidos para Excel.
+    name=re.sub(r"[\\/*?:\[\]]", "_", str(sheet_name))[:31] or "Hoja"
+    x.to_excel(writer, sheet_name=name, index=False)
+
 def export(summary,fnr,mc,picker,roster=None):
+    """Genera el Excel de salida sin romper el dashboard si algún dato viene irregular."""
     b=io.BytesIO()
-    with pd.ExcelWriter(b,engine="openpyxl") as w:
-        summary.to_excel(w,"Resumen_Pickers",index=False)
-        fnr.to_excel(w,"Detalle_FNR",index=False); mc.to_excel(w,"Detalle_MC",index=False)
-        products(fnr,picker).to_excel(w,"Productos_FNR",index=False)
-        products(mc,picker).to_excel(w,"Productos_MC",index=False)
-        orders(fnr,picker).to_excel(w,"Pedidos_FNR",index=False)
-        orders(mc,picker).to_excel(w,"Pedidos_MC",index=False)
-        if roster is not None: roster.to_excel(w,"Maestro_Turnos",index=False)
+    writer=pd.ExcelWriter(b,engine="openpyxl")
+    try:
+        _write_sheet(writer,summary,"Resumen_Pickers")
+        _write_sheet(writer,fnr,"Detalle_FNR")
+        _write_sheet(writer,mc,"Detalle_MC")
+        _write_sheet(writer,products(fnr,picker),"Productos_FNR")
+        _write_sheet(writer,products(mc,picker),"Productos_MC")
+        _write_sheet(writer,orders(fnr,picker),"Pedidos_FNR")
+        _write_sheet(writer,orders(mc,picker),"Pedidos_MC")
+        if roster is not None and not roster.empty:
+            _write_sheet(writer,roster,"Maestro_Turnos")
+        writer.close()
+    except Exception:
+        try:
+            writer.close()
+        except Exception:
+            pass
+        raise
     return b.getvalue()
 
 st.title("📊 Control FNR & Mala Calidad")
