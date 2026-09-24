@@ -1,11 +1,40 @@
-
 import io, re, json, os
 from difflib import SequenceMatcher
 from datetime import datetime
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="Control FNR & MC", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Control FNR & Mala Calidad", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
+
+# Estilo visual inspirado en la interfaz limpia de Jüsto: blanco, rojo de marca y tarjetas suaves.
+st.markdown("""
+<style>
+:root { --justo-red:#BD2426; --ink:#272936; --muted:#6f7480; --soft:#f7f7f5; --line:#e7e7e3; --success:#15803d; }
+.main .block-container { max-width: 1500px; padding-top: 1.1rem; padding-bottom: 2.5rem; }
+[data-testid="stSidebar"] { border-right: 1px solid var(--line); }
+[data-testid="stMetric"] { background:#fff; border:1px solid var(--line); border-radius:16px; padding:.75rem .9rem; box-shadow:0 2px 10px rgba(30,30,30,.035); }
+div[data-testid="stExpander"] { border:1px solid var(--line); border-radius:14px; overflow:hidden; }
+button[kind="primary"] { background:var(--justo-red); border-color:var(--justo-red); }
+button[kind="primary"]:hover { background:#a91f21; border-color:#a91f21; }
+[data-testid="stTabs"] button[aria-selected="true"] { color:var(--justo-red); border-bottom-color:var(--justo-red); }
+.justo-card { background:#fff; border:1px solid var(--line); border-radius:18px; padding:18px 20px; box-shadow:0 3px 14px rgba(30,30,30,.045); margin-bottom:12px; }
+.justo-kicker { color:var(--justo-red); font-size:.78rem; font-weight:700; letter-spacing:.08em; text-transform:uppercase; }
+.justo-title { color:var(--ink); font-size:1.55rem; font-weight:750; margin:.1rem 0 .35rem; }
+.justo-muted { color:var(--muted); font-size:.92rem; }
+.status-dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; }
+</style>
+""", unsafe_allow_html=True)
+
+@st.cache_data(show_spinner=False, max_entries=12)
+def sheets_from_bytes(data):
+    """Lee un Excel una sola vez por contenido; evita releer los mismos archivos en cada rerun."""
+    bio=io.BytesIO(data)
+    xls=pd.ExcelFile(bio)
+    out={}
+    for sh in xls.sheet_names:
+        df=pd.read_excel(xls, sheet_name=sh)
+        if not df.empty: out[sh]=clean(df)
+    return out
 FNR_OBJ, MC_OBJ = 1.50, 1.00
 STORE_FILE = "picker_seguimiento.json"
 PERSIST_DIR = "app_data"
@@ -45,6 +74,31 @@ def load_persisted_upload(key):
 
 def persisted_status():
     return {k: os.path.exists(v) and os.path.getsize(v) > 0 for k,v in PERSIST_FILES.items()}
+
+def _safe_filename(name):
+    base=os.path.basename(str(name or "imagen"))
+    base=re.sub(r"[^A-Za-z0-9._-]+","_",base)
+    return base[:120] or "imagen"
+
+def save_process_image(data, process_id, filename):
+    ensure_persist_dir()
+    folder=os.path.join(PERSIST_DIR,"process_images",str(process_id))
+    os.makedirs(folder, exist_ok=True)
+    path=os.path.join(folder,_safe_filename(filename))
+    with open(path,"wb") as f: f.write(data)
+    return path
+
+def load_process_images(process):
+    result=[]
+    for path in process.get("imagenes",[]):
+        if os.path.exists(path):
+            try:
+                with open(path,"rb") as f: result.append((path, f.read()))
+            except Exception: pass
+    return result
+
+def new_process_id():
+    return datetime.now().strftime("%Y%m%d%H%M%S%f")
 
 def load_store():
     if os.path.exists(STORE_FILE):
@@ -551,8 +605,9 @@ def export(summary,fnr,mc,picker,roster=None):
         raise
     return b.getvalue()
 
+st.markdown('<div class="justo-kicker">Operación · Coyoacán</div>', unsafe_allow_html=True)
 st.title("📊 Control FNR & Mala Calidad")
-st.caption("Dashboard automático por picker, turno, área, producto y pedido")
+st.caption("Control operativo de pickers, calidad, seguimiento y procesos")
 
 # Estado persistente: se carga antes de construir los widgets.
 store=load_store()
@@ -560,9 +615,10 @@ store.setdefault("excluded_orders", [])
 store.setdefault("feedback_rows", [])
 store.setdefault("master_overrides", {})
 store.setdefault("master_excluded", [])
+store.setdefault("procesos", [])
 
 with st.sidebar:
-    st.header("Carga")
+    st.header("Control operativo")
     ub_upload=st.file_uploader("① Base de Pickers / Líneas",type=["xlsx","xls"],key="base_picker")
     uf_upload=st.file_uploader("② Detalle FNR",type=["xlsx","xls"],key="detalle_fnr")
     um_upload=st.file_uploader("③ Detalle Mala Calidad",type=["xlsx","xls"],key="detalle_mc")
@@ -597,12 +653,12 @@ if not (ub and uf and um and up):
     st.stop()
 
 try:
-    base=parse_base(choose(sheets(ub),["picker","lineas","resumen"]))
-    fnr=parse_inc(choose(sheets(uf),["fnr","detalle"]),"FNR")
-    mc=parse_inc(choose(sheets(um),["mc","mala"]),"MC")
+    base=parse_base(choose(sheets_from_bytes(ub.getvalue()),["picker","lineas","resumen"]))
+    fnr=parse_inc(choose(sheets_from_bytes(uf.getvalue()),["fnr","detalle"]),"FNR")
+    mc=parse_inc(choose(sheets_from_bytes(um.getvalue()),["mc","mala"]),"MC")
     # La plantilla maestra actual tiene una sola hoja: Base_Pickers.
     # Columnas: PICKER, TURNO, CODIGO + CORREO, SUPERVISOR, AREA_BASE.
-    master_sheets=sheets(up)
+    master_sheets=sheets_from_bytes(up.getvalue())
     if "Base_Pickers" in master_sheets:
         master_df=master_sheets["Base_Pickers"]
     else:
@@ -693,7 +749,7 @@ s_view=s.copy()
 if "_EXCLUDED_PERSONNEL" in s_view.columns:
     s_view=s_view[~s_view["_EXCLUDED_PERSONNEL"].fillna(False)]
 with st.sidebar:
-    st.subheader("Filtros de personal")
+    st.subheader("🔎 Filtros de personal")
     pickers=["Todos"]+sorted({str(x) for x in s_view["PICKER"].tolist() if str(x).strip()})
     turns=["Todos"]+sorted({str(x) for x in s_view["TURNO"].tolist() if str(x).strip() and str(x)!="__EXCLUIDO__"})
     sups=["Todos"]+sorted({str(x) for x in s_view["SUPERVISOR"].tolist() if str(x).strip() and str(x)!="No asignado"})
@@ -712,7 +768,7 @@ base_view=base[base.PICKER.isin(s_view.PICKER)]
 fnr_view=fnr[fnr.PICKER.isin(s_view.PICKER)]
 mc_view=mc[mc.PICKER.isin(s_view.PICKER)]
 
-a,b,c,d,e,g,h,i,f=st.tabs(["🏠 Bodega","👤 Picker","🏷️ Artículos","📦 Pedidos","🌙 Turnos / Áreas","👥 Supervisores","🛡️ Seguimiento","🛠️ Resolver personal","📥 Exportar"])
+a,b,c,d,e,g,h,f,j=st.tabs(["🏠 Bodega","👤 Picker","🏷️ Artículos","📦 Pedidos","🌙 Turnos / Áreas","👥 Supervisores","🛡️ Seguimiento","📥 Exportar","📌 Pendientes & Procesos"])
 
 with a:
     lines=base_view.LINEAS.sum(); F=fnr_view.INCIDENCIAS.sum(); M=mc_view.INCIDENCIAS.sum()
@@ -732,28 +788,62 @@ with a:
     st.dataframe(s_view,use_container_width=True,hide_index=True)
 
 with b:
-    if sp=="Todos": st.info("Selecciona un picker.")
+    if sp=="Todos":
+        st.info("Selecciona un picker en los filtros para consultar su ficha completa.")
     else:
         r=s[s.PICKER==sp].iloc[0]
-        q=st.columns(4); q[0].metric("Líneas",f"{r.LINEAS:,.0f}"); q[1].metric("FNR",f"{r.FNR:,.0f}",f"{r['FNR_%']:.2f}%")
-        st.caption(f"Turno: {r.TURNO} · Correo/usuario: {r.CORREO} · Supervisor: {r.SUPERVISOR} · Área: {r.AREA_BASE}")
-        q[2].metric("MC",f"{r.MC:,.0f}",f"{r['MC_%']:.2f}%"); q[3].metric("Estado",r.ESTADO)
-        st.subheader("Artículos FNR"); st.dataframe(products(fnr,sp),use_container_width=True,hide_index=True)
-        st.subheader("Artículos MC"); st.dataframe(products(mc,sp),use_container_width=True,hide_index=True)
-        st.subheader("Pedidos FNR"); st.dataframe(orders(fnr,sp),use_container_width=True,hide_index=True)
-        rec = picker_record(store, sp)
-        st.subheader("📝 Comentarios del picker")
-        st.caption("Los comentarios quedan guardados para que cualquier supervisor pueda consultar antecedentes del picker.")
-        nuevo_com = st.text_area("Nuevo comentario", key=f"comentario_picker_{sp}", placeholder="Escribe una observación relevante del picker...")
-        comentario_sup = st.text_input("Supervisor que registra", key=f"comentario_sup_{sp}")
-        if st.button("Guardar comentario", key=f"guardar_com_{sp}"):
-            if nuevo_com.strip():
-                rec["comentarios"].append({"fecha":datetime.now().strftime("%Y-%m-%d %H:%M"),"supervisor":comentario_sup.strip() or "No especificado","texto":nuevo_com.strip()})
-                save_store(store); st.success("Comentario guardado."); st.rerun()
-        if rec["comentarios"]:
-            st.dataframe(pd.DataFrame(rec["comentarios"]),use_container_width=True,hide_index=True)
-        else:
-            st.info("Sin comentarios registrados.")
+        st.markdown(f"<div class='justo-card'><div class='justo-kicker'>Ficha de picker</div><div class='justo-title'>{sp}</div><div class='justo-muted'>Turno: {r.TURNO} · Supervisor: {r.SUPERVISOR} · Área: {r.AREA_BASE} · Usuario: {r.CORREO}</div></div>", unsafe_allow_html=True)
+        q=st.columns(4)
+        q[0].metric("Líneas",f"{r.LINEAS:,.0f}")
+        q[1].metric("FNR",f"{r.FNR:,.0f}",f"{r['FNR_%']:.2f}%")
+        q[2].metric("MC",f"{r.MC:,.0f}",f"{r['MC_%']:.2f}%")
+        q[3].metric("Estado",r.ESTADO)
+
+        st.subheader("Incidencias del picker")
+        cc=st.columns(2)
+        with cc[0]: st.dataframe(products(fnr,sp).head(15),use_container_width=True,hide_index=True)
+        with cc[1]: st.dataframe(products(mc,sp).head(15),use_container_width=True,hide_index=True)
+        st.subheader("Pedidos FNR")
+        st.dataframe(orders(fnr,sp).head(25),use_container_width=True,hide_index=True)
+
+        rec=picker_record(store,sp)
+        st.subheader("📝 Retroalimentación y seguimiento")
+        st.caption("Todo lo que registres aquí queda guardado en el historial del picker.")
+        fb_col, act_col=st.columns(2)
+        with fb_col:
+            with st.form(f"feedback_picker_form_{sp}", clear_on_submit=True):
+                fb_sup=st.text_input("Supervisor que registra",value=str(r.get("SUPERVISOR","")))
+                fortalezas=st.text_area("Fortalezas observadas")
+                mejora=st.text_area("Punto de mejora")
+                acuerdo=st.text_area("Acuerdo / acción de mejora")
+                if st.form_submit_button("Guardar retroalimentación", type="primary"):
+                    store.setdefault("feedback_rows",[]).append({
+                        "FECHA":datetime.now().strftime("%Y-%m-%d %H:%M"),"SUPERVISOR":fb_sup.strip() or "No especificado",
+                        "TURNO":str(r.get("TURNO","")),"PICKER":sp,"FNR_LINEAS_%":float(r["FNR_%"]),
+                        "MC_LINEAS_%":float(r["MC_%"]),"ESTADO":str(r["ESTADO"]),"FORTALEZAS":fortalezas,
+                        "PUNTO_MEJORA":mejora,"ACUERDO":acuerdo})
+                    save_store(store); st.success("Retroalimentación guardada."); st.rerun()
+        with act_col:
+            with st.form(f"accion_picker_form_{sp}", clear_on_submit=True):
+                act_type=st.selectbox("Tipo de seguimiento",["Llamada de atención","Advertencia verbal 1","Advertencia verbal 2","Acta 1","Acta 2","Acta 3","Cero tolerancia"])
+                act_sup=st.text_input("Supervisor",value=str(r.get("SUPERVISOR","")))
+                act_motivo=st.text_area("Motivo / detalle")
+                if st.form_submit_button("Guardar llamada / acta", type="primary"):
+                    rec["acciones"].append({"fecha":datetime.now().strftime("%Y-%m-%d %H:%M"),"accion":act_type,"supervisor":act_sup.strip() or "No especificado","motivo":act_motivo.strip()})
+                    save_store(store); st.success("Seguimiento guardado."); st.rerun()
+
+        picker_fb=[x for x in store.get("feedback_rows",[]) if str(x.get("PICKER",""))==sp]
+        if picker_fb:
+            st.markdown("**Historial de retroalimentaciones**")
+            st.dataframe(pd.DataFrame(picker_fb).sort_values("FECHA",ascending=False),use_container_width=True,hide_index=True)
+        if rec.get("comentarios"):
+            st.markdown("**Comentarios**")
+            st.dataframe(pd.DataFrame(rec["comentarios"]).sort_values("fecha",ascending=False),use_container_width=True,hide_index=True)
+        if rec.get("acciones"):
+            st.markdown("**Llamadas de atención / actas**")
+            st.dataframe(pd.DataFrame(rec["acciones"]).sort_values("fecha",ascending=False),use_container_width=True,hide_index=True)
+        if not picker_fb and not rec.get("comentarios") and not rec.get("acciones"):
+            st.info("Este picker todavía no tiene retroalimentaciones ni acciones registradas.")
 
 with c:
     tipo=st.radio("Tipo",["FNR","MC"],horizontal=True); data=fnr if tipo=="FNR" else mc
@@ -779,43 +869,21 @@ with e:
     st.warning("El % / líneas por área solo aparece si existe un denominador real de líneas por área.")
 
 with g:
-    st.subheader("Retroalimentación por turno")
-    if roster is None or roster.empty:
-        st.info("Elige el turno directamente desde el filtro del Excel consolidado.")
+    st.subheader("👥 Supervisores")
+    st.caption("Vista operativa para revisar carga, calidad y seguimiento por supervisor.")
+    sup_data=s_view.copy()
+    if not sup_data.empty:
+        sup_summary=(sup_data.groupby("SUPERVISOR",as_index=False)
+            .agg(PICKERS=("PICKER","nunique"),LINEAS=("LINEAS","sum"),FNR=("FNR","sum"),MC=("MC","sum"))
+            .sort_values("FNR",ascending=False))
+        sup_summary["FNR %"]=(sup_summary["FNR"]/sup_summary["LINEAS"].replace(0,pd.NA)*100).round(2)
+        sup_summary["MC %"]=(sup_summary["MC"]/sup_summary["LINEAS"].replace(0,pd.NA)*100).round(2)
+        st.dataframe(sup_summary,use_container_width=True,hide_index=True)
+        sup_focus=st.selectbox("Supervisor",["Todos"]+sorted([str(x) for x in sup_summary["SUPERVISOR"] if str(x).strip()]))
+        if sup_focus!="Todos":
+            st.dataframe(s_view[s_view["SUPERVISOR"]==sup_focus],use_container_width=True,hide_index=True)
     else:
-        turnos=sorted({str(x).strip() for x in roster["TURNO_MAESTRO"].dropna() if str(x).strip()})
-        turno_sel=st.selectbox("Turno",turnos if turnos else ["Sin turno"])
-        rt=roster[roster["TURNO_MAESTRO"]==turno_sel].copy()
-        supervisores=sorted([str(x) for x in rt["SUPERVISOR"].dropna().unique() if str(x).strip() and str(x)!="No asignado"])
-        sup_sel=st.selectbox("Supervisor",["Todos"]+supervisores)
-        if sup_sel!="Todos": rt=rt[rt["SUPERVISOR"]==sup_sel]
-        disponibles=[str(x).strip() for x in rt["PICKER"].tolist() if str(x).strip() in set(s["PICKER"].astype(str).str.strip())]
-        picker_sel=st.selectbox("Picker para retroalimentación",["Selecciona..."]+sorted(disponibles,key=lambda z:z.upper()))
-        if picker_sel!="Selecciona...":
-            r=s[s["PICKER"]==picker_sel].iloc[0]
-            st.markdown(f"### {picker_sel}")
-            q=st.columns(4); q[0].metric("Líneas",f"{r.LINEAS:,.0f}"); q[1].metric("FNR / líneas",f"{r['FNR_%']:.2f}%"); q[2].metric("MC / líneas",f"{r['MC_%']:.2f}%"); q[3].metric("Estado",r.ESTADO)
-            st.subheader("Incidencias del picker")
-            cc=st.columns(2)
-            with cc[0]: st.dataframe(products(fnr,picker_sel).head(15),use_container_width=True,hide_index=True)
-            with cc[1]: st.dataframe(products(mc,picker_sel).head(15),use_container_width=True,hide_index=True)
-            st.subheader("Retroalimentación")
-            supervisor_actual=sup_sel if sup_sel!="Todos" else (rt["SUPERVISOR"].iloc[0] if len(rt) else "No asignado")
-            fortalezas=st.text_area("Fortalezas observadas",key=f"fort_{picker_sel}")
-            mejora=st.text_area("Punto de mejora",key=f"mej_{picker_sel}")
-            acuerdo=st.text_area("Acuerdo / acción de mejora",key=f"acuerdo_{picker_sel}")
-            fecha=st.date_input("Fecha de retroalimentación",key=f"fecha_{picker_sel}")
-            if st.button("Guardar retroalimentación",key=f"save_{picker_sel}"):
-                row={"FECHA":str(fecha),"SUPERVISOR":supervisor_actual,"TURNO":turno_sel,"PICKER":picker_sel,"FNR_LINEAS_%":float(r["FNR_%"]),"MC_LINEAS_%":float(r["MC_%"]),"ESTADO":r["ESTADO"],"FORTALEZAS":fortalezas,"PUNTO_MEJORA":mejora,"ACUERDO":acuerdo}
-                store.setdefault("feedback_rows",[]).append(row)
-                save_store(store)
-                st.success("Retroalimentación guardada permanentemente.")
-                st.rerun()
-        if store.get("feedback_rows"):
-            st.subheader("Retroalimentaciones guardadas")
-            fb=pd.DataFrame(store["feedback_rows"])
-            st.dataframe(fb,use_container_width=True,hide_index=True)
-            st.download_button("📥 Descargar retroalimentaciones",feedback_export(store["feedback_rows"]),f"Retroalimentacion_{periodo}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.info("No hay datos para los filtros actuales.")
 
 with h:
     st.subheader("🛡️ Seguimiento de Pickers")
@@ -864,80 +932,78 @@ with h:
                 save_store(store); st.success("Picker reactivado."); st.rerun()
         st.info("Las estadísticas de FNR/MC de este periodo NO se filtran por estado. Un picker dado de baja sigue contando porque sus incidencias ocurrieron durante su periodo de operación.")
 
-with i:
-    st.subheader("🛠️ Resolver personal pendiente")
-    st.caption("Selecciona varios pickers sin coincidencia para asignarles el mismo turno, supervisor y área, o excluirlos del personal. Las líneas y los KPI históricos no se borran.")
-
-    pending_mask=(~match_series) & (~excluded_series) if "match_series" in globals() else pd.Series(False,index=base.index)
-    pending=base.loc[pending_mask,[c for c in ["PICKER","CORREO"] if c in base.columns]].copy()
-    pending["ETIQUETA"]=pending.apply(lambda r: f"{r.get('PICKER','')} | {r.get('CORREO','')}".strip(" |"),axis=1)
-    pending_options=pending["ETIQUETA"].astype(str).tolist()
-
-    if not pending_options:
-        st.success("No hay pickers pendientes de resolver.")
-    else:
-        selected_labels=st.multiselect("Pickers pendientes (selección múltiple)", pending_options, key="bulk_pending_select")
-        selected_rows=pending[pending["ETIQUETA"].isin(selected_labels)].copy()
-
-        roster_turns=sorted({str(x).strip() for x in roster.get("TURNO_MAESTRO",pd.Series(dtype=str)).dropna() if str(x).strip()})
-        roster_sups=sorted({str(x).strip() for x in roster.get("SUPERVISOR",pd.Series(dtype=str)).dropna() if str(x).strip() and str(x)!="No asignado"})
-        roster_areas=sorted({str(x).strip() for x in roster.get("AREA_MAESTRO",pd.Series(dtype=str)).dropna() if str(x).strip()})
-        turn_bulk=st.selectbox("Turno para los seleccionados", roster_turns or ["Matutino","Intermedio","Tarde"], key="bulk_turn")
-        sup_bulk=st.selectbox("Supervisor para los seleccionados", ["No asignado"]+roster_sups, key="bulk_sup")
-        area_bulk=st.selectbox("Área para los seleccionados", ["No especificada"]+roster_areas, key="bulk_area")
-
-        c_bulk1,c_bulk2=st.columns(2)
-        with c_bulk1:
-            if st.button("✅ Asignar seleccionados", key="bulk_assign"):
-                if not selected_labels:
-                    st.warning("Selecciona al menos un picker.")
-                else:
-                    store.setdefault("master_overrides",{})
-                    for _,rr in selected_rows.iterrows():
-                        original=str(rr.get("PICKER","")).strip()
-                        k=person_key(original)
-                        store["master_overrides"][k]={
-                            "PICKER":original,
-                            "TURNO":turn_bulk,
-                            "CORREO":str(rr.get("CORREO","") or "").strip(),
-                            "SUPERVISOR":sup_bulk,
-                            "AREA_BASE":area_bulk
-                        }
-                        store.setdefault("master_excluded",[])
-                        store["master_excluded"]=[x for x in store["master_excluded"] if x!=k]
-                    save_store(store)
-                    st.success(f"Se asignaron {len(selected_rows)} pickers.")
-                    st.rerun()
-        with c_bulk2:
-            if st.button("🗑️ Excluir seleccionados", key="bulk_exclude"):
-                if not selected_labels:
-                    st.warning("Selecciona al menos un picker.")
-                else:
-                    store.setdefault("master_excluded",[])
-                    for _,rr in selected_rows.iterrows():
-                        k=person_key(str(rr.get("PICKER","")).strip())
-                        if k and k not in store["master_excluded"]:
-                            store["master_excluded"].append(k)
-                    save_store(store)
-                    st.success(f"Se excluyeron {len(selected_rows)} pickers del personal.")
-                    st.rerun()
-
-        st.dataframe(selected_rows.drop(columns=["ETIQUETA"],errors="ignore") if not selected_rows.empty else pending.drop(columns=["ETIQUETA"],errors="ignore"), use_container_width=True, hide_index=True)
-
-    st.divider()
-    st.subheader("Administrar asignaciones y exclusiones")
-    saved_overrides=store.get("master_overrides",{})
-    saved_excluded=store.get("master_excluded",[])
-    st.write(f"Asignaciones manuales guardadas: **{len(saved_overrides)}** · Exclusiones guardadas: **{len(saved_excluded)}**")
-    if saved_excluded:
-        excluded_labels=[next((str(v) for v in base["PICKER"].tolist() if person_key(v)==k),k) for k in saved_excluded]
-        restore=st.multiselect("Pickers excluidos para reactivar", excluded_labels, key="bulk_restore_select")
-        if st.button("↩️ Reactivar seleccionados", key="bulk_restore"):
-            selected_keys={person_key(x) for x in restore}
-            store["master_excluded"]=[k for k in saved_excluded if k not in selected_keys]
-            save_store(store); st.success(f"Se reactivaron {len(selected_keys)} pickers."); st.rerun()
-
 with f:
     st.download_button("📥 Descargar Excel completo",export(s,fnr,mc,None if sp=="Todos" else sp,roster),f"Analisis_FNR_MC_{periodo}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    st.info("La app utiliza 3 Excel operativos separados (Pickers, FNR y MC) y una sola plantilla consolidada para turno, correo, supervisor y área.")
+    st.info("La app utiliza 3 Excel operativos separados (Pickers, FNR y MC) y un Master consolidado para turno, correo, supervisor y área.")
     st.success(f"Persistencia activa: {len(store.get('excluded_orders',[]))} pedidos excluidos · {len(store.get('master_overrides',{}))} asignaciones manuales · {len(store.get('master_excluded',[]))} exclusiones de personal · {len(store.get('feedback_rows',[]))} retroalimentaciones guardadas.")
+
+with j:
+    st.subheader("📌 Tablero de pendientes y procesos")
+    st.caption("Aquí el responsable puede publicar procesos nuevos, pendientes operativos y material visual de referencia. Todo queda guardado.")
+
+    with st.expander("➕ Crear nuevo proceso / pendiente", expanded=False):
+        with st.form("nuevo_proceso_form", clear_on_submit=True):
+            p1,p2=st.columns([2,1])
+            with p1:
+                proc_titulo=st.text_input("Nombre del proceso / pendiente",placeholder="Ej. Validación de pedidos 07:00–12:00")
+                proc_obj=st.text_area("Objetivo / qué se debe hacer",height=90)
+                proc_pasos=st.text_area("Pasos o instrucciones",height=130,placeholder="1. ...\n2. ...\n3. ...")
+            with p2:
+                proc_resp=st.text_input("Responsable")
+                proc_prior=st.selectbox("Prioridad",["Alta","Media","Baja"])
+                proc_status=st.selectbox("Estado",["Pendiente","En proceso","Completado"])
+                proc_fecha=st.date_input("Fecha objetivo",value=datetime.now().date())
+                proc_imgs=st.file_uploader("Imágenes referenciales",type=["png","jpg","jpeg","webp"],accept_multiple_files=True,key="proc_imgs_new")
+            if st.form_submit_button("Guardar proceso",type="primary"):
+                if not proc_titulo.strip():
+                    st.warning("Escribe un nombre para el proceso.")
+                else:
+                    pid=new_process_id()
+                    paths=[]
+                    for img in proc_imgs or []:
+                        paths.append(save_process_image(img.getvalue(),pid,img.name))
+                    store.setdefault("procesos",[]).append({
+                        "id":pid,"titulo":proc_titulo.strip(),"objetivo":proc_obj.strip(),"pasos":proc_pasos.strip(),
+                        "responsable":proc_resp.strip(),"prioridad":proc_prior,"estado":proc_status,
+                        "fecha_objetivo":str(proc_fecha),"creado":datetime.now().strftime("%Y-%m-%d %H:%M"),"imagenes":paths})
+                    save_store(store); st.success("Proceso guardado."); st.rerun()
+
+    procesos=store.get("procesos",[])
+    if not procesos:
+        st.info("Todavía no hay procesos o pendientes publicados.")
+    else:
+        status_order=["Pendiente","En proceso","Completado"]
+        for status_name in status_order:
+            items=[p for p in procesos if p.get("estado")==status_name]
+            st.markdown(f"### {status_name} · {len(items)}")
+            cols=st.columns(3)
+            if not items:
+                st.caption("Sin elementos en esta columna.")
+            for idx,proc in enumerate(items):
+                with cols[idx%3]:
+                    priority=proc.get("prioridad","Media")
+                    st.markdown(f"<div class='justo-card'><div class='justo-kicker'>{priority}</div><div class='justo-title'>{proc.get('titulo','Sin título')}</div><div class='justo-muted'>Responsable: {proc.get('responsable') or 'Sin asignar'} · Fecha: {proc.get('fecha_objetivo') or 'Sin fecha'}</div></div>",unsafe_allow_html=True)
+                    if proc.get("objetivo"): st.write(proc["objetivo"])
+                    if proc.get("pasos"):
+                        with st.expander("Ver instrucciones"):
+                            st.write(proc["pasos"])
+                    imgs=load_process_images(proc)
+                    if imgs:
+                        st.image([data for _,data in imgs],caption=[os.path.basename(path) for path,_ in imgs],use_container_width=True)
+                    new_status=st.selectbox("Cambiar estado",status_order,index=status_order.index(proc.get("estado","Pendiente")) if proc.get("estado") in status_order else 0,key=f"proc_status_{proc['id']}")
+                    ec1,ec2=st.columns(2)
+                    with ec1:
+                        if st.button("Guardar estado",key=f"proc_save_{proc['id']}"):
+                            for pp in store["procesos"]:
+                                if pp.get("id")==proc.get("id"): pp["estado"]=new_status
+                            save_store(store); st.rerun()
+                    with ec2:
+                        if st.button("Eliminar",key=f"proc_del_{proc['id']}"):
+                            store["procesos"]=[pp for pp in store["procesos"] if pp.get("id")!=proc.get("id")]
+                            save_store(store); st.rerun()
+
+    st.divider()
+    st.subheader("💾 Respaldo de configuración")
+    st.caption("Para evitar perder asignaciones, seguimientos y procesos si Streamlit Cloud reinicia el contenedor, puedes descargar un respaldo y conservarlo.")
+    backup_json=json.dumps(store,ensure_ascii=False,indent=2).encode("utf-8")
+    st.download_button("Descargar respaldo de configuración",backup_json,f"Respaldo_Control_FNR_{periodo}.json","application/json")
