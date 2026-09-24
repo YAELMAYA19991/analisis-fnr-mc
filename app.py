@@ -1,4 +1,6 @@
+
 import io, re, json, os
+from difflib import SequenceMatcher
 from datetime import datetime
 import pandas as pd
 import streamlit as st
@@ -99,6 +101,7 @@ def parse_roster(df, turno_fijo=None):
         "SUPERVISOR":df[sup].astype(str).str.strip() if sup else "No asignado",
         "AREA_MAESTRO":df[ar].astype(str).str.strip() if ar else ""
     })
+    x["TURNO_MAESTRO"]=x["TURNO_MAESTRO"].fillna("").astype(str).str.strip()
     x=x[x["PICKER"].str.strip().ne("")].copy()
     x["_KEY"]=x["PICKER"].map(person_key)
     x["_TOKEN_KEY"]=x["PICKER"].map(token_key)
@@ -115,27 +118,46 @@ def apply_roster(base, roster):
     token_map=r.drop_duplicates("_TOKEN_KEY").set_index("_TOKEN_KEY")
     code_map=r[r["_CODE_KEY"].astype(str).str.strip().ne("")].drop_duplicates("_CODE_KEY").set_index("_CODE_KEY")
 
+    master_rows=r.to_dict("records")
     def lookup(row):
+        # 1) nombre exacto normalizado, 2) mismas palabras aunque estén en otro orden,
+        # 3) código/usuario, 4) coincidencia aproximada para diferencias menores de escritura.
         for key,mp in [(row.get("_KEY",""),exact),(row.get("_TOKEN_KEY",""),token_map),(row.get("_CODE_KEY",""),code_map)]:
             if key and key in mp.index:
                 rr=mp.loc[key]
                 if isinstance(rr,pd.DataFrame): rr=rr.iloc[0]
-                return pd.Series([rr.get("TURNO_MAESTRO",""),rr.get("CORREO",""),rr.get("SUPERVISOR","No asignado"),rr.get("AREA_MAESTRO","")])
-        return pd.Series(["","","No asignado",""])
+                return pd.Series([rr.get("PICKER",""),rr.get("TURNO_MAESTRO",""),rr.get("CORREO",""),rr.get("SUPERVISOR","No asignado"),rr.get("AREA_MAESTRO","")])
+        # Fuzzy conservador: solo si hay una coincidencia claramente alta.
+        name_key=str(row.get("_KEY","") or "")
+        if name_key:
+            best=None; best_score=0.0; second=0.0
+            for rr in master_rows:
+                score=SequenceMatcher(None,name_key,str(rr.get("_KEY","") or "")).ratio()
+                if score>best_score:
+                    second=best_score; best_score=score; best=rr
+                elif score>second:
+                    second=score
+            if best is not None and best_score>=0.90 and (best_score-second>=0.03 or best_score>=0.96):
+                return pd.Series([best.get("PICKER",""),best.get("TURNO_MAESTRO",""),best.get("CORREO",""),best.get("SUPERVISOR","No asignado"),best.get("AREA_MAESTRO","")])
+        return pd.Series(["","","","No asignado",""])
 
     vals=x.apply(lookup,axis=1)
-    vals.columns=["TURNO_MAESTRO","CORREO_MASTER","SUPERVISOR_MASTER","AREA_MAESTRO"]
+    vals.columns=["PICKER_MASTER","TURNO_MAESTRO","CORREO_MASTER","SUPERVISOR_MASTER","AREA_MAESTRO"]
     x=pd.concat([x.reset_index(drop=True),vals.reset_index(drop=True)],axis=1)
     tm=x["TURNO_MAESTRO"].fillna("").astype(str).str.strip()
     tb=x["TURNO"].fillna("").astype(str).str.strip()
     x["TURNO"]=tm.where(tm.ne(""),tb)
+    # El nombre del Master es el nombre canónico para que FNR/MC y los filtros
+    # trabajen sobre la misma identidad del picker.
+    pm=x["PICKER_MASTER"].fillna("").astype(str).str.strip()
+    x["PICKER"]=pm.where(pm.ne(""),x["PICKER"].astype(str).str.strip())
     am=x["AREA_MAESTRO"].fillna("").astype(str).str.strip()
     ab=x["AREA_BASE"].fillna("").astype(str).str.strip()
     x["AREA_BASE"]=am.where(am.ne(""),ab)
     x["SUPERVISOR"]=x["SUPERVISOR_MASTER"].fillna("No asignado").astype(str).str.strip()
     master_email=x["CORREO_MASTER"].fillna("").astype(str).str.strip()
     x["CORREO"]=master_email.where(master_email.ne(""),x["CORREO"].fillna("").astype(str).str.strip())
-    return x.drop(columns=["_KEY","_TOKEN_KEY","_CODE_KEY","TURNO_MAESTRO","CORREO_MASTER","SUPERVISOR_MASTER","AREA_MAESTRO"],errors="ignore")
+    return x.drop(columns=["_KEY","_TOKEN_KEY","_CODE_KEY","PICKER_MASTER","TURNO_MAESTRO","CORREO_MASTER","SUPERVISOR_MASTER","AREA_MAESTRO"],errors="ignore")
 
 def roster_from_uploads(uploads):
     frames=[]
