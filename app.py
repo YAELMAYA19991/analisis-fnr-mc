@@ -224,22 +224,31 @@ with st.sidebar:
     uf=st.file_uploader("② Detalle FNR",type=["xlsx","xls"],key="detalle_fnr")
     um=st.file_uploader("③ Detalle Mala Calidad",type=["xlsx","xls"],key="detalle_mc")
     up=st.file_uploader("④ Plantilla consolidada de personal",type=["xlsx","xls"],key="plantilla_personal")
-    st.caption("Los 3 archivos operativos siguen separados. Solo la plantilla de personal concentra turno, correo, supervisor y área.")
+    st.caption("Los 3 archivos operativos siguen separados. El Excel maestro concentra PICKER, TURNO, CODIGO + CORREO, SUPERVISOR y AREA_BASE.")
     st.divider(); periodo=st.text_input("Periodo",datetime.now().strftime("%Y-%m"))
     ex=st.text_area("Pedidos operativos a excluir (uno por línea)")
     excluded={x.strip() for x in ex.splitlines() if x.strip()}
 
 if not (ub and uf and um and up):
     st.info("Carga los 3 Excel operativos y la plantilla consolidada de personal para comenzar.")
-    st.markdown("**Archivos:** ① Pickers/Líneas · ② FNR · ③ Mala Calidad · ④ Plantilla consolidada (turno, correo, supervisor y área).")
+    st.markdown("**Archivos:** ① Pickers/Líneas · ② FNR · ③ Mala Calidad · ④ Master Pickers (PICKER, TURNO, CODIGO + CORREO, SUPERVISOR, AREA_BASE).")
     st.stop()
 
 try:
     base=parse_base(choose(sheets(ub),["picker","lineas","resumen"]))
     fnr=parse_inc(choose(sheets(uf),["fnr","detalle"]),"FNR")
     mc=parse_inc(choose(sheets(um),["mc","mala"]),"MC")
-    roster=parse_roster(choose(sheets(up),["maestro_personal","personal","maestro","turno"]))
+    # La plantilla maestra actual tiene una sola hoja: Base_Pickers.
+    # Columnas: PICKER, TURNO, CODIGO + CORREO, SUPERVISOR, AREA_BASE.
+    master_sheets=sheets(up)
+    if "Base_Pickers" in master_sheets:
+        master_df=master_sheets["Base_Pickers"]
+    else:
+        master_df=choose(master_sheets,["base_pickers","maestro_personal","personal","maestro","turno"])
+    roster=parse_roster(master_df)
     base=apply_roster(base,roster)
+    if roster.empty:
+        raise ValueError("El Excel maestro no contiene pickers válidos.")
 except Exception as e:
     st.error(f"Error en los archivos cargados: {e}"); st.stop()
 
