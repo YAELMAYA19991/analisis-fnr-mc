@@ -1,11 +1,32 @@
 
-import io, re
+import io, re, json, os
 from datetime import datetime
 import pandas as pd
 import streamlit as st
 
 st.set_page_config(page_title="Control FNR & MC", page_icon="📊", layout="wide")
 FNR_OBJ, MC_OBJ = 1.50, 1.00
+STORE_FILE = "picker_seguimiento.json"
+
+def load_store():
+    if os.path.exists(STORE_FILE):
+        try:
+            with open(STORE_FILE, "r", encoding="utf-8") as f: return json.load(f)
+        except Exception: pass
+    return {"pickers": {}}
+
+def save_store(store):
+    tmp = STORE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f: json.dump(store, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, STORE_FILE)
+
+def picker_record(store, picker):
+    rec = store.setdefault("pickers", {}).setdefault(picker, {"estado":"ACTIVO", "comentarios":[], "acciones":[]})
+    rec.setdefault("estado", "ACTIVO"); rec.setdefault("comentarios", []); rec.setdefault("acciones", [])
+    return rec
+
+def active_picker_names(store):
+    return {p for p,r in store.get("pickers",{}).items() if r.get("estado", "ACTIVO") == "ACTIVO"}
 
 def norm(x):
     x = str(x).strip().lower().translate(str.maketrans("áéíóúüñ","aeiouun"))
@@ -230,6 +251,10 @@ if excluded:
     fnr=fnr[~fnr.ORDER_NUMBER.isin(excluded)].copy()
     mc=mc[~mc.ORDER_NUMBER.isin(excluded)].copy()
 fnr=attach(fnr,base); mc=attach(mc,base); s=summary(base,fnr,mc)
+store = load_store()
+# Registrar automáticamente pickers vistos en la operación, sin alterar su estado histórico.
+for _p in base["PICKER"].astype(str).str.strip().unique(): picker_record(store, _p)
+save_store(store)
 
 if roster is not None:
     matched=base["PICKER"].isin(roster["PICKER"]).sum()
@@ -245,7 +270,7 @@ with st.sidebar:
     turns.extend(sorted({str(x) for x in s["TURNO"].tolist() if str(x).strip()}))
     sp=st.selectbox("Picker",pickers); stn=st.selectbox("Turno",turns)
 
-a,b,c,d,e,g,f=st.tabs(["🏠 Bodega","👤 Picker","🏷️ Artículos","📦 Pedidos","🌙 Turnos / Áreas","👥 Supervisores","📥 Exportar"])
+a,b,c,d,e,g,h,f=st.tabs(["🏠 Bodega","👤 Picker","🏷️ Artículos","📦 Pedidos","🌙 Turnos / Áreas","👥 Supervisores","🛡️ Seguimiento","📥 Exportar"])
 
 with a:
     lines=base.LINEAS.sum(); F=fnr.INCIDENCIAS.sum(); M=mc.INCIDENCIAS.sum()
@@ -273,6 +298,19 @@ with b:
         st.subheader("Artículos FNR"); st.dataframe(products(fnr,sp),use_container_width=True,hide_index=True)
         st.subheader("Artículos MC"); st.dataframe(products(mc,sp),use_container_width=True,hide_index=True)
         st.subheader("Pedidos FNR"); st.dataframe(orders(fnr,sp),use_container_width=True,hide_index=True)
+        rec = picker_record(store, sp)
+        st.subheader("📝 Comentarios del picker")
+        st.caption("Los comentarios quedan guardados para que cualquier supervisor pueda consultar antecedentes del picker.")
+        nuevo_com = st.text_area("Nuevo comentario", key=f"comentario_picker_{sp}", placeholder="Escribe una observación relevante del picker...")
+        comentario_sup = st.text_input("Supervisor que registra", key=f"comentario_sup_{sp}")
+        if st.button("Guardar comentario", key=f"guardar_com_{sp}"):
+            if nuevo_com.strip():
+                rec["comentarios"].append({"fecha":datetime.now().strftime("%Y-%m-%d %H:%M"),"supervisor":comentario_sup.strip() or "No especificado","texto":nuevo_com.strip()})
+                save_store(store); st.success("Comentario guardado."); st.rerun()
+        if rec["comentarios"]:
+            st.dataframe(pd.DataFrame(rec["comentarios"]),use_container_width=True,hide_index=True)
+        else:
+            st.info("Sin comentarios registrados.")
 
 with c:
     tipo=st.radio("Tipo",["FNR","MC"],horizontal=True); data=fnr if tipo=="FNR" else mc
@@ -287,42 +325,16 @@ with d:
     st.caption("PICKERS indica cuántos pickers aparecen en el mismo pedido.")
 
 with e:
-    if roster is not None and not roster.empty:
+    if roster is not None:
         st.success("Los turnos mostrados aquí provienen del maestro de personas cargado en ④.")
     else:
-        st.info("Puedes cargar el maestro de personas por turno en ④ para asignar el turno de cada picker y cruzarlo con FNR/MC.")
+        st.info("Puedes cargar un maestro de personas por turno en ④ para asignar el turno de cada picker y cruzarlo con FNR/MC.")
+    st.subheader("FNR por turno"); st.dataframe(groups(fnr,base,"TURNO"),use_container_width=True,hide_index=True)
+    st.subheader("MC por turno"); st.dataframe(groups(mc,base,"TURNO"),use_container_width=True,hide_index=True)
+    st.subheader("FNR por área"); st.dataframe(groups(fnr,base,"AREA"),use_container_width=True,hide_index=True)
+    st.subheader("MC por área"); st.dataframe(groups(mc,base,"AREA"),use_container_width=True,hide_index=True)
+    st.warning("El % / líneas por área solo aparece si existe un denominador real de líneas por área.")
 
-    st.subheader("FNR por turno")
-    st.dataframe(
-        groups(fnr,base,"TURNO"),
-        use_container_width=True,
-        hide_index=True
-    )
-
-    st.subheader("MC por turno")
-    st.dataframe(
-        groups(mc,base,"TURNO"),
-        use_container_width=True,
-        hide_index=True
-    )
-
-    st.subheader("FNR por área")
-    st.dataframe(
-        groups(fnr,base,"AREA"),
-        use_container_width=True,
-        hide_index=True
-    )
-
-    st.subheader("MC por área")
-    st.dataframe(
-        groups(mc,base,"AREA"),
-        use_container_width=True,
-        hide_index=True
-    )
-
-    st.warning(
-        "El % / líneas por área solo aparece si existe un denominador real de líneas por área."
-    )
 with g:
     st.subheader("Retroalimentación por turno")
     if roster is None or roster.empty:
@@ -359,6 +371,53 @@ with g:
             fb=pd.DataFrame(st.session_state["feedback_rows"])
             st.dataframe(fb,use_container_width=True,hide_index=True)
             st.download_button("📥 Descargar retroalimentaciones",feedback_export(st.session_state["feedback_rows"]),f"Retroalimentacion_{periodo}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+with h:
+    st.subheader("🛡️ Seguimiento de Pickers")
+    st.caption("La baja saca al picker del seguimiento activo, pero conserva todo su historial. Sus incidencias siguen contando en las estadísticas del periodo en que ocurrieron.")
+    # Lista de seguimiento se separa de las estadísticas: s sigue conteniendo todos los pickers del periodo.
+    all_names = sorted(set(base["PICKER"].astype(str).str.strip()) | set(store.get("pickers",{}).keys()))
+    vista = st.radio("Mostrar", ["Activos", "Dados de baja", "Todos"], horizontal=True)
+    rows=[]
+    for p in all_names:
+        rec=picker_record(store,p)
+        acciones=rec.get("acciones",[])
+        counts={a:sum(1 for x in acciones if x.get("accion")==a) for a in ["Advertencia verbal 1","Advertencia verbal 2","Acta 1","Acta 2","Acta 3","Cero tolerancia"]}
+        rows.append({"PICKER":p,"ESTADO":rec.get("estado","ACTIVO"),**counts,"ÚLTIMA ACCIÓN":acciones[-1].get("fecha","") if acciones else ""})
+    track=pd.DataFrame(rows)
+    if vista=="Activos": track=track[track.ESTADO=="ACTIVO"]
+    elif vista=="Dados de baja": track=track[track.ESTADO=="BAJA"]
+    st.dataframe(track,use_container_width=True,hide_index=True)
+    st.divider()
+    opciones = track["PICKER"].tolist() if not track.empty else all_names
+    if opciones:
+        picker_track=st.selectbox("Picker", opciones, key="picker_tracking")
+        rec=picker_record(store,picker_track)
+        c1,c2,c3=st.columns(3)
+        c1.metric("Estado",rec.get("estado","ACTIVO"))
+        c2.metric("Comentarios",len(rec.get("comentarios",[])))
+        c3.metric("Acciones",len(rec.get("acciones",[])))
+        st.subheader("Registrar acción")
+        accion=st.selectbox("Tipo de seguimiento",["Advertencia verbal 1","Advertencia verbal 2","Acta 1","Acta 2","Acta 3","Cero tolerancia"],key="accion_tipo")
+        sup_acc=st.text_input("Supervisor",key="accion_supervisor")
+        motivo=st.text_area("Motivo / detalle",key="accion_motivo")
+        if st.button("Guardar acción",key="guardar_accion"):
+            rec["acciones"].append({"fecha":datetime.now().strftime("%Y-%m-%d %H:%M"),"accion":accion,"supervisor":sup_acc.strip() or "No especificado","motivo":motivo.strip()})
+            save_store(store); st.success("Acción registrada."); st.rerun()
+        if rec.get("acciones"):
+            st.subheader("Historial de acciones")
+            st.dataframe(pd.DataFrame(rec["acciones"]),use_container_width=True,hide_index=True)
+        st.subheader("Estado del picker")
+        if rec.get("estado","ACTIVO")=="ACTIVO":
+            st.warning("Dar de baja NO borra al picker ni sus estadísticas históricas. Solo lo retira del seguimiento activo.")
+            if st.button("⛔ Dar de baja de la base de seguimiento",key="baja_picker"):
+                rec["estado"]="BAJA"; rec["baja_fecha"]=datetime.now().strftime("%Y-%m-%d %H:%M")
+                save_store(store); st.success("Picker dado de baja del seguimiento activo. Su histórico permanece."); st.rerun()
+        else:
+            if st.button("↩️ Reactivar en seguimiento",key="reactivar_picker"):
+                rec["estado"]="ACTIVO"; rec["reactivacion_fecha"]=datetime.now().strftime("%Y-%m-%d %H:%M")
+                save_store(store); st.success("Picker reactivado."); st.rerun()
+        st.info("Las estadísticas de FNR/MC de este periodo NO se filtran por estado. Un picker dado de baja sigue contando porque sus incidencias ocurrieron durante su periodo de operación.")
 
 with f:
     st.download_button("📥 Descargar Excel completo",export(s,fnr,mc,None if sp=="Todos" else sp,roster),f"Analisis_FNR_MC_{periodo}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
