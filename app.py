@@ -34,13 +34,29 @@ def norm(x):
     return re.sub(r"[^a-z0-9]+","_",x).strip("_")
 
 def person_key(x):
-    """Clave robusta para cruzar nombres aunque cambien mayúsculas, acentos o signos."""
-    return norm(x).replace("_", "")
+    """Clave robusta para nombres: sin acentos, signos ni diferencias de espacios."""
+    return re.sub(r"[^a-z0-9]", "", norm(x))
+
+def name_tokens(x):
+    """Tokens de identidad de una persona."""
+    return {t for t in norm(x).split("_") if t and len(t) > 1}
 
 def token_key(x):
-    """Clave por palabras para tolerar nombres escritos en distinto orden."""
-    k=norm(x)
-    return "_".join(sorted([t for t in k.split("_") if t]))
+    return "_".join(sorted(name_tokens(x)))
+
+def extract_code(value):
+    """Extrae el código del formato 1188502.nombre@justo.mx o JT1180680.nombre@..."""
+    s=str(value or "").strip().lower()
+    if not s or s in {"nan", "none"}: return ""
+    m=re.match(r"^(jt)?(\d+)(?:\.|\s|$)", s)
+    return (m.group(2) if m else "")
+
+def email_name_tokens(value):
+    """Obtiene los nombres del correo ignorando el código inicial."""
+    s=str(value or "").strip().lower()
+    if "@" in s: s=s.split("@",1)[0]
+    s=re.sub(r"^(?:jt)?\d+[._-]*", "", s)
+    return name_tokens(s.replace(".", "_"))
 
 def clean(df):
     x=df.copy(); x.columns=[norm(c) for c in x.columns]; return x
@@ -83,7 +99,8 @@ def parse_base(df):
     })
     x["_KEY"]=x["PICKER"].map(person_key)
     x["_TOKEN_KEY"]=x["PICKER"].map(token_key)
-    x["_CODE_KEY"]=x["CORREO"].map(lambda v: norm(v.split(".",1)[0]) if str(v).strip() else "")
+    x["_CODE_KEY"]=x["CORREO"].map(extract_code)
+    x["_EMAIL_TOKENS"]=x["CORREO"].map(email_name_tokens)
     return x.sort_values("LINEAS").drop_duplicates("PICKER",keep="last")
 
 def parse_roster(df, turno_fijo=None):
@@ -105,59 +122,93 @@ def parse_roster(df, turno_fijo=None):
     x=x[x["PICKER"].str.strip().ne("")].copy()
     x["_KEY"]=x["PICKER"].map(person_key)
     x["_TOKEN_KEY"]=x["PICKER"].map(token_key)
-    x["_CODE_KEY"]=x["CORREO"].map(lambda v: norm(v.split(".",1)[0]) if str(v).strip() else "")
+    x["_CODE_KEY"]=x["CORREO"].map(extract_code)
+    x["_EMAIL_TOKENS"]=x["CORREO"].map(email_name_tokens)
     x=x.drop_duplicates("_KEY",keep="last")
     return x
 
 def _match_master_row(value, roster, code_value=""):
-    """Encuentra el picker del Master de forma robusta.
-    Orden: nombre exacto, mismas palabras, código/correo y similitud segura.
+    """Resuelve una persona contra el Master.
+
+    Prioridad de identidad:
+    1) nombre exacto normalizado;
+    2) mismas palabras aunque cambie el orden;
+    3) código de empleado;
+    4) nombre parcial/subconjunto (ej. "AMARO PAULINA ANDREA" contra
+       "AMARO OROPEZA PAULINA ANDREA");
+    5) nombre del correo;
+    6) similitud conservadora.
+
+    Nunca asigna por una sola palabra genérica.
     """
-    if roster is None or roster.empty:
-        return None
-    key=person_key(value)
-    tkey=token_key(value)
-    code=norm(str(code_value).split(".",1)[0]) if str(code_value).strip() else ""
-    # exacto por nombre normalizado
-    for _,rr in roster.iterrows():
-        if key and key==rr.get("_KEY",""):
-            return rr
-    # mismas palabras, independientemente del orden
-    for _,rr in roster.iterrows():
-        if tkey and tkey==rr.get("_TOKEN_KEY",""):
-            return rr
-    # código / usuario antes del correo (ej. 1188502.nombre@justo.mx)
+    if roster is None or roster.empty: return None
+    value=str(value or "").strip()
+    key=person_key(value); toks=name_tokens(value)
+    code=extract_code(code_value) or extract_code(value)
+    email_toks=email_name_tokens(code_value)
+
+    # 1. Nombre exacto
+    hits=roster[roster["_KEY"].astype(str)==key] if key else roster.iloc[0:0]
+    if len(hits)==1: return hits.iloc[0]
+
+    # 2. Todas las palabras coinciden, sin importar orden
+    if toks:
+        hits=roster[roster["_TOKEN_KEY"].astype(str)==token_key(value)]
+        if len(hits)==1: return hits.iloc[0]
+
+    # 3. Código único
     if code:
         hits=roster[roster["_CODE_KEY"].astype(str)==code]
-        if len(hits): return hits.iloc[0]
-    # coincidencia por conjunto de palabras; evita que un nombre muy corto genere falsos positivos
-    toks=set([t for t in norm(value).split("_") if t])
-    if len(toks)>=2:
-        best=None; best_score=0.0; second=0.0
-        for _,rr in roster.iterrows():
-            rtoks=set([t for t in norm(rr["PICKER"]).split("_") if t])
-            inter=len(toks & rtoks); union=len(toks | rtoks) or 1
-            j=inter/union
-            seq=SequenceMatcher(None,key,str(rr.get("_KEY","") or "")).ratio()
-            # Jaccard pesa más cuando el orden de nombres cambia.
-            score=0.65*j+0.35*seq
-            if score>best_score:
-                second=best_score; best_score=score; best=rr
-            elif score>second:
-                second=score
-        if best is not None and best_score>=0.84 and (best_score-second>=0.04 or best_score>=0.93):
-            return best
+        if len(hits)==1: return hits.iloc[0]
+
+    # 4/5. Puntaje por identidad: favorece que TODOS los tokens del nombre
+    # corto estén contenidos en el nombre del Master, o que el correo aporte
+    # nombre+apellido.
+    candidates=[]
+    for _,rr in roster.iterrows():
+        rtoks=name_tokens(rr.get("PICKER",""))
+        if not rtoks: continue
+        overlap=len(toks & rtoks)
+        union=len(toks | rtoks) or 1
+        # Cobertura del nombre de entrada y del Master.
+        cov_in=overlap/(len(toks) or 1)
+        cov_master=overlap/(len(rtoks) or 1)
+        j=overlap/union
+        seq=SequenceMatcher(None,key,str(rr.get("_KEY","") or "")).ratio()
+        etoks=rr.get("_EMAIL_TOKENS",set())
+        email_overlap=len(email_toks & etoks) if email_toks else 0
+        email_cov=email_overlap/(len(email_toks) or 1) if email_toks else 0
+        # Código ya fue evaluado; aquí el correo ayuda cuando el Excel
+        # operativo trae nombre y el Master tiene nombre+correo.
+        score=(0.50*cov_in)+(0.18*j)+(0.17*seq)+(0.15*email_cov)
+        candidates.append((score,cov_in,j,seq,email_cov,rr))
+
+    candidates.sort(key=lambda z:z[0], reverse=True)
+    if not candidates: return None
+    best=candidates[0]; second=candidates[1][0] if len(candidates)>1 else 0
+    score,cov_in,j,seq,email_cov,rr=best
+
+    # Caso fuerte: al menos 2 palabras del nombre de entrada están en el Master
+    # y todas las palabras de entrada están cubiertas por ese Master.
+    if len(toks)>=2 and cov_in>=1.0 and len(toks & name_tokens(rr["PICKER"]))>=2:
+        if score>=0.60 and (score-second>=0.05 or score>=0.82): return rr
+    # Si el correo identifica al menos dos tokens, es una señal fuerte.
+    if len(email_toks)>=2 and email_cov>=1.0 and len(email_toks & name_tokens(rr["PICKER"]))>=2:
+        if score>=0.58 and (score-second>=0.04 or score>=0.82): return rr
+    # Coincidencia muy cercana para errores de escritura.
+    if score>=0.90 and (score-second>=0.04 or score>=0.96): return rr
     return None
 
 def apply_roster(base, roster):
     if roster is None or roster.empty: return base
     x=base.copy()
-    matched=[]
+    matches=[]
     for _,row in x.iterrows():
         rr=_match_master_row(row.get("PICKER",""),roster,row.get("CORREO",""))
-        matched.append(rr)
+        matches.append(rr)
+
     out=[]
-    for row,rr in zip(x.to_dict("records"),matched):
+    for row,rr in zip(x.to_dict("records"),matches):
         if rr is None:
             row["_MASTER_MATCH"]=False
             row["_MASTER_PICKER"]=""
@@ -174,55 +225,48 @@ def apply_roster(base, roster):
             row["_MASTER_AREA"]=str(rr.get("AREA_MAESTRO","")).strip()
         out.append(row)
     x=pd.DataFrame(out)
-    # El Master es la fuente oficial de identidad, turno, correo, supervisor y área.
+
     ok=x["_MASTER_MATCH"]
     x.loc[ok,"PICKER"]=x.loc[ok,"_MASTER_PICKER"]
     x.loc[ok,"TURNO"]=x.loc[ok,"_MASTER_TURNO"]
     x.loc[ok,"CORREO"]=x.loc[ok,"_MASTER_CORREO"]
     x.loc[ok,"SUPERVISOR"]=x.loc[ok,"_MASTER_SUPERVISOR"]
     x.loc[ok,"AREA_BASE"]=x.loc[ok,"_MASTER_AREA"]
-    return x.drop(columns=["_KEY","_TOKEN_KEY","_CODE_KEY","_MASTER_PICKER","_MASTER_TURNO","_MASTER_CORREO","_MASTER_SUPERVISOR","_MASTER_AREA"],errors="ignore")
+    return x.drop(columns=["_KEY","_TOKEN_KEY","_CODE_KEY","_EMAIL_TOKENS","_MASTER_PICKER","_MASTER_TURNO","_MASTER_CORREO","_MASTER_SUPERVISOR","_MASTER_AREA"],errors="ignore")
 
 def canonicalize_incidents(inc, base):
-    """Alinea FNR/MC al nombre canónico de la base ya cruzada con Master."""
-    if inc is None or inc.empty or base is None or base.empty:
-        return inc
+    """Lleva FNR/MC al nombre canónico de la base, usando nombre/código/correo."""
+    if inc is None or inc.empty or base is None or base.empty: return inc
     out=inc.copy()
-    b=base.copy()
-    b["_KEY2"]=b["PICKER"].map(person_key)
-    b["_TOKEN2"]=b["PICKER"].map(token_key)
-    b["_CODE2"]=b["CORREO"].map(lambda v:norm(str(v).split(".",1)[0]) if str(v).strip() else "")
-    records=b.to_dict("records")
-    canonical=[]
+    records=base.to_dict("records")
+    # Índices directos
+    by_key={person_key(r.get("PICKER","")):r for r in records if person_key(r.get("PICKER",""))}
+    by_token={token_key(r.get("PICKER","")):r for r in records if token_key(r.get("PICKER",""))}
+    by_code={extract_code(r.get("CORREO","")):r for r in records if extract_code(r.get("CORREO",""))}
+
+    result=[]
     for _,row in out.iterrows():
-        k=person_key(row.get("PICKER","")); tk=token_key(row.get("PICKER",""))
-        hit=b[b["_KEY2"]==k]
-        if hit.empty:
-            hit=b[b["_TOKEN2"]==tk]
-        if hit.empty:
-            code=norm(str(row.get("PICKER","")).split(".",1)[0])
-            if code:
-                hit=b[b["_CODE2"]==code]
-        if not hit.empty:
-            canonical.append(str(hit.iloc[0]["PICKER"]).strip())
+        value=str(row.get("PICKER","")).strip()
+        code=extract_code(row.get("CORREO","") or value)
+        key=person_key(value); tk=token_key(value)
+        rr=by_key.get(key) or by_token.get(tk) or (by_code.get(code) if code else None)
+        if rr is not None:
+            result.append(str(rr.get("PICKER",value)).strip())
             continue
-        # Similaridad conservadora para diferencias menores de escritura.
-        toks=set(t for t in norm(row.get("PICKER","")).split("_") if t)
-        best=None; best_score=0.0; second=0.0
-        for rr in records:
-            rtoks=set(t for t in norm(rr.get("PICKER","")).split("_") if t)
-            j=len(toks & rtoks)/(len(toks | rtoks) or 1)
-            seq=SequenceMatcher(None,person_key(row.get("PICKER","")),person_key(rr.get("PICKER",""))).ratio()
-            score=.65*j+.35*seq
-            if score>best_score:
-                second=best_score; best_score=score; best=rr
-            elif score>second:
-                second=score
-        if best is not None and best_score>=.84 and (best_score-second>=.04 or best_score>=.93):
-            canonical.append(str(best["PICKER"]).strip())
+        # Resolver contra la lista de la base con la misma lógica de identidad.
+        toks=name_tokens(value); best=None; best_tuple=None
+        for cand in records:
+            ctoks=name_tokens(cand.get("PICKER","")); overlap=len(toks & ctoks)
+            cov=overlap/(len(toks) or 1); j=overlap/(len(toks|ctoks) or 1)
+            seq=SequenceMatcher(None,person_key(value),person_key(cand.get("PICKER",""))).ratio()
+            score=.55*cov+.20*j+.25*seq
+            tup=(score,cov,seq,cand)
+            if best_tuple is None or tup[:3]>best_tuple[:3]: best_tuple=tup; best=cand
+        if best_tuple and len(toks)>=2 and best_tuple[1]>=1 and best_tuple[0]>=.70:
+            result.append(str(best.get("PICKER",value)).strip())
         else:
-            canonical.append(str(row.get("PICKER","")).strip())
-    out["PICKER"]=canonical
+            result.append(value)
+    out["PICKER"]=result
     return out
 
 def roster_from_uploads(uploads):
@@ -244,6 +288,7 @@ def parse_inc(df,tipo):
     if not p: raise ValueError(f"El detalle {tipo} necesita PICKER.")
     x=pd.DataFrame({
         "PICKER":df[p].astype(str).str.strip(),
+        "CORREO":df[col(df,["codigo_correo","codigo + correo","correo","email","usuario"])].astype(str).str.strip() if col(df,["codigo_correo","codigo + correo","correo","email","usuario"]) else "",
         "PRODUCTO":df[prod].astype(str).str.strip() if prod else "Sin producto",
         "ORDER_NUMBER":df[order].astype(str).str.strip() if order else "",
         "AREA":df[ar].astype(str).str.strip() if ar else "No especificada",
@@ -255,15 +300,14 @@ def parse_inc(df,tipo):
     return x
 
 def attach(inc,base):
-    ref=base[["PICKER","LINEAS","PEDIDOS","TURNO"]].copy()
+    ref=base[[c for c in ["PICKER","LINEAS","PEDIDOS","TURNO","CORREO"] if c in base.columns]].copy()
     ref["_KEY"]=ref["PICKER"].map(person_key)
     ref["_TOKEN_KEY"]=ref["PICKER"].map(token_key)
-    ref["_CODE_KEY"]=ref.get("CORREO",pd.Series([""]*len(ref),index=ref.index)).map(lambda v: norm(v.split(".",1)[0]) if str(v).strip() else "")
-    # Mantener el nombre del incidente, pero cruzar por una clave robusta.
+    ref["_CODE_KEY"]=ref.get("CORREO",pd.Series([""]*len(ref),index=ref.index)).map(extract_code)
     y=inc.copy()
     y["_KEY"]=y["PICKER"].map(person_key)
     y["_TOKEN_KEY"]=y["PICKER"].map(token_key)
-    y["_CODE_KEY"]=y.get("CORREO",pd.Series([""]*len(y),index=y.index)).map(lambda v: norm(v.split(".",1)[0]) if str(v).strip() else "")
+    y["_CODE_KEY"]=y.get("CORREO",pd.Series([""]*len(y),index=y.index)).map(extract_code)
     ref_exact=ref.drop_duplicates("_KEY").set_index("_KEY")
     ref_token=ref.drop_duplicates("_TOKEN_KEY").set_index("_TOKEN_KEY")
     ref_code=ref[ref["_CODE_KEY"].astype(str).str.strip().ne("")].drop_duplicates("_CODE_KEY").set_index("_CODE_KEY")
@@ -277,10 +321,7 @@ def attach(inc,base):
     vals=y.apply(get_ref,axis=1)
     vals.columns=["PICKER_REF","LINEAS","PEDIDOS","TURNO_REF"]
     y=pd.concat([y.reset_index(drop=True),vals.reset_index(drop=True)],axis=1)
-    # Canonicalizar el nombre del picker al que existe en la base maestra.
-    # Así los filtros por picker/turno/supervisor/área también encuentran FNR y MC.
-    matched=y["PICKER_REF"].astype(str).str.strip().ne("") & y["PICKER_REF"].astype(str).str.strip().ne("nan")
-    y.loc[matched,"PICKER"]=y.loc[matched,"PICKER_REF"]
+    y.loc[y["PICKER_REF"].astype(str).str.strip().ne(""),"PICKER"]=y.loc[y["PICKER_REF"].astype(str).str.strip().ne(""),"PICKER_REF"]
     return y.drop(columns=["_KEY","_TOKEN_KEY","_CODE_KEY"],errors="ignore")
 
 def summary(base,fnr,mc):
@@ -426,13 +467,21 @@ for _p in base["PICKER"].astype(str).str.strip().unique(): picker_record(store, 
 save_store(store)
 
 if roster is not None:
-    matched=int(base.get("_MASTER_MATCH",pd.Series(False,index=base.index)).sum())
+    match_series=base.get("_MASTER_MATCH",pd.Series(False,index=base.index)).fillna(False).astype(bool)
+    matched=int(match_series.sum())
     total=len(base); unmatched=total-matched
+    matched_turn=int((match_series & base["TURNO"].astype(str).str.strip().ne("") & base["TURNO"].astype(str).str.strip().ne("No especificado")).sum())
     with st.sidebar:
         st.success(f"Personal cruzado: {matched}/{total} pickers desde el Excel consolidado.")
-        if unmatched: st.warning(f"{unmatched} pickers de la base no tienen coincidencia en Master_Pickers.")
-        matched_turn=int((base["TURNO"].astype(str).str.strip().ne("") & base["TURNO"].astype(str).str.strip().ne("No especificado") & base.get("_MASTER_MATCH",False)).sum())
         st.caption(f"Turnos asignados desde Master: {matched_turn}/{total}")
+        if unmatched: st.warning(f"{unmatched} pickers de la base no tienen coincidencia en Master_Pickers.")
+        # Diagnóstico visible para saber EXACTAMENTE qué nombres no cruzaron.
+        with st.expander("🔎 Diagnóstico del cruce", expanded=False):
+            diag=base.loc[~match_series,["PICKER","CORREO"]].copy() if unmatched else pd.DataFrame()
+            if diag.empty:
+                st.success("Todos los pickers de la base fueron identificados en el Master.")
+            else:
+                st.dataframe(diag.head(100),use_container_width=True,hide_index=True)
 
 # Retira columnas técnicas antes de mostrar/exportar.
 base=base.drop(columns=["_MASTER_MATCH"],errors="ignore")
