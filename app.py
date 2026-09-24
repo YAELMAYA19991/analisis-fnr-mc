@@ -1,3 +1,4 @@
+
 import io, re, json, os
 from difflib import SequenceMatcher
 from datetime import datetime
@@ -949,10 +950,40 @@ with b:
         q[2].metric("MC",f"{r.MC:,.0f}",f"{r['MC_%']:.2f}%")
         q[3].metric("Estado",r.ESTADO)
 
-        st.subheader("Incidencias del picker")
+        st.subheader("⚠️ Incidencias del picker")
+        st.caption("Cada incidencia está identificada explícitamente como FNR o Mala Calidad (MC).")
+        inc_fnr = fnr[fnr.PICKER == sp].copy()
+        inc_mc = mc[mc.PICKER == sp].copy()
+        total_fnr_inc = int(pd.to_numeric(inc_fnr["INCIDENCIAS"], errors="coerce").fillna(0).sum()) if not inc_fnr.empty else 0
+        total_mc_inc = int(pd.to_numeric(inc_mc["INCIDENCIAS"], errors="coerce").fillna(0).sum()) if not inc_mc.empty else 0
+        ic1, ic2 = st.columns(2)
+        with ic1:
+            st.markdown("<div class='justo-card' style='border-left:4px solid #d64545'><div class='justo-kicker'>FNR · Faltante no reportado</div><div class='justo-title' style='font-size:1.25rem'>%s incidencias</div></div>" % f"{total_fnr_inc:,}", unsafe_allow_html=True)
+        with ic2:
+            st.markdown("<div class='justo-card' style='border-left:4px solid #d6a72c'><div class='justo-kicker'>MC · Mala Calidad</div><div class='justo-title' style='font-size:1.25rem'>%s incidencias</div></div>" % f"{total_mc_inc:,}", unsafe_allow_html=True)
         cc=st.columns(2)
-        with cc[0]: st.dataframe(products(fnr,sp).head(15),use_container_width=True,hide_index=True)
-        with cc[1]: st.dataframe(products(mc,sp).head(15),use_container_width=True,hide_index=True)
+        with cc[0]:
+            st.markdown("**🔴 FNR · Faltantes no reportados**")
+            fprod=products(fnr,sp).head(15).copy()
+            if not fprod.empty:
+                fprod.insert(0,"TIPO","FNR")
+            st.dataframe(fprod,use_container_width=True,hide_index=True)
+        with cc[1]:
+            st.markdown("**🟡 MC · Mala Calidad**")
+            mprod=products(mc,sp).head(15).copy()
+            if not mprod.empty:
+                mprod.insert(0,"TIPO","MC")
+            st.dataframe(mprod,use_container_width=True,hide_index=True)
+        st.subheader("📦 Pedidos con incidencia")
+        st.caption("El tipo de incidencia se muestra para distinguir FNR de MC.")
+        of=orders(fnr,sp).head(25).copy()
+        om=orders(mc,sp).head(25).copy()
+        if not of.empty: of.insert(0,"TIPO","FNR")
+        if not om.empty: om.insert(0,"TIPO","MC")
+        pedidos_incidencias=pd.concat([of,om],ignore_index=True)
+        if not pedidos_incidencias.empty:
+            pedidos_incidencias=pedidos_incidencias.sort_values(["TIPO","INCIDENCIAS"],ascending=[True,False])
+        st.dataframe(pedidos_incidencias,use_container_width=True,hide_index=True)
         st.subheader("Pedidos FNR")
         st.warning(
             "⚠️ **Antes de tomar en cuenta los FNR, revisa si la factura/orden tiene algún reporte o incidencia registrada.** "
