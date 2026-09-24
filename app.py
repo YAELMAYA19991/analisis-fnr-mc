@@ -115,6 +115,26 @@ def load_process_images(process):
 def new_process_id():
     return datetime.now().strftime("%Y%m%d%H%M%S%f")
 
+def save_followup_pdf(data, picker, filename):
+    """Guarda un PDF de acta/seguimiento asociado a un picker."""
+    ensure_persist_dir()
+    doc_id=datetime.now().strftime("%Y%m%d%H%M%S%f")
+    folder=os.path.join(PERSIST_DIR, "seguimiento_pdfs", person_key(picker) or "picker", doc_id)
+    os.makedirs(folder, exist_ok=True)
+    safe=_safe_filename(filename)
+    path=os.path.join(folder, safe)
+    with open(path, "wb") as f: f.write(data)
+    return path, doc_id
+
+def load_followup_pdf(doc):
+    path=str(doc.get("path", ""))
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as f: return f.read()
+    except Exception:
+        return None
+
 def load_store():
     if os.path.exists(STORE_FILE):
         try:
@@ -128,8 +148,8 @@ def save_store(store):
     os.replace(tmp, STORE_FILE)
 
 def picker_record(store, picker):
-    rec = store.setdefault("pickers", {}).setdefault(picker, {"estado":"ACTIVO", "comentarios":[], "acciones":[]})
-    rec.setdefault("estado", "ACTIVO"); rec.setdefault("comentarios", []); rec.setdefault("acciones", [])
+    rec = store.setdefault("pickers", {}).setdefault(picker, {"estado":"ACTIVO", "comentarios":[], "acciones":[], "documentos":[]})
+    rec.setdefault("estado", "ACTIVO"); rec.setdefault("comentarios", []); rec.setdefault("acciones", []); rec.setdefault("documentos", [])
     return rec
 
 def active_picker_names(store):
@@ -632,6 +652,7 @@ store.setdefault("master_overrides", {})
 store.setdefault("master_excluded", [])
 store.setdefault("procesos", [])
 store.setdefault("recursos_formatos", [])
+store.setdefault("seguimientos_documentos", [])
 
 with st.sidebar:
     st.header("Control operativo")
@@ -1072,6 +1093,130 @@ with g:
             st.dataframe(sup_data[sup_data["SUPERVISOR"]==sup_focus],use_container_width=True,hide_index=True)
     else:
         st.info("No hay datos para el contexto actual.")
+
+with h:
+    st.subheader("🛡️ Seguimiento")
+    st.caption("Consulta el historial por picker, revisa llamadas, advertencias y actas, y adjunta los PDFs para conservar evidencia.")
+
+    ctx,_,_,_=global_context(s_view)
+    selected_context=apply_context(s_view,ctx)
+    render_context_banner(ctx,selected_context,context_reference(s_view,ctx),"Contexto heredado")
+
+    nombres=person_options(selected_context)
+    with st.container(border=True):
+        st.markdown("**🔎 Buscar picker**")
+        buscar=st.text_input("Nombre del picker",placeholder="Escribe parte del nombre…",key="seguimiento_picker_search")
+        opciones=nombres
+        if buscar.strip():
+            term=norm(buscar)
+            opciones=[n for n in nombres if term in norm(n)]
+        seguimiento_picker=st.selectbox("Picker", ["Selecciona un picker"]+opciones, key="seguimiento_picker_select")
+
+    if seguimiento_picker == "Selecciona un picker":
+        st.info("Selecciona un picker para consultar su historial de seguimiento.")
+    else:
+        r=s[s.PICKER==seguimiento_picker].iloc[0]
+        rec=picker_record(store,seguimiento_picker)
+        acciones=rec.get("acciones",[]) or []
+        feedback=[x for x in store.get("feedback_rows",[]) if str(x.get("PICKER",""))==seguimiento_picker]
+        documentos=rec.get("documentos",[]) or []
+
+        st.markdown(
+            f"<div class='justo-card'><div class='justo-kicker'>Expediente de seguimiento</div>"
+            f"<div class='justo-title'>{seguimiento_picker}</div>"
+            f"<div class='justo-muted'>Turno: {r.TURNO} · Supervisor: {r.SUPERVISOR} · Área: {r.AREA_BASE}</div></div>",
+            unsafe_allow_html=True
+        )
+
+        k1,k2,k3,k4=st.columns(4)
+        k1.metric("Retroalimentaciones", f"{len(feedback):,}")
+        k2.metric("Seguimientos", f"{len(acciones):,}")
+        k3.metric("Actas / llamadas", f"{sum(1 for x in acciones if 'Acta' in str(x.get('accion','')) or 'Llamada' in str(x.get('accion',''))):,}")
+        k4.metric("PDF / documentos", f"{len(documentos):,}")
+
+        st.markdown("### 📋 Historial de acciones")
+        if acciones:
+            hist=pd.DataFrame(acciones).copy()
+            hist=hist.rename(columns={"fecha":"Fecha","accion":"Tipo","supervisor":"Supervisor","motivo":"Motivo"})
+            cols=[c for c in ["Fecha","Tipo","Supervisor","Motivo"] if c in hist.columns]
+            st.dataframe(hist[cols].sort_values("Fecha",ascending=False),use_container_width=True,hide_index=True)
+        else:
+            st.info("Este picker todavía no tiene llamadas, advertencias o actas registradas.")
+
+        st.markdown("### 📄 Actas y documentos de seguimiento")
+        st.caption("Arrastra un PDF aquí para asociarlo al picker. También puedes guardar un enlace si el documento está en Drive, SharePoint u otra plataforma.")
+        with st.form(f"seguimiento_documento_form_{seguimiento_picker}", clear_on_submit=True):
+            dc1,dc2=st.columns([1,2])
+            with dc1:
+                doc_tipo=st.selectbox("Tipo de documento", ["Acta 1","Acta 2","Acta 3","Llamada de atención","Advertencia verbal 1","Advertencia verbal 2","Otro"])
+            with dc2:
+                doc_titulo=st.text_input("Nombre / referencia", placeholder="Ej. Acta por FNR — septiembre 2026")
+            doc_detalle=st.text_area("Detalle / motivo", placeholder="Qué originó el seguimiento y cualquier dato importante…")
+            doc_pdf=st.file_uploader("📎 Adjuntar PDF", type=["pdf"], accept_multiple_files=False, key=f"seguimiento_pdf_{seguimiento_picker}")
+            doc_url=st.text_input("🔗 O vincular documento externo", placeholder="https://...")
+            if st.form_submit_button("💾 Guardar documento", type="primary"):
+                titulo=doc_titulo.strip() or (doc_pdf.name if doc_pdf is not None else doc_tipo)
+                url=doc_url.strip()
+                if doc_pdf is None and not url:
+                    st.error("Adjunta un PDF o captura un enlace externo.")
+                elif url and not url.startswith(("http://","https://")):
+                    st.error("El enlace debe comenzar con http:// o https://")
+                else:
+                    registro={
+                        "id": datetime.now().strftime("%Y%m%d%H%M%S%f"),
+                        "fecha": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        "tipo": doc_tipo,
+                        "titulo": titulo,
+                        "detalle": doc_detalle.strip(),
+                        "supervisor": str(r.get("SUPERVISOR","")),
+                        "url": url,
+                        "path":"",
+                        "archivo":""
+                    }
+                    if doc_pdf is not None:
+                        path,doc_id=save_followup_pdf(doc_pdf.getvalue(),seguimiento_picker,doc_pdf.name)
+                        registro["path"]=path
+                        registro["archivo"]=_safe_filename(doc_pdf.name)
+                    rec.setdefault("documentos",[]).append(registro)
+                    save_store(store)
+                    st.success("Documento de seguimiento guardado y asociado al picker.")
+                    st.rerun()
+
+        documentos=sorted(rec.get("documentos",[]) or [], key=lambda x:str(x.get("fecha","")), reverse=True)
+        if documentos:
+            for i,doc in enumerate(documentos):
+                tipo=str(doc.get("tipo","Documento"))
+                titulo=str(doc.get("titulo",doc.get("archivo",tipo)))
+                fecha=str(doc.get("fecha",""))
+                supervisor=str(doc.get("supervisor",r.get("SUPERVISOR","")))
+                archivo=load_followup_pdf(doc)
+                with st.container(border=True):
+                    a1,a2,a3=st.columns([1.2,2.8,1.2])
+                    with a1:
+                        st.markdown(f"**{tipo}**")
+                        st.caption(fecha)
+                    with a2:
+                        st.markdown(f"**{titulo}**")
+                        if doc.get("detalle"): st.caption(doc.get("detalle"))
+                        st.caption(f"Registró: {supervisor}")
+                    with a3:
+                        if archivo is not None:
+                            st.download_button("📥 Ver / descargar PDF", archivo, file_name=str(doc.get("archivo") or f"{tipo}.pdf"), mime="application/pdf", key=f"download_doc_{seguimiento_picker}_{doc.get('id',i)}", use_container_width=True)
+                        if doc.get("url"):
+                            st.link_button("🔗 Abrir enlace", str(doc.get("url")), use_container_width=True)
+                        if st.button("🗑️ Eliminar", key=f"delete_doc_{seguimiento_picker}_{doc.get('id',i)}", use_container_width=True):
+                            rec["documentos"]=[x for x in rec.get("documentos",[]) if x.get("id")!=doc.get("id")]
+                            save_store(store); st.rerun()
+        else:
+            st.info("No hay PDFs o documentos vinculados para este picker.")
+
+        st.markdown("### 📝 Retroalimentación registrada")
+        if feedback:
+            fbd=pd.DataFrame(feedback).copy()
+            columnas=[c for c in ["FECHA","SUPERVISOR","FORTALEZAS","PUNTO_MEJORA","ACUERDO"] if c in fbd.columns]
+            st.dataframe(fbd.sort_values("FECHA",ascending=False)[columnas],use_container_width=True,hide_index=True)
+        else:
+            st.info("No hay retroalimentaciones registradas para este picker.")
 
 with f:
     st.download_button("📥 Descargar Excel completo",export(s,fnr,mc,None if sp=="Todos" else sp,roster),f"Analisis_FNR_MC_{periodo}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
