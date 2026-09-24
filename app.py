@@ -1,4 +1,3 @@
-
 import io, re, json, os
 from datetime import datetime
 import pandas as pd
@@ -32,6 +31,15 @@ def norm(x):
     x = str(x).strip().lower().translate(str.maketrans("áéíóúüñ","aeiouun"))
     return re.sub(r"[^a-z0-9]+","_",x).strip("_")
 
+def person_key(x):
+    """Clave robusta para cruzar nombres aunque cambien mayúsculas, acentos o signos."""
+    return norm(x).replace("_", "")
+
+def token_key(x):
+    """Clave por palabras para tolerar nombres escritos en distinto orden."""
+    k=norm(x)
+    return "_".join(sorted([t for t in k.split("_") if t]))
+
 def clean(df):
     x=df.copy(); x.columns=[norm(c) for c in x.columns]; return x
 
@@ -57,29 +65,33 @@ def choose(ss,words):
     return next(iter(ss.values()))
 
 def parse_base(df):
-    p=col(df,["picker","picker_nombre","nombre","email_picker"])
+    p=col(df,["picker","picker_nombre","nombre","email_picker","persona"])
     l=col(df,["total_lineas","lineas_totales","lineas","total_lineas_pickeadas"])
     ped=col(df,["total_pedidos","pedidos_totales","pedidos"])
     sh=col(df,["turno","shift"]); ar=col(df,["area","departamento","department"])
+    em=col(df,["codigo_correo","codigo + correo","correo","email","usuario"])
     if not p or not l: raise ValueError("La base necesita PICKER y Total lineas.")
     x=pd.DataFrame({
         "PICKER":df[p].astype(str).str.strip(),
         "LINEAS":pd.to_numeric(df[l],errors="coerce").fillna(0),
         "PEDIDOS":pd.to_numeric(df[ped],errors="coerce").fillna(0) if ped else 0,
         "TURNO":df[sh].astype(str).str.strip() if sh else "No especificado",
-        "AREA_BASE":df[ar].astype(str).str.strip() if ar else "No especificada"})
+        "AREA_BASE":df[ar].astype(str).str.strip() if ar else "No especificada",
+        "CORREO":df[em].astype(str).str.strip() if em else ""
+    })
+    x["_KEY"]=x["PICKER"].map(person_key)
+    x["_TOKEN_KEY"]=x["PICKER"].map(token_key)
+    x["_CODE_KEY"]=x["CORREO"].map(lambda v: norm(v.split(".",1)[0]) if str(v).strip() else "")
     return x.sort_values("LINEAS").drop_duplicates("PICKER",keep="last")
 
-
 def parse_roster(df, turno_fijo=None):
-    """Maestro consolidado de personal: PICKER, TURNO, CORREO, SUPERVISOR y AREA."""
+    """Maestro consolidado: PICKER, TURNO, CODIGO + CORREO, SUPERVISOR y AREA_BASE."""
     p=col(df,["picker","picker_nombre","email_picker","nombre","persona"])
     sh=col(df,["turno","shift"])
     em=col(df,["codigo_correo","codigo + correo","correo","email","usuario"])
     sup=col(df,["supervisor","supervisor_nombre","jefe","responsable"])
     ar=col(df,["area_base","area","departamento","department"])
-    if not p:
-        raise ValueError("La hoja de personal necesita la columna PICKER.")
+    if not p: raise ValueError("La hoja de personal necesita la columna PICKER.")
     x=pd.DataFrame({
         "PICKER":df[p].astype(str).str.strip(),
         "TURNO_MAESTRO":(df[sh].astype(str).str.strip() if sh and not turno_fijo else turno_fijo or ""),
@@ -88,23 +100,42 @@ def parse_roster(df, turno_fijo=None):
         "AREA_MAESTRO":df[ar].astype(str).str.strip() if ar else ""
     })
     x=x[x["PICKER"].str.strip().ne("")].copy()
-    x=x.drop_duplicates("PICKER",keep="last")
+    x["_KEY"]=x["PICKER"].map(person_key)
+    x["_TOKEN_KEY"]=x["PICKER"].map(token_key)
+    x["_CODE_KEY"]=x["CORREO"].map(lambda v: norm(v.split(".",1)[0]) if str(v).strip() else "")
+    x=x.drop_duplicates("_KEY",keep="last")
     return x
 
 def apply_roster(base, roster):
     if roster is None or roster.empty: return base
-    cols=["PICKER","TURNO_MAESTRO","CORREO","SUPERVISOR","AREA_MAESTRO"]
-    r=roster[[c for c in cols if c in roster.columns]].copy()
-    x=base.merge(r,on="PICKER",how="left")
+    x=base.copy()
+    r=roster.copy()
+    # Primero por nombre normalizado; luego por palabras del nombre; finalmente por código.
+    exact=r.drop_duplicates("_KEY").set_index("_KEY")
+    token_map=r.drop_duplicates("_TOKEN_KEY").set_index("_TOKEN_KEY")
+    code_map=r[r["_CODE_KEY"].astype(str).str.strip().ne("")].drop_duplicates("_CODE_KEY").set_index("_CODE_KEY")
+
+    def lookup(row):
+        for key,mp in [(row.get("_KEY",""),exact),(row.get("_TOKEN_KEY",""),token_map),(row.get("_CODE_KEY",""),code_map)]:
+            if key and key in mp.index:
+                rr=mp.loc[key]
+                if isinstance(rr,pd.DataFrame): rr=rr.iloc[0]
+                return pd.Series([rr.get("TURNO_MAESTRO",""),rr.get("CORREO",""),rr.get("SUPERVISOR","No asignado"),rr.get("AREA_MAESTRO","")])
+        return pd.Series(["","","No asignado",""])
+
+    vals=x.apply(lookup,axis=1)
+    vals.columns=["TURNO_MAESTRO","CORREO_MASTER","SUPERVISOR_MASTER","AREA_MAESTRO"]
+    x=pd.concat([x.reset_index(drop=True),vals.reset_index(drop=True)],axis=1)
     tm=x["TURNO_MAESTRO"].fillna("").astype(str).str.strip()
     tb=x["TURNO"].fillna("").astype(str).str.strip()
     x["TURNO"]=tm.where(tm.ne(""),tb)
     am=x["AREA_MAESTRO"].fillna("").astype(str).str.strip()
     ab=x["AREA_BASE"].fillna("").astype(str).str.strip()
     x["AREA_BASE"]=am.where(am.ne(""),ab)
-    x["SUPERVISOR"]=x["SUPERVISOR"].fillna("No asignado").astype(str).str.strip()
-    x["CORREO"]=x["CORREO"].fillna("").astype(str).str.strip()
-    return x.drop(columns=["TURNO_MAESTRO","AREA_MAESTRO"],errors="ignore")
+    x["SUPERVISOR"]=x["SUPERVISOR_MASTER"].fillna("No asignado").astype(str).str.strip()
+    master_email=x["CORREO_MASTER"].fillna("").astype(str).str.strip()
+    x["CORREO"]=master_email.where(master_email.ne(""),x["CORREO"].fillna("").astype(str).str.strip())
+    return x.drop(columns=["_KEY","_TOKEN_KEY","_CODE_KEY","TURNO_MAESTRO","CORREO_MASTER","SUPERVISOR_MASTER","AREA_MAESTRO"],errors="ignore")
 
 def roster_from_uploads(uploads):
     frames=[]
@@ -136,8 +167,33 @@ def parse_inc(df,tipo):
     return x
 
 def attach(inc,base):
-    ref=base[["PICKER","LINEAS","PEDIDOS","TURNO"]].rename(columns={"TURNO":"TURNO_REF"})
-    return inc.merge(ref,on="PICKER",how="left")
+    ref=base[["PICKER","LINEAS","PEDIDOS","TURNO"]].copy()
+    ref["_KEY"]=ref["PICKER"].map(person_key)
+    ref["_TOKEN_KEY"]=ref["PICKER"].map(token_key)
+    ref["_CODE_KEY"]=ref.get("CORREO",pd.Series([""]*len(ref),index=ref.index)).map(lambda v: norm(v.split(".",1)[0]) if str(v).strip() else "")
+    # Mantener el nombre del incidente, pero cruzar por una clave robusta.
+    y=inc.copy()
+    y["_KEY"]=y["PICKER"].map(person_key)
+    y["_TOKEN_KEY"]=y["PICKER"].map(token_key)
+    y["_CODE_KEY"]=y.get("CORREO",pd.Series([""]*len(y),index=y.index)).map(lambda v: norm(v.split(".",1)[0]) if str(v).strip() else "")
+    ref_exact=ref.drop_duplicates("_KEY").set_index("_KEY")
+    ref_token=ref.drop_duplicates("_TOKEN_KEY").set_index("_TOKEN_KEY")
+    ref_code=ref[ref["_CODE_KEY"].astype(str).str.strip().ne("")].drop_duplicates("_CODE_KEY").set_index("_CODE_KEY")
+    def get_ref(row):
+        for key,mp in [(row["_KEY"],ref_exact),(row["_TOKEN_KEY"],ref_token),(row["_CODE_KEY"],ref_code)]:
+            if key and key in mp.index:
+                rr=mp.loc[key]
+                if isinstance(rr,pd.DataFrame): rr=rr.iloc[0]
+                return pd.Series([rr["PICKER"],rr["LINEAS"],rr["PEDIDOS"],rr["TURNO"]])
+        return pd.Series([row["PICKER"],0,0,"No especificado"])
+    vals=y.apply(get_ref,axis=1)
+    vals.columns=["PICKER_REF","LINEAS","PEDIDOS","TURNO_REF"]
+    y=pd.concat([y.reset_index(drop=True),vals.reset_index(drop=True)],axis=1)
+    # Canonicalizar el nombre del picker al que existe en la base maestra.
+    # Así los filtros por picker/turno/supervisor/área también encuentran FNR y MC.
+    matched=y["PICKER_REF"].astype(str).str.strip().ne("") & y["PICKER_REF"].astype(str).str.strip().ne("nan")
+    y.loc[matched,"PICKER"]=y.loc[matched,"PICKER_REF"]
+    return y.drop(columns=["_KEY","_TOKEN_KEY","_CODE_KEY"],errors="ignore")
 
 def summary(base,fnr,mc):
     s=base.copy()
@@ -280,6 +336,8 @@ if roster is not None:
     with st.sidebar:
         st.success(f"Personal cruzado: {matched}/{total} pickers desde el Excel consolidado.")
         if unmatched: st.warning(f"{unmatched} pickers de la base no aparecen en Maestro_Personal.")
+        matched_turn=(base["TURNO"].astype(str).str.strip().ne("") & base["TURNO"].astype(str).str.strip().ne("No especificado")).sum()
+        st.caption(f"Turnos asignados desde Master: {matched_turn}/{total}")
 
 with st.sidebar:
     st.subheader("Filtros de personal")
@@ -373,14 +431,14 @@ with g:
     if roster is None or roster.empty:
         st.info("Elige el turno directamente desde el filtro del Excel consolidado.")
     else:
-        turnos=[x for x in ["Matutino","Intermedio","Vespertino","Nocturno"] if x in set(roster["TURNO_MAESTRO"])]
+        turnos=sorted({str(x).strip() for x in roster["TURNO_MAESTRO"].dropna() if str(x).strip()})
         turno_sel=st.selectbox("Turno",turnos if turnos else ["Sin turno"])
         rt=roster[roster["TURNO_MAESTRO"]==turno_sel].copy()
         supervisores=sorted([str(x) for x in rt["SUPERVISOR"].dropna().unique() if str(x).strip() and str(x)!="No asignado"])
         sup_sel=st.selectbox("Supervisor",["Todos"]+supervisores)
         if sup_sel!="Todos": rt=rt[rt["SUPERVISOR"]==sup_sel]
-        disponibles=[x for x in rt["PICKER"].tolist() if x in set(s["PICKER"])]
-        picker_sel=st.selectbox("Picker para retroalimentación",["Selecciona..."]+sorted(disponibles))
+        disponibles=[str(x).strip() for x in rt["PICKER"].tolist() if str(x).strip() in set(s["PICKER"].astype(str).str.strip())]
+        picker_sel=st.selectbox("Picker para retroalimentación",["Selecciona..."]+sorted(disponibles,key=lambda z:z.upper()))
         if picker_sel!="Selecciona...":
             r=s[s["PICKER"]==picker_sel].iloc[0]
             st.markdown(f"### {picker_sel}")
@@ -409,7 +467,7 @@ with h:
     st.subheader("🛡️ Seguimiento de Pickers")
     st.caption("La baja saca al picker del seguimiento activo, pero conserva todo su historial. Sus incidencias siguen contando en las estadísticas del periodo en que ocurrieron.")
     # Lista de seguimiento se separa de las estadísticas: s sigue conteniendo todos los pickers del periodo.
-    all_names = sorted(set(base["PICKER"].astype(str).str.strip()) | set(store.get("pickers",{}).keys()))
+    all_names = sorted({str(x).strip() for x in base["PICKER"].tolist()} | {str(x).strip() for x in store.get("pickers",{}).keys() if str(x).strip()}, key=lambda z:z.upper())
     vista = st.radio("Mostrar", ["Activos", "Dados de baja", "Todos"], horizontal=True)
     rows=[]
     for p in all_names:
