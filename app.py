@@ -1,3 +1,4 @@
+
 import io, re, json, os
 from difflib import SequenceMatcher
 from datetime import datetime
@@ -612,7 +613,7 @@ base_view=base[base.PICKER.isin(s_view.PICKER)]
 fnr_view=fnr[fnr.PICKER.isin(s_view.PICKER)]
 mc_view=mc[mc.PICKER.isin(s_view.PICKER)]
 
-a,b,c,d,e,g,h,f=st.tabs(["🏠 Bodega","👤 Picker","🏷️ Artículos","📦 Pedidos","🌙 Turnos / Áreas","👥 Supervisores","🛡️ Seguimiento","📥 Exportar"])
+a,b,c,d,e,g,h,i,f=st.tabs(["🏠 Bodega","👤 Picker","🏷️ Artículos","📦 Pedidos","🌙 Turnos / Áreas","👥 Supervisores","🛡️ Seguimiento","🛠️ Resolver personal","📥 Exportar"])
 
 with a:
     lines=base_view.LINEAS.sum(); F=fnr_view.INCIDENCIAS.sum(); M=mc_view.INCIDENCIAS.sum()
@@ -761,6 +762,79 @@ with h:
                 rec["estado"]="ACTIVO"; rec["reactivacion_fecha"]=datetime.now().strftime("%Y-%m-%d %H:%M")
                 save_store(store); st.success("Picker reactivado."); st.rerun()
         st.info("Las estadísticas de FNR/MC de este periodo NO se filtran por estado. Un picker dado de baja sigue contando porque sus incidencias ocurrieron durante su periodo de operación.")
+
+with i:
+    st.subheader("🛠️ Resolver personal pendiente")
+    st.caption("Selecciona varios pickers sin coincidencia para asignarles el mismo turno, supervisor y área, o excluirlos del personal. Las líneas y los KPI históricos no se borran.")
+
+    pending_mask=(~match_series) & (~excluded_series) if "match_series" in globals() else pd.Series(False,index=base.index)
+    pending=base.loc[pending_mask,[c for c in ["PICKER","CORREO"] if c in base.columns]].copy()
+    pending["ETIQUETA"]=pending.apply(lambda r: f"{r.get('PICKER','')} | {r.get('CORREO','')}".strip(" |"),axis=1)
+    pending_options=pending["ETIQUETA"].astype(str).tolist()
+
+    if not pending_options:
+        st.success("No hay pickers pendientes de resolver.")
+    else:
+        selected_labels=st.multiselect("Pickers pendientes (selección múltiple)", pending_options, key="bulk_pending_select")
+        selected_rows=pending[pending["ETIQUETA"].isin(selected_labels)].copy()
+
+        roster_turns=sorted({str(x).strip() for x in roster.get("TURNO_MAESTRO",pd.Series(dtype=str)).dropna() if str(x).strip()})
+        roster_sups=sorted({str(x).strip() for x in roster.get("SUPERVISOR",pd.Series(dtype=str)).dropna() if str(x).strip() and str(x)!="No asignado"})
+        roster_areas=sorted({str(x).strip() for x in roster.get("AREA_MAESTRO",pd.Series(dtype=str)).dropna() if str(x).strip()})
+        turn_bulk=st.selectbox("Turno para los seleccionados", roster_turns or ["Matutino","Intermedio","Tarde"], key="bulk_turn")
+        sup_bulk=st.selectbox("Supervisor para los seleccionados", ["No asignado"]+roster_sups, key="bulk_sup")
+        area_bulk=st.selectbox("Área para los seleccionados", ["No especificada"]+roster_areas, key="bulk_area")
+
+        c_bulk1,c_bulk2=st.columns(2)
+        with c_bulk1:
+            if st.button("✅ Asignar seleccionados", key="bulk_assign"):
+                if not selected_labels:
+                    st.warning("Selecciona al menos un picker.")
+                else:
+                    store.setdefault("master_overrides",{})
+                    for _,rr in selected_rows.iterrows():
+                        original=str(rr.get("PICKER","")).strip()
+                        k=person_key(original)
+                        store["master_overrides"][k]={
+                            "PICKER":original,
+                            "TURNO":turn_bulk,
+                            "CORREO":str(rr.get("CORREO","") or "").strip(),
+                            "SUPERVISOR":sup_bulk,
+                            "AREA_BASE":area_bulk
+                        }
+                        store.setdefault("master_excluded",[])
+                        store["master_excluded"]=[x for x in store["master_excluded"] if x!=k]
+                    save_store(store)
+                    st.success(f"Se asignaron {len(selected_rows)} pickers.")
+                    st.rerun()
+        with c_bulk2:
+            if st.button("🗑️ Excluir seleccionados", key="bulk_exclude"):
+                if not selected_labels:
+                    st.warning("Selecciona al menos un picker.")
+                else:
+                    store.setdefault("master_excluded",[])
+                    for _,rr in selected_rows.iterrows():
+                        k=person_key(str(rr.get("PICKER","")).strip())
+                        if k and k not in store["master_excluded"]:
+                            store["master_excluded"].append(k)
+                    save_store(store)
+                    st.success(f"Se excluyeron {len(selected_rows)} pickers del personal.")
+                    st.rerun()
+
+        st.dataframe(selected_rows.drop(columns=["ETIQUETA"],errors="ignore") if not selected_rows.empty else pending.drop(columns=["ETIQUETA"],errors="ignore"), use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("Administrar asignaciones y exclusiones")
+    saved_overrides=store.get("master_overrides",{})
+    saved_excluded=store.get("master_excluded",[])
+    st.write(f"Asignaciones manuales guardadas: **{len(saved_overrides)}** · Exclusiones guardadas: **{len(saved_excluded)}**")
+    if saved_excluded:
+        excluded_labels=[next((str(v) for v in base["PICKER"].tolist() if person_key(v)==k),k) for k in saved_excluded]
+        restore=st.multiselect("Pickers excluidos para reactivar", excluded_labels, key="bulk_restore_select")
+        if st.button("↩️ Reactivar seleccionados", key="bulk_restore"):
+            selected_keys={person_key(x) for x in restore}
+            store["master_excluded"]=[k for k in saved_excluded if k not in selected_keys]
+            save_store(store); st.success(f"Se reactivaron {len(selected_keys)} pickers."); st.rerun()
 
 with f:
     st.download_button("📥 Descargar Excel completo",export(s,fnr,mc,None if sp=="Todos" else sp,roster),f"Analisis_FNR_MC_{periodo}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
