@@ -1,3 +1,4 @@
+
 import io, re, json, os
 from datetime import datetime
 import pandas as pd
@@ -219,30 +220,28 @@ st.caption("Dashboard automático por picker, turno, área, producto y pedido")
 
 with st.sidebar:
     st.header("Carga")
-    uc=st.file_uploader("📤 Excel consolidado",type=["xlsx","xls"])
-    st.caption("Un solo archivo con las hojas Base_Pickers, Detalle_FNR, Detalle_MC y Maestro_Personal.")
+    ub=st.file_uploader("① Base de Pickers / Líneas",type=["xlsx","xls"],key="base_picker")
+    uf=st.file_uploader("② Detalle FNR",type=["xlsx","xls"],key="detalle_fnr")
+    um=st.file_uploader("③ Detalle Mala Calidad",type=["xlsx","xls"],key="detalle_mc")
+    up=st.file_uploader("④ Plantilla consolidada de personal",type=["xlsx","xls"],key="plantilla_personal")
+    st.caption("Los 3 archivos operativos siguen separados. Solo la plantilla de personal concentra turno, correo, supervisor y área.")
     st.divider(); periodo=st.text_input("Periodo",datetime.now().strftime("%Y-%m"))
     ex=st.text_area("Pedidos operativos a excluir (uno por línea)")
     excluded={x.strip() for x in ex.splitlines() if x.strip()}
 
-if not uc:
-    st.info("Carga un solo Excel consolidado para comenzar.")
-    st.markdown("**Formato:** Base_Pickers + Detalle_FNR + Detalle_MC + Maestro_Personal. El maestro permite filtrar por picker, turno, correo, supervisor y área.")
+if not (ub and uf and um and up):
+    st.info("Carga los 3 Excel operativos y la plantilla consolidada de personal para comenzar.")
+    st.markdown("**Archivos:** ① Pickers/Líneas · ② FNR · ③ Mala Calidad · ④ Plantilla consolidada (turno, correo, supervisor y área).")
     st.stop()
 
 try:
-    ss=sheets(uc)
-    base_df=choose(ss,["base_pickers","picker","lineas","resumen"])
-    fnr_df=choose({k:v for k,v in ss.items() if "fnr" in norm(k)},["fnr","detalle"])
-    mc_df=choose({k:v for k,v in ss.items() if "mc" in norm(k) or "mala" in norm(k)},["mc","mala"])
-    roster_df=choose({k:v for k,v in ss.items() if "maestro" in norm(k) or "personal" in norm(k)},["maestro_personal","personal","maestro"])
-    base=parse_base(base_df)
-    roster=parse_roster(roster_df)
+    base=parse_base(choose(sheets(ub),["picker","lineas","resumen"]))
+    fnr=parse_inc(choose(sheets(uf),["fnr","detalle"]),"FNR")
+    mc=parse_inc(choose(sheets(um),["mc","mala"]),"MC")
+    roster=parse_roster(choose(sheets(up),["maestro_personal","personal","maestro","turno"]))
     base=apply_roster(base,roster)
-    fnr=parse_inc(fnr_df,"FNR")
-    mc=parse_inc(mc_df,"MC")
 except Exception as e:
-    st.error(f"Error en el Excel consolidado: {e}"); st.stop()
+    st.error(f"Error en los archivos cargados: {e}"); st.stop()
 
 if excluded:
     fnr=fnr[~fnr.ORDER_NUMBER.isin(excluded)].copy()
@@ -433,4 +432,4 @@ with h:
 
 with f:
     st.download_button("📥 Descargar Excel completo",export(s,fnr,mc,None if sp=="Todos" else sp,roster),f"Analisis_FNR_MC_{periodo}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    st.info("La V4 permite cargar personal por cuatro turnos y capturar retroalimentación por supervisor.")
+    st.info("La app utiliza 3 Excel operativos separados (Pickers, FNR y MC) y una sola plantilla consolidada para turno, correo, supervisor y área.")
