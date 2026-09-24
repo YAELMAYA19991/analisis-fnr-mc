@@ -1,3 +1,4 @@
+
 import io, re, json, os
 from difflib import SequenceMatcher
 from datetime import datetime
@@ -12,6 +13,9 @@ st.markdown("""
 :root { --justo-red:#BD2426; --ink:#272936; --muted:#6f7480; --soft:#f7f7f5; --line:#e7e7e3; --success:#15803d; }
 .main .block-container { max-width: 1500px; padding-top: 1.1rem; padding-bottom: 2.5rem; }
 [data-testid="stSidebar"] { border-right: 1px solid var(--line); }
+section[data-testid="stSidebar"] { width: 320px !important; }
+section[data-testid="stSidebar"] > div { width: 320px !important; }
+.page-filter { background:#fafaf8; border:1px solid var(--line); border-radius:16px; padding:12px 14px 2px; margin:0 0 18px; }
 [data-testid="stMetric"] { background:#fff; border:1px solid var(--line); border-radius:16px; padding:.75rem .9rem; box-shadow:0 2px 10px rgba(30,30,30,.035); }
 div[data-testid="stExpander"] { border:1px solid var(--line); border-radius:14px; overflow:hidden; }
 button[kind="primary"] { background:var(--justo-red); border-color:var(--justo-red); }
@@ -694,76 +698,64 @@ if roster is not None:
     total=len(base); unmatched=total-matched-int(excluded_series.sum())
     matched_turn=int((match_series & ~excluded_series & base["TURNO"].astype(str).str.strip().ne("") & base["TURNO"].astype(str).str.strip().ne("No especificado") & base["TURNO"].astype(str).str.strip().ne("__EXCLUIDO__")).sum())
     with st.sidebar:
-        st.success(f"Personal identificado: {matched}/{total} pickers.")
+        st.success(f"Personal identificado: {matched}/{total}")
         st.caption(f"Turnos asignados: {matched_turn}/{total} · Excluidos: {int(excluded_series.sum())}")
-        if unmatched: st.warning(f"{unmatched} pickers necesitan asignación o exclusión.")
-        with st.expander("🛠️ Resolver pickers sin coincidencia", expanded=bool(unmatched)):
-            diag=base.loc[(~match_series) & (~excluded_series),["PICKER","CORREO"]].copy() if unmatched else pd.DataFrame()
-            if diag.empty:
-                st.success("Todos los pickers están identificados o fueron excluidos.")
-            else:
-                unresolved=diag["PICKER"].astype(str).tolist()
-                selected_unresolved=st.selectbox("Picker pendiente", unresolved, key="resolver_picker")
-                current_key=person_key(selected_unresolved)
-                st.caption("Puedes resolverlo aquí sin modificar el Excel operativo.")
-                ov=store.get("master_overrides",{}).get(current_key,{})
-                turn_options=sorted(set(["Matutino","Intermedio","Tarde","Vespertino","Nocturno","Sin turno"] + [str(x).strip() for x in roster["TURNO_MAESTRO"].dropna().tolist() if str(x).strip()]))
-                default_turn=ov.get("TURNO") if ov.get("TURNO") in turn_options else (turn_options[0] if turn_options else "Sin turno")
-                turno_manual=st.selectbox("Turno",turn_options,index=turn_options.index(default_turn),key=f"manual_turn_{current_key}")
-                correo_manual=st.text_input("Código + correo",value=str(ov.get("CORREO","") or ""),key=f"manual_email_{current_key}")
-                sup_manual=st.text_input("Supervisor",value=str(ov.get("SUPERVISOR","") or ""),key=f"manual_sup_{current_key}")
-                area_manual=st.text_input("Área",value=str(ov.get("AREA_BASE","") or ""),key=f"manual_area_{current_key}")
-                c1,c2=st.columns(2)
-                with c1:
-                    if st.button("✅ Asignar y guardar",key=f"assign_{current_key}"):
-                        store.setdefault("master_overrides",{})[current_key]={"PICKER":selected_unresolved,"TURNO":turno_manual,"CORREO":correo_manual.strip(),"SUPERVISOR":sup_manual.strip() or "No asignado","AREA_BASE":area_manual.strip() or "No especificada"}
-                        store.setdefault("master_excluded",[])
-                        store["master_excluded"]=[k for k in store["master_excluded"] if k!=current_key]
-                        save_store(store); st.success("Asignación guardada."); st.rerun()
-                with c2:
-                    if st.button("🗑️ Excluir de personal",key=f"exclude_{current_key}"):
-                        store.setdefault("master_excluded",[])
-                        if current_key not in store["master_excluded"]: store["master_excluded"].append(current_key)
-                        save_store(store); st.success("Picker excluido del maestro de personal. Sus líneas/FNR/MC globales se conservan."); st.rerun()
-                st.dataframe(diag.head(100),use_container_width=True,hide_index=True)
-            # Administración de asignaciones ya hechas
-            saved=store.get("master_overrides",{})
-            if saved:
-                st.caption(f"Asignaciones manuales guardadas: {len(saved)}")
-            excluded_saved=store.get("master_excluded",[])
-            if excluded_saved:
-                st.caption(f"Exclusiones guardadas: {len(excluded_saved)}")
-                excluded_labels=[next((str(v) for v in base["PICKER"].tolist() if person_key(v)==k),k) for k in excluded_saved]
-                restore_label=st.selectbox("Reactivar picker excluido", ["Selecciona..."]+excluded_labels, key="restore_excluded")
-                if restore_label!="Selecciona..." and st.button("↩️ Reactivar en personal",key="restore_excluded_btn"):
-                    rk=person_key(restore_label)
-                    store["master_excluded"]=[k for k in store.get("master_excluded",[]) if k!=rk]
-                    save_store(store); st.success("Picker reactivado para el análisis de personal."); st.rerun()
+        if unmatched:
+            st.caption(f"{unmatched} picker(s) sin coincidencia en el maestro.")
 
 # Retira columnas técnicas antes de mostrar/exportar.
 base=base.drop(columns=["_MASTER_MATCH"],errors="ignore")
 
-# Filtros combinados de personal. Las personas excluidas no aparecen en los filtros,
-# pero sus líneas/incidencias siguen disponibles para el KPI global.
+def person_options(df):
+    return sorted({str(x).strip() for x in df["PICKER"].tolist() if str(x).strip()}, key=lambda z:z.upper())
+
+def render_person_filters(df, key_prefix, include_picker=True, include_area=True):
+    """Filtros locales de cada página; evita depender de un filtro global en el sidebar."""
+    turns=["Todos"]+sorted({str(x).strip() for x in df["TURNO"].tolist() if str(x).strip() and str(x)!="__EXCLUIDO__"}, key=lambda z:z.upper())
+    sups=["Todos"]+sorted({str(x).strip() for x in df["SUPERVISOR"].tolist() if str(x).strip() and str(x)!="No asignado"}, key=lambda z:z.upper())
+    areas=["Todos"]+sorted({str(x).strip() for x in df["AREA_BASE"].tolist() if str(x).strip() and str(x)!="No especificada"}, key=lambda z:z.upper())
+    ncols=4 if include_picker and include_area else 3
+    c=st.columns(ncols)
+    pos=0
+    picker_sel="Todos"
+    if include_picker:
+        with c[pos]:
+            search=st.text_input("Buscar picker", placeholder="Escribe un nombre…", key=f"{key_prefix}_search")
+            names=person_options(df)
+            if search.strip():
+                term=norm(search)
+                names=[n for n in names if term in norm(n)]
+            picker_sel=st.selectbox("Picker",["Todos"]+names, key=f"{key_prefix}_picker")
+        pos+=1
+    with c[pos]:
+        turn_sel=st.selectbox("Turno",turns,key=f"{key_prefix}_turn")
+    pos+=1
+    with c[pos]:
+        sup_sel=st.selectbox("Supervisor",sups,key=f"{key_prefix}_sup")
+    pos+=1
+    area_sel="Todos"
+    if include_area:
+        with c[pos]:
+            area_sel=st.selectbox("Área",areas,key=f"{key_prefix}_area")
+    return picker_sel,turn_sel,sup_sel,area_sel
+
+def apply_person_filters(df, picker_sel="Todos", turn_sel="Todos", sup_sel="Todos", area_sel="Todos"):
+    out=df.copy()
+    if picker_sel!="Todos": out=out[out.PICKER==picker_sel]
+    if turn_sel!="Todos": out=out[out.TURNO.astype(str)==turn_sel]
+    if sup_sel!="Todos": out=out[out.SUPERVISOR.astype(str)==sup_sel]
+    if area_sel!="Todos": out=out[out.AREA_BASE.astype(str)==area_sel]
+    return out
+
 s_view=s.copy()
 if "_EXCLUDED_PERSONNEL" in s_view.columns:
     s_view=s_view[~s_view["_EXCLUDED_PERSONNEL"].fillna(False)]
-with st.sidebar:
-    st.subheader("🔎 Filtros de personal")
-    pickers=["Todos"]+sorted({str(x) for x in s_view["PICKER"].tolist() if str(x).strip()})
-    turns=["Todos"]+sorted({str(x) for x in s_view["TURNO"].tolist() if str(x).strip() and str(x)!="__EXCLUIDO__"})
-    sups=["Todos"]+sorted({str(x) for x in s_view["SUPERVISOR"].tolist() if str(x).strip() and str(x)!="No asignado"})
-    areas=["Todos"]+sorted({str(x) for x in s_view["AREA_BASE"].tolist() if str(x).strip() and str(x)!="No especificada"})
-    sp=st.selectbox("Picker",pickers)
-    stn=st.selectbox("Turno",turns)
-    ssup=st.selectbox("Supervisor",sups)
-    sar=st.selectbox("Área",areas)
 
-# Filtros combinados de personal. Los KPI se recalculan sobre la selección.
-if sp!="Todos": s_view=s_view[s_view.PICKER==sp]
-if stn!="Todos": s_view=s_view[s_view.TURNO==stn]
-if ssup!="Todos": s_view=s_view[s_view.SUPERVISOR==ssup]
-if sar!="Todos": s_view=s_view[s_view.AREA_BASE==sar]
+# Defaults para pestañas que no necesitan filtros globales.
+sp="Todos"
+stn="Todos"
+ssup="Todos"
+sar="Todos"
 base_view=base[base.PICKER.isin(s_view.PICKER)]
 fnr_view=fnr[fnr.PICKER.isin(s_view.PICKER)]
 mc_view=mc[mc.PICKER.isin(s_view.PICKER)]
@@ -771,25 +763,46 @@ mc_view=mc[mc.PICKER.isin(s_view.PICKER)]
 a,b,c,d,e,g,h,f,j=st.tabs(["🏠 Bodega","👤 Picker","🏷️ Artículos","📦 Pedidos","🌙 Turnos / Áreas","👥 Supervisores","🛡️ Seguimiento","📥 Exportar","📌 Pendientes & Procesos"])
 
 with a:
-    lines=base_view.LINEAS.sum(); F=fnr_view.INCIDENCIAS.sum(); M=mc_view.INCIDENCIAS.sum()
-    total_pedidos,fnr_pedidos,mc_pedidos,fnr_rate,mc_rate=monthly_kpis(base_view,fnr_view,mc_view)
     st.subheader(f"Resumen de bodega — {periodo}")
-    q=st.columns(6)
-    q[0].metric("Líneas",f"{lines:,.0f}")
-    q[1].metric("Pedidos",f"{total_pedidos:,.0f}")
-    q[2].metric("FNR mensual",f"{fnr_rate:.2f}%" if fnr_rate is not None else "N/D", "Objetivo < 1.50%")
-    q[3].metric("MC mensual",f"{mc_rate:.2f}%" if mc_rate is not None else "N/D", "Objetivo < 1.00%")
-    q[4].metric("Pickers",len(s_view))
-    q[5].metric("Fuera objetivo",(s_view.ESTADO=="🔴 FUERA DE OBJETIVO").sum())
-    st.caption(f"KPI mensual: {fnr_pedidos:,} pedidos con FNR / {total_pedidos:,} pedidos = {fnr_rate:.2f}% · {mc_pedidos:,} pedidos con MC / {total_pedidos:,} pedidos = {mc_rate:.2f}%" if fnr_rate is not None and mc_rate is not None else "No hay suficientes pedidos para calcular el KPI mensual.")
+    st.caption("Los filtros de esta página afectan únicamente este tablero.")
+    with st.container(border=True):
+        st.markdown("**🔎 Filtros de bodega**")
+        bsp,bst,bss,bsa=render_person_filters(s_view,"bodega",include_picker=False,include_area=True)
+    s_bodega=apply_person_filters(s_view,bsp,bst,bss,bsa)
+    base_bodega=base[base.PICKER.isin(s_bodega.PICKER)]
+    fnr_bodega=fnr[fnr.PICKER.isin(s_bodega.PICKER)]
+    mc_bodega=mc[mc.PICKER.isin(s_bodega.PICKER)]
+    lines=base_bodega.LINEAS.sum(); F=fnr_bodega.INCIDENCIAS.sum(); M=mc_bodega.INCIDENCIAS.sum()
+    total_pedidos,fnr_pedidos,mc_pedidos,fnr_rate,mc_rate=monthly_kpis(base_bodega,fnr_bodega,mc_bodega)
+    q1=st.columns(3)
+    q1[0].metric("Líneas",f"{lines:,.0f}")
+    q1[1].metric("Pedidos",f"{total_pedidos:,.0f}")
+    q1[2].metric("Pickers",f"{len(s_bodega):,}")
+    q2=st.columns(3)
+    q2[0].metric("FNR mensual",f"{fnr_rate:.2f}%" if fnr_rate is not None else "N/D","Objetivo < 1.50%")
+    q2[1].metric("MC mensual",f"{mc_rate:.2f}%" if mc_rate is not None else "N/D","Objetivo < 1.00%")
+    q2[2].metric("Fuera objetivo",f"{int((s_bodega.ESTADO=="🔴 FUERA DE OBJETIVO").sum()):,}")
+    if fnr_rate is not None and mc_rate is not None:
+        st.caption(f"KPI mensual: {fnr_pedidos:,} pedidos con FNR / {total_pedidos:,} pedidos = {fnr_rate:.2f}% · {mc_pedidos:,} pedidos con MC / {total_pedidos:,} pedidos = {mc_rate:.2f}%")
+    else:
+        st.caption("No hay suficientes pedidos para calcular el KPI mensual.")
     st.divider()
     st.subheader("Indicador operativo por líneas")
-    k=st.columns(2); k[0].metric("FNR / líneas",f"{F/lines*100:.2f}%" if lines else "N/D"); k[1].metric("MC / líneas",f"{M/lines*100:.2f}%" if lines else "N/D")
-    st.dataframe(s_view,use_container_width=True,hide_index=True)
+    k=st.columns(2)
+    k[0].metric("FNR / líneas",f"{F/lines*100:.2f}%" if lines else "N/D")
+    k[1].metric("MC / líneas",f"{M/lines*100:.2f}%" if lines else "N/D")
+    st.subheader("Detalle por picker")
+    st.dataframe(s_bodega,use_container_width=True,hide_index=True)
 
 with b:
+    st.subheader("👤 Ficha de picker")
+    st.caption("Busca y selecciona el nombre directamente desde esta página. Los filtros no afectan las demás pestañas.")
+    with st.container(border=True):
+        st.markdown("**🔎 Buscar picker**")
+        psp,pst,pssup,psarea=render_person_filters(s_view,"picker_page",include_picker=True,include_area=True)
+    sp=psp
     if sp=="Todos":
-        st.info("Selecciona un picker en los filtros para consultar su ficha completa.")
+        st.info("Escribe parte del nombre o selecciona un picker para consultar su ficha completa.")
     else:
         r=s[s.PICKER==sp].iloc[0]
         st.markdown(f"<div class='justo-card'><div class='justo-kicker'>Ficha de picker</div><div class='justo-title'>{sp}</div><div class='justo-muted'>Turno: {r.TURNO} · Supervisor: {r.SUPERVISOR} · Área: {r.AREA_BASE} · Usuario: {r.CORREO}</div></div>", unsafe_allow_html=True)
@@ -846,32 +859,49 @@ with b:
             st.info("Este picker todavía no tiene retroalimentaciones ni acciones registradas.")
 
 with c:
-    tipo=st.radio("Tipo",["FNR","MC"],horizontal=True); data=fnr if tipo=="FNR" else mc
-    if sp!="Todos": data=data[data.PICKER==sp]
-    if stn!="Todos": data=data[data.TURNO_REF.astype(str)==stn]
+    st.subheader("🏷️ Artículos")
+    st.caption("Filtra los productos por picker, turno, supervisor o área sin salir de esta página.")
+    with st.container(border=True):
+        asp,ast,assup,asar=render_person_filters(s_view,"articulos",include_picker=True,include_area=True)
+    tipo=st.radio("Tipo",["FNR","MC"],horizontal=True,key="articulos_tipo")
+    data=fnr if tipo=="FNR" else mc
+    selected=apply_person_filters(s_view,asp,ast,assup,asar)
+    data=data[data.PICKER.isin(selected.PICKER)]
     st.dataframe(data.groupby(["PRODUCTO","AREA"],as_index=False).INCIDENCIAS.sum().rename(columns={"INCIDENCIAS":"CANTIDAD"}).sort_values("CANTIDAD",ascending=False),use_container_width=True,hide_index=True)
 
 with d:
-    tipo=st.radio("Incidencia",["FNR","MC"],horizontal=True); data=fnr if tipo=="FNR" else mc
-    if sp!="Todos": data=data[data.PICKER==sp]
+    st.subheader("📦 Pedidos")
+    st.caption("Consulta los pedidos con FNR o MC y filtra por persona desde aquí.")
+    with st.container(border=True):
+        dsp,dst,dssup,dsar=render_person_filters(s_view,"pedidos",include_picker=True,include_area=True)
+    tipo=st.radio("Incidencia",["FNR","MC"],horizontal=True,key="pedidos_tipo")
+    data=fnr if tipo=="FNR" else mc
+    selected=apply_person_filters(s_view,dsp,dst,dssup,dsar)
+    data=data[data.PICKER.isin(selected.PICKER)]
     st.dataframe(orders(data),use_container_width=True,hide_index=True)
     st.caption("PICKERS indica cuántos pickers aparecen en el mismo pedido.")
 
 with e:
-    if roster is not None:
-        st.success("Los turnos, correos, supervisores y áreas provienen del Maestro_Personal del único Excel cargado.")
-    else:
-        st.info("El Maestro_Personal del Excel consolidado asigna turno, correo, supervisor y área a cada picker.")
-    st.subheader("FNR por turno"); st.dataframe(groups(fnr_view,base_view,"TURNO"),use_container_width=True,hide_index=True)
-    st.subheader("MC por turno"); st.dataframe(groups(mc_view,base_view,"TURNO"),use_container_width=True,hide_index=True)
-    st.subheader("FNR por área"); st.dataframe(groups(fnr_view,base_view,"AREA"),use_container_width=True,hide_index=True)
-    st.subheader("MC por área"); st.dataframe(groups(mc_view,base_view,"AREA"),use_container_width=True,hide_index=True)
+    st.subheader("🌙 Turnos / Áreas")
+    st.caption("Selecciona un supervisor o área para concentrar el análisis operativo.")
+    with st.container(border=True):
+        esp,est,essup,esar=render_person_filters(s_view,"turnos_areas",include_picker=False,include_area=True)
+    selected=apply_person_filters(s_view,esp,est,essup,esar)
+    bsel=base[base.PICKER.isin(selected.PICKER)]
+    fsel=fnr[fnr.PICKER.isin(selected.PICKER)]
+    msel=mc[mc.PICKER.isin(selected.PICKER)]
+    st.subheader("FNR por turno"); st.dataframe(groups(fsel,bsel,"TURNO"),use_container_width=True,hide_index=True)
+    st.subheader("MC por turno"); st.dataframe(groups(msel,bsel,"TURNO"),use_container_width=True,hide_index=True)
+    st.subheader("FNR por área"); st.dataframe(groups(fsel,bsel,"AREA"),use_container_width=True,hide_index=True)
+    st.subheader("MC por área"); st.dataframe(groups(msel,bsel,"AREA"),use_container_width=True,hide_index=True)
     st.warning("El % / líneas por área solo aparece si existe un denominador real de líneas por área.")
 
 with g:
     st.subheader("👥 Supervisores")
     st.caption("Vista operativa para revisar carga, calidad y seguimiento por supervisor.")
-    sup_data=s_view.copy()
+    with st.container(border=True):
+        gsp,gst,gssup,gsarea=render_person_filters(s_view,"supervisores",include_picker=False,include_area=True)
+    sup_data=apply_person_filters(s_view,gsp,gst,gssup,gsarea)
     if not sup_data.empty:
         sup_summary=(sup_data.groupby("SUPERVISOR",as_index=False)
             .agg(PICKERS=("PICKER","nunique"),LINEAS=("LINEAS","sum"),FNR=("FNR","sum"),MC=("MC","sum"))
@@ -881,7 +911,7 @@ with g:
         st.dataframe(sup_summary,use_container_width=True,hide_index=True)
         sup_focus=st.selectbox("Supervisor",["Todos"]+sorted([str(x) for x in sup_summary["SUPERVISOR"] if str(x).strip()]))
         if sup_focus!="Todos":
-            st.dataframe(s_view[s_view["SUPERVISOR"]==sup_focus],use_container_width=True,hide_index=True)
+            st.dataframe(sup_data[sup_data["SUPERVISOR"]==sup_focus],use_container_width=True,hide_index=True)
     else:
         st.info("No hay datos para los filtros actuales.")
 
