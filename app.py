@@ -1,4 +1,3 @@
-
 import io, re, json, os
 from difflib import SequenceMatcher
 from datetime import datetime
@@ -234,6 +233,68 @@ def apply_roster(base, roster):
     x.loc[ok,"AREA_BASE"]=x.loc[ok,"_MASTER_AREA"]
     return x.drop(columns=["_KEY","_TOKEN_KEY","_CODE_KEY","_EMAIL_TOKENS","_MASTER_PICKER","_MASTER_TURNO","_MASTER_CORREO","_MASTER_SUPERVISOR","_MASTER_AREA"],errors="ignore")
 
+def apply_manual_personnel(base, store):
+    """Aplica asignaciones/exclusiones capturadas desde la interfaz.
+
+    Las asignaciones se guardan por una clave normalizada del picker original,
+    de modo que no es necesario editar el Excel operativo. Una exclusión solo
+    retira a la persona de los filtros/segmentaciones de personal; no borra
+    sus líneas ni sus incidencias del cálculo global.
+    """
+    x=base.copy()
+    overrides=store.get("master_overrides",{}) if isinstance(store,dict) else {}
+    excluded=set(store.get("master_excluded",[])) if isinstance(store,dict) else set()
+    if "_MANUAL_MATCH" not in x.columns: x["_MANUAL_MATCH"]=False
+    if "_EXCLUDED_PERSONNEL" not in x.columns: x["_EXCLUDED_PERSONNEL"]=False
+    for i,row in x.iterrows():
+        key=person_key(row.get("PICKER",""))
+        if not key: continue
+        if key in excluded:
+            x.at[i,"_EXCLUDED_PERSONNEL"]=True
+            x.at[i,"_MASTER_MATCH"]=True
+            x.at[i,"TURNO"]="__EXCLUIDO__"
+            x.at[i,"SUPERVISOR"]="Excluido"
+            x.at[i,"AREA_BASE"]="Excluido"
+            continue
+        ov=overrides.get(key)
+        if not ov: continue
+        x.at[i,"_MANUAL_MATCH"]=True
+        x.at[i,"_MASTER_MATCH"]=True
+        if ov.get("PICKER"): x.at[i,"PICKER"]=str(ov.get("PICKER")).strip()
+        x.at[i,"TURNO"]=str(ov.get("TURNO","")).strip() or "No especificado"
+        x.at[i,"CORREO"]=str(ov.get("CORREO","")).strip()
+        x.at[i,"SUPERVISOR"]=str(ov.get("SUPERVISOR","")).strip() or "No asignado"
+        x.at[i,"AREA_BASE"]=str(ov.get("AREA_BASE","")).strip() or "No especificada"
+    return x
+
+def effective_roster(roster, store):
+    """Construye el maestro efectivo: Excel + asignaciones manuales - exclusiones."""
+    r=roster.copy() if roster is not None else pd.DataFrame()
+    overrides=store.get("master_overrides",{}) if isinstance(store,dict) else {}
+    excluded=set(store.get("master_excluded",[])) if isinstance(store,dict) else set()
+    if overrides:
+        rows=[]
+        for _,ov in overrides.items():
+            rows.append({
+                "PICKER":str(ov.get("PICKER","")).strip(),
+                "TURNO_MAESTRO":str(ov.get("TURNO","")).strip(),
+                "CORREO":str(ov.get("CORREO","")).strip(),
+                "SUPERVISOR":str(ov.get("SUPERVISOR","No asignado")).strip() or "No asignado",
+                "AREA_MAESTRO":str(ov.get("AREA_BASE","")).strip(),
+            })
+        if rows:
+            manual=pd.DataFrame(rows)
+            manual["_KEY"]=manual["PICKER"].map(person_key)
+            manual["_TOKEN_KEY"]=manual["PICKER"].map(token_key)
+            manual["_CODE_KEY"]=manual["CORREO"].map(extract_code)
+            manual["_EMAIL_TOKENS"]=manual["CORREO"].map(email_name_tokens)
+            r=pd.concat([r,manual],ignore_index=True)
+    if not r.empty:
+        r["_KEY"]=r["PICKER"].map(person_key)
+        r=r[~r["_KEY"].isin(excluded)].copy()
+        r=r.drop_duplicates("_KEY",keep="last")
+    return r
+
 def canonicalize_incidents(inc, base):
     """Lleva FNR/MC al nombre canónico de la base, usando nombre/código/correo."""
     if inc is None or inc.empty or base is None or base.empty: return inc
@@ -300,7 +361,7 @@ def parse_inc(df,tipo):
     return x
 
 def attach(inc,base):
-    ref=base[[c for c in ["PICKER","LINEAS","PEDIDOS","TURNO","CORREO"] if c in base.columns]].copy()
+    ref=base[[c for c in ["PICKER","LINEAS","PEDIDOS","TURNO","CORREO","_EXCLUDED_PERSONNEL"] if c in base.columns]].copy()
     ref["_KEY"]=ref["PICKER"].map(person_key)
     ref["_TOKEN_KEY"]=ref["PICKER"].map(token_key)
     ref["_CODE_KEY"]=ref.get("CORREO",pd.Series([""]*len(ref),index=ref.index)).map(extract_code)
@@ -316,10 +377,10 @@ def attach(inc,base):
             if key and key in mp.index:
                 rr=mp.loc[key]
                 if isinstance(rr,pd.DataFrame): rr=rr.iloc[0]
-                return pd.Series([rr["PICKER"],rr["LINEAS"],rr["PEDIDOS"],rr["TURNO"]])
+                return pd.Series([rr["PICKER"],rr["LINEAS"],rr["PEDIDOS"],rr["TURNO"],bool(rr.get("_EXCLUDED_PERSONNEL",False))])
         return pd.Series([row["PICKER"],0,0,"No especificado"])
     vals=y.apply(get_ref,axis=1)
-    vals.columns=["PICKER_REF","LINEAS","PEDIDOS","TURNO_REF"]
+    vals.columns=["PICKER_REF","LINEAS","PEDIDOS","TURNO_REF","_EXCLUDED_PERSONNEL"]
     y=pd.concat([y.reset_index(drop=True),vals.reset_index(drop=True)],axis=1)
     y.loc[y["PICKER_REF"].astype(str).str.strip().ne(""),"PICKER"]=y.loc[y["PICKER_REF"].astype(str).str.strip().ne(""),"PICKER_REF"]
     return y.drop(columns=["_KEY","_TOKEN_KEY","_CODE_KEY"],errors="ignore")
@@ -375,6 +436,8 @@ def groups(inc,base,key):
     según la versión de pandas/Streamlit Cloud.
     """
     x=inc.copy()
+    if "_EXCLUDED_PERSONNEL" in x.columns:
+        x=x[~x["_EXCLUDED_PERSONNEL"].fillna(False)].copy()
     if x.empty:
         return pd.DataFrame(columns=["GRUPO","INCIDENCIAS","% DEL TOTAL","LINEAS","% / LINEAS"])
 
@@ -444,9 +507,12 @@ try:
     else:
         master_df=choose(master_sheets,["base_pickers","maestro_personal","personal","maestro","turno"])
     roster=parse_roster(master_df)
-    base=apply_roster(base,roster)
     if roster.empty:
         raise ValueError("El Excel maestro no contiene pickers válidos.")
+    store=load_store()
+    base=apply_roster(base,roster)
+    base=apply_manual_personnel(base,store)
+    roster=effective_roster(roster,store)
     # Normaliza FNR/MC contra los pickers canónicos de la base.
     fnr=canonicalize_incidents(fnr,base)
     mc=canonicalize_incidents(mc,base)
@@ -461,44 +527,83 @@ fnr=attach(fnr,base); mc=attach(mc,base); s=summary(base,fnr,mc)
 master_match=base.get("_MASTER_MATCH",pd.Series(False,index=base.index)).copy()
 base_display=base.drop(columns=["_MASTER_MATCH"],errors="ignore")
 s=s.drop(columns=["_MASTER_MATCH"],errors="ignore")
-store = load_store()
 # Registrar automáticamente pickers vistos en la operación, sin alterar su estado histórico.
 for _p in base["PICKER"].astype(str).str.strip().unique(): picker_record(store, _p)
 save_store(store)
 
 if roster is not None:
     match_series=base.get("_MASTER_MATCH",pd.Series(False,index=base.index)).fillna(False).astype(bool)
-    matched=int(match_series.sum())
-    total=len(base); unmatched=total-matched
-    matched_turn=int((match_series & base["TURNO"].astype(str).str.strip().ne("") & base["TURNO"].astype(str).str.strip().ne("No especificado")).sum())
+    excluded_series=base.get("_EXCLUDED_PERSONNEL",pd.Series(False,index=base.index)).fillna(False).astype(bool)
+    matched=int((match_series & ~excluded_series).sum())
+    total=len(base); unmatched=total-matched-int(excluded_series.sum())
+    matched_turn=int((match_series & ~excluded_series & base["TURNO"].astype(str).str.strip().ne("") & base["TURNO"].astype(str).str.strip().ne("No especificado") & base["TURNO"].astype(str).str.strip().ne("__EXCLUIDO__")).sum())
     with st.sidebar:
-        st.success(f"Personal cruzado: {matched}/{total} pickers desde el Excel consolidado.")
-        st.caption(f"Turnos asignados desde Master: {matched_turn}/{total}")
-        if unmatched: st.warning(f"{unmatched} pickers de la base no tienen coincidencia en Master_Pickers.")
-        # Diagnóstico visible para saber EXACTAMENTE qué nombres no cruzaron.
-        with st.expander("🔎 Diagnóstico del cruce", expanded=False):
-            diag=base.loc[~match_series,["PICKER","CORREO"]].copy() if unmatched else pd.DataFrame()
+        st.success(f"Personal identificado: {matched}/{total} pickers.")
+        st.caption(f"Turnos asignados: {matched_turn}/{total} · Excluidos: {int(excluded_series.sum())}")
+        if unmatched: st.warning(f"{unmatched} pickers necesitan asignación o exclusión.")
+        with st.expander("🛠️ Resolver pickers sin coincidencia", expanded=bool(unmatched)):
+            diag=base.loc[(~match_series) & (~excluded_series),["PICKER","CORREO"]].copy() if unmatched else pd.DataFrame()
             if diag.empty:
-                st.success("Todos los pickers de la base fueron identificados en el Master.")
+                st.success("Todos los pickers están identificados o fueron excluidos.")
             else:
+                unresolved=diag["PICKER"].astype(str).tolist()
+                selected_unresolved=st.selectbox("Picker pendiente", unresolved, key="resolver_picker")
+                current_key=person_key(selected_unresolved)
+                st.caption("Puedes resolverlo aquí sin modificar el Excel operativo.")
+                ov=store.get("master_overrides",{}).get(current_key,{})
+                turn_options=sorted(set(["Matutino","Intermedio","Tarde","Vespertino","Nocturno","Sin turno"] + [str(x).strip() for x in roster["TURNO_MAESTRO"].dropna().tolist() if str(x).strip()]))
+                default_turn=ov.get("TURNO") if ov.get("TURNO") in turn_options else (turn_options[0] if turn_options else "Sin turno")
+                turno_manual=st.selectbox("Turno",turn_options,index=turn_options.index(default_turn),key=f"manual_turn_{current_key}")
+                correo_manual=st.text_input("Código + correo",value=str(ov.get("CORREO","") or ""),key=f"manual_email_{current_key}")
+                sup_manual=st.text_input("Supervisor",value=str(ov.get("SUPERVISOR","") or ""),key=f"manual_sup_{current_key}")
+                area_manual=st.text_input("Área",value=str(ov.get("AREA_BASE","") or ""),key=f"manual_area_{current_key}")
+                c1,c2=st.columns(2)
+                with c1:
+                    if st.button("✅ Asignar y guardar",key=f"assign_{current_key}"):
+                        store.setdefault("master_overrides",{})[current_key]={"PICKER":selected_unresolved,"TURNO":turno_manual,"CORREO":correo_manual.strip(),"SUPERVISOR":sup_manual.strip() or "No asignado","AREA_BASE":area_manual.strip() or "No especificada"}
+                        store.setdefault("master_excluded",[])
+                        store["master_excluded"]=[k for k in store["master_excluded"] if k!=current_key]
+                        save_store(store); st.success("Asignación guardada."); st.rerun()
+                with c2:
+                    if st.button("🗑️ Excluir de personal",key=f"exclude_{current_key}"):
+                        store.setdefault("master_excluded",[])
+                        if current_key not in store["master_excluded"]: store["master_excluded"].append(current_key)
+                        save_store(store); st.success("Picker excluido del maestro de personal. Sus líneas/FNR/MC globales se conservan."); st.rerun()
                 st.dataframe(diag.head(100),use_container_width=True,hide_index=True)
+            # Administración de asignaciones ya hechas
+            saved=store.get("master_overrides",{})
+            if saved:
+                st.caption(f"Asignaciones manuales guardadas: {len(saved)}")
+            excluded_saved=store.get("master_excluded",[])
+            if excluded_saved:
+                st.caption(f"Exclusiones guardadas: {len(excluded_saved)}")
+                excluded_labels=[next((str(v) for v in base["PICKER"].tolist() if person_key(v)==k),k) for k in excluded_saved]
+                restore_label=st.selectbox("Reactivar picker excluido", ["Selecciona..."]+excluded_labels, key="restore_excluded")
+                if restore_label!="Selecciona..." and st.button("↩️ Reactivar en personal",key="restore_excluded_btn"):
+                    rk=person_key(restore_label)
+                    store["master_excluded"]=[k for k in store.get("master_excluded",[]) if k!=rk]
+                    save_store(store); st.success("Picker reactivado para el análisis de personal."); st.rerun()
 
 # Retira columnas técnicas antes de mostrar/exportar.
 base=base.drop(columns=["_MASTER_MATCH"],errors="ignore")
 
+# Filtros combinados de personal. Las personas excluidas no aparecen en los filtros,
+# pero sus líneas/incidencias siguen disponibles para el KPI global.
+s_view=s.copy()
+if "_EXCLUDED_PERSONNEL" in s_view.columns:
+    s_view=s_view[~s_view["_EXCLUDED_PERSONNEL"].fillna(False)]
 with st.sidebar:
     st.subheader("Filtros de personal")
-    pickers=["Todos"]+sorted({str(x) for x in s["PICKER"].tolist() if str(x).strip()})
-    turns=["Todos"]+sorted({str(x) for x in s["TURNO"].tolist() if str(x).strip()})
-    sups=["Todos"]+sorted({str(x) for x in s["SUPERVISOR"].tolist() if str(x).strip() and str(x)!="No asignado"})
-    areas=["Todos"]+sorted({str(x) for x in s["AREA_BASE"].tolist() if str(x).strip() and str(x)!="No especificada"})
+    pickers=["Todos"]+sorted({str(x) for x in s_view["PICKER"].tolist() if str(x).strip()})
+    turns=["Todos"]+sorted({str(x) for x in s_view["TURNO"].tolist() if str(x).strip() and str(x)!="__EXCLUIDO__"})
+    sups=["Todos"]+sorted({str(x) for x in s_view["SUPERVISOR"].tolist() if str(x).strip() and str(x)!="No asignado"})
+    areas=["Todos"]+sorted({str(x) for x in s_view["AREA_BASE"].tolist() if str(x).strip() and str(x)!="No especificada"})
     sp=st.selectbox("Picker",pickers)
     stn=st.selectbox("Turno",turns)
     ssup=st.selectbox("Supervisor",sups)
     sar=st.selectbox("Área",areas)
 
 # Filtros combinados de personal. Los KPI se recalculan sobre la selección.
-s_view=s.copy()
 if sp!="Todos": s_view=s_view[s_view.PICKER==sp]
 if stn!="Todos": s_view=s_view[s_view.TURNO==stn]
 if ssup!="Todos": s_view=s_view[s_view.SUPERVISOR==ssup]
