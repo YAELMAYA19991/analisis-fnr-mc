@@ -185,22 +185,35 @@ def orders(inc,picker=None):
     return x.groupby("ORDER_NUMBER",as_index=False).agg(INCIDENCIAS=("INCIDENCIAS","sum"),PICKERS=("PICKER","nunique"),PRODUCTOS=("PRODUCTO","nunique")).sort_values(["INCIDENCIAS","PICKERS"],ascending=False)
 
 def groups(inc,base,key):
+    """Agrupa FNR/MC por turno o área usando acceso por nombre de columna.
+    Evita el acceso por atributo de pandas (p.ej. .LINEAS), que puede fallar
+    según la versión de pandas/Streamlit Cloud.
+    """
     x=inc.copy()
+    if x.empty:
+        return pd.DataFrame(columns=["GRUPO","INCIDENCIAS","% DEL TOTAL","LINEAS","% / LINEAS"])
+
     if key=="TURNO":
-        x["GRUPO"]=x.TURNO_REF
-        den=base.groupby("TURNO",as_index=False).LINEAS.rename(columns={"TURNO":"GRUPO"})
+        x["GRUPO"]=x["TURNO_REF"].astype(str).str.strip()
+        den=(base.groupby("TURNO",as_index=False)["LINEAS"].sum()
+             .rename(columns={"TURNO":"GRUPO"}))
     else:
-        x["GRUPO"]=x.AREA
-        if (base.AREA_BASE!="No especificada").any():
-            den=base.groupby("AREA_BASE",as_index=False).LINEAS.rename(columns={"AREA_BASE":"GRUPO"})
-        else: den=None
-    g=x.groupby("GRUPO",as_index=False).INCIDENCIAS.sum()
-    g["% DEL TOTAL"]=(g.INCIDENCIAS/g.INCIDENCIAS.sum()*100).round(2)
+        x["GRUPO"]=x["AREA"].astype(str).str.strip()
+        if "AREA_BASE" in base.columns and (base["AREA_BASE"].astype(str).str.strip()!="No especificada").any():
+            den=(base.groupby("AREA_BASE",as_index=False)["LINEAS"].sum()
+                 .rename(columns={"AREA_BASE":"GRUPO"}))
+        else:
+            den=None
+
+    g=x.groupby("GRUPO",as_index=False)["INCIDENCIAS"].sum()
+    total_inc=float(g["INCIDENCIAS"].sum())
+    g["% DEL TOTAL"]=(g["INCIDENCIAS"]/total_inc*100).round(2) if total_inc else 0.0
+
     if den is not None:
         g=g.merge(den,on="GRUPO",how="left")
         g["LINEAS"]=pd.to_numeric(g["LINEAS"],errors="coerce").fillna(0.0)
-        den=g["LINEAS"].where(g["LINEAS"].ne(0), float("nan"))
-        g["% / LINEAS"]=pd.to_numeric(g.INCIDENCIAS.div(den)*100,errors="coerce").round(2)
+        den_lineas=g["LINEAS"].where(g["LINEAS"].ne(0), float("nan"))
+        g["% / LINEAS"]=pd.to_numeric(g["INCIDENCIAS"].div(den_lineas)*100,errors="coerce").round(2)
     return g.sort_values("INCIDENCIAS",ascending=False)
 
 def export(summary,fnr,mc,picker,roster=None):
