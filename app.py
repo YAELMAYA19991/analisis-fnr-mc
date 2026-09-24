@@ -1021,8 +1021,35 @@ with b:
         if rec.get("acciones"):
             st.markdown("**Llamadas de atención / actas**")
             st.dataframe(pd.DataFrame(rec["acciones"]).sort_values("fecha",ascending=False),use_container_width=True,hide_index=True)
-        if not picker_fb and not rec.get("comentarios") and not rec.get("acciones"):
-            st.info("Este picker todavía no tiene retroalimentaciones ni acciones registradas.")
+
+        # El expediente documental es el mismo que usa la pestaña Seguimiento.
+        # Así, los PDFs/enlaces cargados en Seguimiento también quedan visibles en Picker.
+        picker_docs=sorted(rec.get("documentos",[]) or [], key=lambda x:str(x.get("fecha","")), reverse=True)
+        st.markdown("### 📄 Actas y documentos vinculados")
+        if picker_docs:
+            for i,doc in enumerate(picker_docs):
+                tipo=str(doc.get("tipo","Documento")); titulo=str(doc.get("titulo",doc.get("archivo",tipo)))
+                fecha=str(doc.get("fecha","")); supervisor=str(doc.get("supervisor",r.get("SUPERVISOR","")))
+                archivo=load_followup_pdf(doc)
+                with st.container(border=True):
+                    d1,d2,d3=st.columns([1.1,3.1,1.4])
+                    with d1:
+                        st.markdown(f"**{tipo}**")
+                        st.caption(fecha)
+                    with d2:
+                        st.markdown(f"**{titulo}**")
+                        if doc.get("detalle"): st.caption(doc.get("detalle"))
+                        st.caption(f"Registró: {supervisor}")
+                    with d3:
+                        if archivo is not None:
+                            st.download_button("📥 Ver PDF",archivo,file_name=str(doc.get("archivo") or f"{tipo}.pdf"),mime="application/pdf",key=f"picker_doc_download_{sp}_{doc.get('id',i)}",use_container_width=True)
+                        if doc.get("url"):
+                            st.link_button("🔗 Abrir enlace",str(doc.get("url")),use_container_width=True)
+        else:
+            st.info("No hay actas o documentos vinculados. Puedes agregarlos desde la pestaña 🛡️ Seguimiento; quedarán visibles aquí automáticamente.")
+
+        if not picker_fb and not rec.get("comentarios") and not rec.get("acciones") and not picker_docs:
+            st.info("Este picker todavía no tiene retroalimentaciones, seguimientos ni documentos registrados.")
 
 with c:
     ctx,_,_,_=global_context(s_view)
