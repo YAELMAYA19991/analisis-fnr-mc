@@ -1,4 +1,3 @@
-
 import io, re, json, os
 from difflib import SequenceMatcher
 from datetime import datetime
@@ -17,6 +16,17 @@ section[data-testid="stSidebar"] { width: 320px !important; }
 section[data-testid="stSidebar"] > div { width: 320px !important; }
 .page-filter { background:#fafaf8; border:1px solid var(--line); border-radius:16px; padding:12px 14px 2px; margin:0 0 18px; }
 [data-testid="stMetric"] { background:#fff; border:1px solid var(--line); border-radius:16px; padding:.75rem .9rem; box-shadow:0 2px 10px rgba(30,30,30,.035); }
+.kpi-soft-blue { background:#f3f8ff; border:1px solid #dcecff; }
+.kpi-soft-red { background:#fff6f6; border:1px solid #f4d9da; }
+.kpi-soft-green { background:#f3faf5; border:1px solid #dcefe1; }
+.kpi-soft-amber { background:#fffbf1; border:1px solid #f2e7c5; }
+.context-banner { background:linear-gradient(90deg,#f7f9fc,#fffafa); border:1px solid #e7e9ee; border-radius:14px; padding:12px 15px; margin:10px 0 16px; }
+.context-title { color:var(--ink); font-weight:700; font-size:.92rem; }
+.context-detail { color:var(--muted); font-size:.82rem; margin-top:3px; }
+.compare-strip { display:flex; gap:10px; flex-wrap:wrap; margin:6px 0 16px; }
+.compare-chip { background:#fafaf8; border:1px solid var(--line); border-radius:12px; padding:8px 12px; min-width:150px; }
+.compare-chip strong { color:var(--ink); }
+.compare-chip span { color:var(--muted); font-size:.78rem; }
 div[data-testid="stExpander"] { border:1px solid var(--line); border-radius:14px; overflow:hidden; }
 button[kind="primary"] { background:var(--justo-red); border-color:var(--justo-red); }
 button[kind="primary"]:hover { background:#a91f21; border-color:#a91f21; }
@@ -747,6 +757,81 @@ def apply_person_filters(df, picker_sel="Todos", turn_sel="Todos", sup_sel="Todo
     if area_sel!="Todos": out=out[out.AREA_BASE.astype(str)==area_sel]
     return out
 
+def context_values(df):
+    """Opciones del contexto global; se comparten entre todas las pestañas."""
+    turns=["Todos"]+sorted({str(x).strip() for x in df["TURNO"].tolist() if str(x).strip() and str(x)!="__EXCLUIDO__"}, key=lambda z:z.upper())
+    sups=["Todos"]+sorted({str(x).strip() for x in df["SUPERVISOR"].tolist() if str(x).strip() and str(x)!="No asignado"}, key=lambda z:z.upper())
+    areas=["Todos"]+sorted({str(x).strip() for x in df["AREA_BASE"].tolist() if str(x).strip() and str(x)!="No especificada"}, key=lambda z:z.upper())
+    return turns,sups,areas
+
+def global_context(df):
+    """Lee el contexto elegido en Bodega. Las demás páginas lo heredan automáticamente."""
+    turns,sups,areas=context_values(df)
+    ctx=st.session_state.setdefault("global_context", {"turno":"Todos","supervisor":"Todos","area":"Todos"})
+    if ctx.get("turno") not in turns: ctx["turno"]="Todos"
+    if ctx.get("supervisor") not in sups: ctx["supervisor"]="Todos"
+    if ctx.get("area") not in areas: ctx["area"]="Todos"
+    return ctx,turns,sups,areas
+
+def apply_context(df, ctx, include_turn=True):
+    return apply_person_filters(
+        df,
+        "Todos",
+        ctx.get("turno","Todos") if include_turn else "Todos",
+        ctx.get("supervisor","Todos"),
+        ctx.get("area","Todos"),
+    )
+
+def context_reference(df, ctx):
+    """Base de comparación: mantiene supervisor/área, pero abre todos los turnos."""
+    return apply_person_filters(df,"Todos","Todos",ctx.get("supervisor","Todos"),ctx.get("area","Todos"))
+
+def render_context_banner(ctx, selected_df, reference_df, label="Contexto de análisis"):
+    parts=[]
+    for k,lab in [("turno","Turno"),("supervisor","Supervisor"),("area","Área")]:
+        v=ctx.get(k,"Todos")
+        if v!="Todos": parts.append(f"{lab}: {v}")
+    scope=" · ".join(parts) if parts else "Todos los turnos"
+    sel_p=len(selected_df)
+    ref_p=len(reference_df)
+    pct=(sel_p/ref_p*100) if ref_p else 0
+    st.markdown(
+        f"<div class='context-banner'><div class='context-title'>🎯 {label}: {scope}</div>"
+        f"<div class='context-detail'>{sel_p:,} pickers · {pct:.1f}% del universo de comparación · Las demás pestañas utilizan este mismo contexto.</div></div>",
+        unsafe_allow_html=True)
+
+def render_soft_kpis(cards):
+    """Tarjetas KPI con colores muy suaves para facilitar lectura sin saturar la vista."""
+    cols=st.columns(len(cards))
+    for i,(label,value,detail,tone) in enumerate(cards):
+        with cols[i]:
+            st.markdown(
+                f"<div class='justo-card kpi-soft-{tone}'><div class='justo-muted'>{label}</div>"
+                f"<div class='justo-title' style='font-size:1.55rem;margin:.18rem 0'>{value}</div>"
+                f"<div class='justo-muted'>{detail}</div></div>",
+                unsafe_allow_html=True)
+
+def render_turn_comparison(selected_base, reference_base, selected_fnr, reference_fnr, selected_mc, reference_mc):
+    """Muestra cantidad y porcentaje del contexto contra el universo de comparación."""
+    def pct(v,d): return (v/d*100) if d else 0
+    sl=selected_base.LINEAS.sum(); rl=reference_base.LINEAS.sum()
+    sp=selected_base.PEDIDOS.sum(); rp=reference_base.PEDIDOS.sum()
+    sf=selected_fnr.INCIDENCIAS.sum(); rf=reference_fnr.INCIDENCIAS.sum()
+    sm=selected_mc.INCIDENCIAS.sum(); rm=reference_mc.INCIDENCIAS.sum()
+    sfp,_,_,sfr,s_mr=monthly_kpis(selected_base,selected_fnr,selected_mc)
+    _,_,_,rfr,r_mr=monthly_kpis(reference_base,reference_fnr,reference_mc)
+    cards=[
+        ("Líneas",sl, pct(sl,rl), "del universo"),
+        ("Pedidos",sp, pct(sp,rp), "del universo"),
+        ("FNR",sf, pct(sf,rf), "de incidencias"),
+        ("MC",sm, pct(sm,rm), "de incidencias"),
+    ]
+    chips="".join(f"<div class='compare-chip'><strong>{lab}: {val:,.0f}</strong><br><span>{share:.1f}% {sub}</span></div>" for lab,val,share,sub in cards)
+    st.markdown(f"<div class='compare-strip'>{chips}</div>",unsafe_allow_html=True)
+    c1,c2=st.columns(2)
+    c1.metric("FNR del contexto", f"{sfr:.2f}%" if sfr is not None else "N/D", f"vs {rfr:.2f}% del universo" if rfr is not None else "")
+    c2.metric("MC del contexto", f"{s_mr:.2f}%" if s_mr is not None else "N/D", f"vs {r_mr:.2f}% del universo" if r_mr is not None else "")
+
 s_view=s.copy()
 if "_EXCLUDED_PERSONNEL" in s_view.columns:
     s_view=s_view[~s_view["_EXCLUDED_PERSONNEL"].fillna(False)]
@@ -764,29 +849,51 @@ a,b,c,d,e,g,h,f,j=st.tabs(["🏠 Bodega","👤 Picker","🏷️ Artículos","�
 
 with a:
     st.subheader(f"Resumen de bodega — {periodo}")
-    st.caption("Los filtros de esta página afectan únicamente este tablero.")
+    st.caption("El contexto elegido aquí se comparte automáticamente con todas las pestañas.")
+    ctx,turns,sups,areas=global_context(s_view)
     with st.container(border=True):
-        st.markdown("**🔎 Filtros de bodega**")
-        bsp,bst,bss,bsa=render_person_filters(s_view,"bodega",include_picker=False,include_area=True)
-    s_bodega=apply_person_filters(s_view,bsp,bst,bss,bsa)
+        st.markdown("**🎯 Contexto global de análisis**")
+        c1,c2,c3=st.columns(3)
+        with c1:
+            st.selectbox("Turno",turns,key="global_turno")
+        with c2:
+            st.selectbox("Supervisor",sups,key="global_supervisor")
+        with c3:
+            st.selectbox("Área",areas,key="global_area")
+    ctx["turno"]=st.session_state.get("global_turno","Todos")
+    ctx["supervisor"]=st.session_state.get("global_supervisor","Todos")
+    ctx["area"]=st.session_state.get("global_area","Todos")
+
+    s_bodega=apply_context(s_view,ctx)
+    s_reference=context_reference(s_view,ctx)
     base_bodega=base[base.PICKER.isin(s_bodega.PICKER)]
     fnr_bodega=fnr[fnr.PICKER.isin(s_bodega.PICKER)]
     mc_bodega=mc[mc.PICKER.isin(s_bodega.PICKER)]
+    base_reference=base[base.PICKER.isin(s_reference.PICKER)]
+    fnr_reference=fnr[fnr.PICKER.isin(s_reference.PICKER)]
+    mc_reference=mc[mc.PICKER.isin(s_reference.PICKER)]
+    render_context_banner(ctx,s_bodega,s_reference)
+
     lines=base_bodega.LINEAS.sum(); F=fnr_bodega.INCIDENCIAS.sum(); M=mc_bodega.INCIDENCIAS.sum()
     total_pedidos,fnr_pedidos,mc_pedidos,fnr_rate,mc_rate=monthly_kpis(base_bodega,fnr_bodega,mc_bodega)
-    q1=st.columns(3)
-    q1[0].metric("Líneas",f"{lines:,.0f}")
-    q1[1].metric("Pedidos",f"{total_pedidos:,.0f}")
-    q1[2].metric("Pickers",f"{len(s_bodega):,}")
-    q2=st.columns(3)
-    q2[0].metric("FNR mensual",f"{fnr_rate:.2f}%" if fnr_rate is not None else "N/D","Objetivo < 1.50%")
-    q2[1].metric("MC mensual",f"{mc_rate:.2f}%" if mc_rate is not None else "N/D","Objetivo < 1.00%")
-    q2[2].metric("Fuera objetivo",f"{int((s_bodega.ESTADO=="🔴 FUERA DE OBJETIVO").sum()):,}")
+    render_soft_kpis([
+        ("Líneas",f"{lines:,.0f}",f"{lines/base_reference.LINEAS.sum()*100:.1f}% del universo" if base_reference.LINEAS.sum() else "Sin referencia","blue"),
+        ("Pedidos",f"{total_pedidos:,.0f}",f"{total_pedidos/base_reference.PEDIDOS.sum()*100:.1f}% del universo" if base_reference.PEDIDOS.sum() else "Sin referencia","green"),
+        ("Pickers",f"{len(s_bodega):,}",f"{len(s_bodega)/len(s_reference)*100:.1f}% del universo" if len(s_reference) else "Sin referencia","blue"),
+    ])
+    render_soft_kpis([
+        ("FNR mensual",f"{fnr_rate:.2f}%" if fnr_rate is not None else "N/D","Objetivo < 1.50%","red"),
+        ("MC mensual",f"{mc_rate:.2f}%" if mc_rate is not None else "N/D","Objetivo < 1.00%","amber"),
+        ("Fuera objetivo",f"{int((s_bodega.ESTADO=="🔴 FUERA DE OBJETIVO").sum()):,}",f"de {len(s_bodega):,} pickers","red"),
+    ])
     if fnr_rate is not None and mc_rate is not None:
-        st.caption(f"KPI mensual: {fnr_pedidos:,} pedidos con FNR / {total_pedidos:,} pedidos = {fnr_rate:.2f}% · {mc_pedidos:,} pedidos con MC / {total_pedidos:,} pedidos = {mc_rate:.2f}%")
+        st.caption(f"KPI mensual del contexto: {fnr_pedidos:,} pedidos con FNR / {total_pedidos:,} pedidos = {fnr_rate:.2f}% · {mc_pedidos:,} pedidos con MC / {total_pedidos:,} pedidos = {mc_rate:.2f}%")
     else:
         st.caption("No hay suficientes pedidos para calcular el KPI mensual.")
-    st.divider()
+
+    st.subheader("Comparativo del contexto")
+    render_turn_comparison(base_bodega,base_reference,fnr_bodega,fnr_reference,mc_bodega,mc_reference)
+
     st.subheader("Indicador operativo por líneas")
     k=st.columns(2)
     k[0].metric("FNR / líneas",f"{F/lines*100:.2f}%" if lines else "N/D")
@@ -795,12 +902,20 @@ with a:
     st.dataframe(s_bodega,use_container_width=True,hide_index=True)
 
 with b:
+    ctx,_,_,_=global_context(s_view)
+    selected_context=apply_context(s_view,ctx)
     st.subheader("👤 Ficha de picker")
-    st.caption("Busca y selecciona el nombre directamente desde esta página. Los filtros no afectan las demás pestañas.")
+    st.caption("El turno, supervisor y área se heredan del contexto elegido en Bodega. Aquí solo buscas el picker.")
+    render_context_banner(ctx,selected_context,context_reference(s_view,ctx),"Contexto heredado")
+    names=person_options(selected_context)
     with st.container(border=True):
-        st.markdown("**🔎 Buscar picker**")
-        psp,pst,pssup,psarea=render_person_filters(s_view,"picker_page",include_picker=True,include_area=True)
-    sp=psp
+        search=st.text_input("🔎 Buscar picker",placeholder="Escribe parte del nombre…",key="picker_page_search")
+        filtered_names=names
+        if search.strip():
+            term=norm(search)
+            filtered_names=[n for n in names if term in norm(n)]
+        picker_choice=st.selectbox("Selecciona un picker",["Todos"]+filtered_names,key="picker_page_picker")
+    sp=picker_choice
     if sp=="Todos":
         st.info("Escribe parte del nombre o selecciona un picker para consultar su ficha completa.")
     else:
@@ -859,49 +974,62 @@ with b:
             st.info("Este picker todavía no tiene retroalimentaciones ni acciones registradas.")
 
 with c:
+    ctx,_,_,_=global_context(s_view)
     st.subheader("🏷️ Artículos")
-    st.caption("Filtra los productos por picker, turno, supervisor o área sin salir de esta página.")
-    with st.container(border=True):
-        asp,ast,assup,asar=render_person_filters(s_view,"articulos",include_picker=True,include_area=True)
+    st.caption("Esta página respeta el mismo turno, supervisor y área seleccionados en Bodega.")
+    selected=apply_context(s_view,ctx)
+    render_context_banner(ctx,selected,context_reference(s_view,ctx),"Contexto heredado")
     tipo=st.radio("Tipo",["FNR","MC"],horizontal=True,key="articulos_tipo")
     data=fnr if tipo=="FNR" else mc
-    selected=apply_person_filters(s_view,asp,ast,assup,asar)
     data=data[data.PICKER.isin(selected.PICKER)]
-    st.dataframe(data.groupby(["PRODUCTO","AREA"],as_index=False).INCIDENCIAS.sum().rename(columns={"INCIDENCIAS":"CANTIDAD"}).sort_values("CANTIDAD",ascending=False),use_container_width=True,hide_index=True)
+    art=data.groupby(["PRODUCTO","AREA"],as_index=False).INCIDENCIAS.sum().rename(columns={"INCIDENCIAS":"CANTIDAD"}).sort_values("CANTIDAD",ascending=False)
+    st.dataframe(art,use_container_width=True,hide_index=True)
+    st.caption(f"{len(art):,} artículos con incidencia · {int(art.CANTIDAD.sum()) if not art.empty else 0:,} incidencias dentro del contexto seleccionado.")
 
 with d:
+    ctx,_,_,_=global_context(s_view)
     st.subheader("📦 Pedidos")
-    st.caption("Consulta los pedidos con FNR o MC y filtra por persona desde aquí.")
-    with st.container(border=True):
-        dsp,dst,dssup,dsar=render_person_filters(s_view,"pedidos",include_picker=True,include_area=True)
+    st.caption("Esta página respeta el mismo turno, supervisor y área seleccionados en Bodega.")
+    selected=apply_context(s_view,ctx)
+    render_context_banner(ctx,selected,context_reference(s_view,ctx),"Contexto heredado")
     tipo=st.radio("Incidencia",["FNR","MC"],horizontal=True,key="pedidos_tipo")
     data=fnr if tipo=="FNR" else mc
-    selected=apply_person_filters(s_view,dsp,dst,dssup,dsar)
     data=data[data.PICKER.isin(selected.PICKER)]
-    st.dataframe(orders(data),use_container_width=True,hide_index=True)
+    pedidos_view=orders(data)
+    st.dataframe(pedidos_view,use_container_width=True,hide_index=True)
     st.caption("PICKERS indica cuántos pickers aparecen en el mismo pedido.")
 
 with e:
+    ctx,_,_,_=global_context(s_view)
     st.subheader("🌙 Turnos / Áreas")
-    st.caption("Selecciona un supervisor o área para concentrar el análisis operativo.")
-    with st.container(border=True):
-        esp,est,essup,esar=render_person_filters(s_view,"turnos_areas",include_picker=False,include_area=True)
-    selected=apply_person_filters(s_view,esp,est,essup,esar)
+    st.caption("El contexto seleccionado se mantiene, pero el comparativo conserva todos los turnos para no perder proporciones.")
+    selected=apply_context(s_view,ctx)
+    reference=context_reference(s_view,ctx)
+    render_context_banner(ctx,selected,reference,"Contexto heredado")
     bsel=base[base.PICKER.isin(selected.PICKER)]
     fsel=fnr[fnr.PICKER.isin(selected.PICKER)]
     msel=mc[mc.PICKER.isin(selected.PICKER)]
-    st.subheader("FNR por turno"); st.dataframe(groups(fsel,bsel,"TURNO"),use_container_width=True,hide_index=True)
-    st.subheader("MC por turno"); st.dataframe(groups(msel,bsel,"TURNO"),use_container_width=True,hide_index=True)
-    st.subheader("FNR por área"); st.dataframe(groups(fsel,bsel,"AREA"),use_container_width=True,hide_index=True)
-    st.subheader("MC por área"); st.dataframe(groups(msel,bsel,"AREA"),use_container_width=True,hide_index=True)
+    bref=base[base.PICKER.isin(reference.PICKER)]
+    fref=fnr[fnr.PICKER.isin(reference.PICKER)]
+    mref=mc[mc.PICKER.isin(reference.PICKER)]
+    render_turn_comparison(bsel,bref,fsel,fref,msel,mref)
+    st.subheader("FNR por turno")
+    st.dataframe(groups(fsel,bsel,"TURNO"),use_container_width=True,hide_index=True)
+    st.subheader("MC por turno")
+    st.dataframe(groups(msel,bsel,"TURNO"),use_container_width=True,hide_index=True)
+    st.subheader("FNR por área")
+    st.dataframe(groups(fsel,bsel,"AREA"),use_container_width=True,hide_index=True)
+    st.subheader("MC por área")
+    st.dataframe(groups(msel,bsel,"AREA"),use_container_width=True,hide_index=True)
     st.warning("El % / líneas por área solo aparece si existe un denominador real de líneas por área.")
 
 with g:
+    ctx,_,_,_=global_context(s_view)
     st.subheader("👥 Supervisores")
-    st.caption("Vista operativa para revisar carga, calidad y seguimiento por supervisor.")
-    with st.container(border=True):
-        gsp,gst,gssup,gsarea=render_person_filters(s_view,"supervisores",include_picker=False,include_area=True)
-    sup_data=apply_person_filters(s_view,gsp,gst,gssup,gsarea)
+    st.caption("Vista operativa bajo el mismo contexto global. Las cantidades se mantienen y los KPIs conservan su porcentaje.")
+    sup_data=apply_context(s_view,ctx)
+    reference=context_reference(s_view,ctx)
+    render_context_banner(ctx,sup_data,reference,"Contexto heredado")
     if not sup_data.empty:
         sup_summary=(sup_data.groupby("SUPERVISOR",as_index=False)
             .agg(PICKERS=("PICKER","nunique"),LINEAS=("LINEAS","sum"),FNR=("FNR","sum"),MC=("MC","sum"))
@@ -913,54 +1041,7 @@ with g:
         if sup_focus!="Todos":
             st.dataframe(sup_data[sup_data["SUPERVISOR"]==sup_focus],use_container_width=True,hide_index=True)
     else:
-        st.info("No hay datos para los filtros actuales.")
-
-with h:
-    st.subheader("🛡️ Seguimiento de Pickers")
-    st.caption("La baja saca al picker del seguimiento activo, pero conserva todo su historial. Sus incidencias siguen contando en las estadísticas del periodo en que ocurrieron.")
-    # Lista de seguimiento se separa de las estadísticas: s sigue conteniendo todos los pickers del periodo.
-    all_names = sorted({str(x).strip() for x in base["PICKER"].tolist()} | {str(x).strip() for x in store.get("pickers",{}).keys() if str(x).strip()}, key=lambda z:z.upper())
-    vista = st.radio("Mostrar", ["Activos", "Dados de baja", "Todos"], horizontal=True)
-    rows=[]
-    for p in all_names:
-        rec=picker_record(store,p)
-        acciones=rec.get("acciones",[])
-        counts={a:sum(1 for x in acciones if x.get("accion")==a) for a in ["Advertencia verbal 1","Advertencia verbal 2","Acta 1","Acta 2","Acta 3","Cero tolerancia"]}
-        rows.append({"PICKER":p,"ESTADO":rec.get("estado","ACTIVO"),**counts,"ÚLTIMA ACCIÓN":acciones[-1].get("fecha","") if acciones else ""})
-    track=pd.DataFrame(rows)
-    if vista=="Activos": track=track[track.ESTADO=="ACTIVO"]
-    elif vista=="Dados de baja": track=track[track.ESTADO=="BAJA"]
-    st.dataframe(track,use_container_width=True,hide_index=True)
-    st.divider()
-    opciones = track["PICKER"].tolist() if not track.empty else all_names
-    if opciones:
-        picker_track=st.selectbox("Picker", opciones, key="picker_tracking")
-        rec=picker_record(store,picker_track)
-        c1,c2,c3=st.columns(3)
-        c1.metric("Estado",rec.get("estado","ACTIVO"))
-        c2.metric("Comentarios",len(rec.get("comentarios",[])))
-        c3.metric("Acciones",len(rec.get("acciones",[])))
-        st.subheader("Registrar acción")
-        accion=st.selectbox("Tipo de seguimiento",["Advertencia verbal 1","Advertencia verbal 2","Acta 1","Acta 2","Acta 3","Cero tolerancia"],key="accion_tipo")
-        sup_acc=st.text_input("Supervisor",key="accion_supervisor")
-        motivo=st.text_area("Motivo / detalle",key="accion_motivo")
-        if st.button("Guardar acción",key="guardar_accion"):
-            rec["acciones"].append({"fecha":datetime.now().strftime("%Y-%m-%d %H:%M"),"accion":accion,"supervisor":sup_acc.strip() or "No especificado","motivo":motivo.strip()})
-            save_store(store); st.success("Acción registrada."); st.rerun()
-        if rec.get("acciones"):
-            st.subheader("Historial de acciones")
-            st.dataframe(pd.DataFrame(rec["acciones"]),use_container_width=True,hide_index=True)
-        st.subheader("Estado del picker")
-        if rec.get("estado","ACTIVO")=="ACTIVO":
-            st.warning("Dar de baja NO borra al picker ni sus estadísticas históricas. Solo lo retira del seguimiento activo.")
-            if st.button("⛔ Dar de baja de la base de seguimiento",key="baja_picker"):
-                rec["estado"]="BAJA"; rec["baja_fecha"]=datetime.now().strftime("%Y-%m-%d %H:%M")
-                save_store(store); st.success("Picker dado de baja del seguimiento activo. Su histórico permanece."); st.rerun()
-        else:
-            if st.button("↩️ Reactivar en seguimiento",key="reactivar_picker"):
-                rec["estado"]="ACTIVO"; rec["reactivacion_fecha"]=datetime.now().strftime("%Y-%m-%d %H:%M")
-                save_store(store); st.success("Picker reactivado."); st.rerun()
-        st.info("Las estadísticas de FNR/MC de este periodo NO se filtran por estado. Un picker dado de baja sigue contando porque sus incidencias ocurrieron durante su periodo de operación.")
+        st.info("No hay datos para el contexto actual.")
 
 with f:
     st.download_button("📥 Descargar Excel completo",export(s,fnr,mc,None if sp=="Todos" else sp,roster),f"Analisis_FNR_MC_{periodo}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
