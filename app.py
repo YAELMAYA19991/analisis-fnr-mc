@@ -251,6 +251,12 @@ def email_name_tokens(value):
     s=re.sub(r"^(?:jt)?\d+[._-]*", "", s)
     return name_tokens(s.replace(".", "_"))
 
+def email_key(value):
+    """Llave de identidad principal: correo completo normalizado."""
+    s=str(value or "").strip().lower().replace(" ", "")
+    if s in {"nan","none","nat"}: return ""
+    return s
+
 def clean(df):
     x=df.copy(); x.columns=[norm(c) for c in x.columns]; return x
 
@@ -303,9 +309,10 @@ def parse_roster(df, turno_fijo=None):
     em=col(df,["codigo_correo","codigo + correo","correo","email","usuario"])
     sup=col(df,["supervisor","supervisor_nombre","jefe","responsable"])
     ar=col(df,["area_base","area","departamento","department"])
-    if not p: raise ValueError("La hoja de personal necesita la columna PICKER.")
+    if not p and not em: raise ValueError("La hoja de personal necesita PICKER o CORREO.")
+    picker_series=df[p].astype(str).str.strip() if p else df[em].astype(str).str.strip().map(email_name_tokens).map(lambda z:" ".join(sorted(z)))
     x=pd.DataFrame({
-        "PICKER":df[p].astype(str).str.strip(),
+        "PICKER":picker_series,
         "TURNO_MAESTRO":(df[sh].astype(str).str.strip() if sh and not turno_fijo else turno_fijo or ""),
         "CORREO":df[em].astype(str).str.strip() if em else "",
         "SUPERVISOR":df[sup].astype(str).str.strip() if sup else "No asignado",
@@ -317,7 +324,8 @@ def parse_roster(df, turno_fijo=None):
     x["_TOKEN_KEY"]=x["PICKER"].map(token_key)
     x["_CODE_KEY"]=x["CORREO"].map(extract_code)
     x["_EMAIL_TOKENS"]=x["CORREO"].map(email_name_tokens)
-    x=x.drop_duplicates("_KEY",keep="last")
+    x["_EMAIL_KEY"]=x["CORREO"].map(email_key)
+    x=x.drop_duplicates("_EMAIL_KEY",keep="last") if x["_EMAIL_KEY"].astype(str).str.strip().ne("").any() else x.drop_duplicates("_KEY",keep="last")
     return x
 
 def _match_master_row(value, roster, code_value=""):
@@ -403,9 +411,18 @@ def apply_roster(base, roster):
     if roster is None or roster.empty: return base
     x=base.copy()
     x["_SOURCE_PICKER"]=x["PICKER"].astype(str).str.strip()
+    # CORREO es la llave principal. Solo si falta correo se usa la identidad por nombre.
+    roster_email={}
+    if "_EMAIL_KEY" in roster.columns:
+        for _,rr in roster.iterrows():
+            ek=email_key(rr.get("CORREO",""))
+            if ek: roster_email[ek]=rr
     matches=[]
     for _,row in x.iterrows():
-        rr=_match_master_row(row.get("PICKER",""),roster,row.get("CORREO",""))
+        ek=email_key(row.get("CORREO",""))
+        rr=roster_email.get(ek) if ek else None
+        if rr is None:
+            rr=_match_master_row(row.get("PICKER",""),roster,row.get("CORREO",""))
         matches.append(rr)
 
     out=[]
@@ -503,6 +520,7 @@ def canonicalize_incidents(inc, base):
     out=inc.copy()
     records=base.to_dict("records")
     # Índices directos
+    by_email={email_key(r.get("CORREO","")):r for r in records if email_key(r.get("CORREO",""))}
     by_key={person_key(r.get("PICKER","")):r for r in records if person_key(r.get("PICKER",""))}
     by_token={token_key(r.get("PICKER","")):r for r in records if token_key(r.get("PICKER",""))}
     by_code={extract_code(r.get("CORREO","")):r for r in records if extract_code(r.get("CORREO",""))}
@@ -510,9 +528,10 @@ def canonicalize_incidents(inc, base):
     result=[]
     for _,row in out.iterrows():
         value=str(row.get("PICKER","")).strip()
+        raw_email=email_key(row.get("CORREO",""))
         code=extract_code(row.get("CORREO","") or value)
         key=person_key(value); tk=token_key(value)
-        rr=by_key.get(key) or by_token.get(tk) or (by_code.get(code) if code else None)
+        rr=by_email.get(raw_email) or by_key.get(key) or by_token.get(tk) or (by_code.get(code) if code else None)
         if rr is not None:
             result.append(str(rr.get("PICKER",value)).strip())
             continue
@@ -571,11 +590,14 @@ def attach(inc,base):
     y["_KEY"]=y["PICKER"].map(person_key)
     y["_TOKEN_KEY"]=y["PICKER"].map(token_key)
     y["_CODE_KEY"]=y.get("CORREO",pd.Series([""]*len(y),index=y.index)).map(extract_code)
+    ref["_EMAIL_KEY"]=ref.get("CORREO",pd.Series([""]*len(ref),index=ref.index)).map(email_key)
+    y["_EMAIL_KEY"]=y.get("CORREO",pd.Series([""]*len(y),index=y.index)).map(email_key)
+    ref_email=ref[ref["_EMAIL_KEY"].astype(str).str.strip().ne("")].drop_duplicates("_EMAIL_KEY").set_index("_EMAIL_KEY")
     ref_exact=ref.drop_duplicates("_KEY").set_index("_KEY")
     ref_token=ref.drop_duplicates("_TOKEN_KEY").set_index("_TOKEN_KEY")
     ref_code=ref[ref["_CODE_KEY"].astype(str).str.strip().ne("")].drop_duplicates("_CODE_KEY").set_index("_CODE_KEY")
     def get_ref(row):
-        for key,mp in [(row["_KEY"],ref_exact),(row["_TOKEN_KEY"],ref_token),(row["_CODE_KEY"],ref_code)]:
+        for key,mp in [(row["_EMAIL_KEY"],ref_email),(row["_KEY"],ref_exact),(row["_TOKEN_KEY"],ref_token),(row["_CODE_KEY"],ref_code)]:
             if key and key in mp.index:
                 rr=mp.loc[key]
                 if isinstance(rr,pd.DataFrame): rr=rr.iloc[0]
@@ -585,7 +607,7 @@ def attach(inc,base):
     vals.columns=["PICKER_REF","LINEAS","PEDIDOS","TURNO_REF","_EXCLUDED_PERSONNEL"]
     y=pd.concat([y.reset_index(drop=True),vals.reset_index(drop=True)],axis=1)
     y.loc[y["PICKER_REF"].astype(str).str.strip().ne(""),"PICKER"]=y.loc[y["PICKER_REF"].astype(str).str.strip().ne(""),"PICKER_REF"]
-    return y.drop(columns=["_KEY","_TOKEN_KEY","_CODE_KEY"],errors="ignore")
+    return y.drop(columns=["_KEY","_TOKEN_KEY","_CODE_KEY","_EMAIL_KEY"],errors="ignore")
 
 def summary(base,fnr,mc):
     s=base.copy()
@@ -797,10 +819,13 @@ try:
     # La plantilla maestra actual tiene una sola hoja: Base_Pickers.
     # Columnas: PICKER, TURNO, CODIGO + CORREO, SUPERVISOR, AREA_BASE.
     master_sheets=sheets_from_bytes(up.getvalue())
-    if "Base_Pickers" in master_sheets:
+    # Si existe Maestro_Personal, es la fuente principal porque contiene el universo de correos.
+    if "Maestro_Personal" in master_sheets:
+        master_df=master_sheets["Maestro_Personal"]
+    elif "Base_Pickers" in master_sheets:
         master_df=master_sheets["Base_Pickers"]
     else:
-        master_df=choose(master_sheets,["base_pickers","maestro_personal","personal","maestro","turno"])
+        master_df=choose(master_sheets,["maestro_personal","base_pickers","personal","maestro","turno"])
     roster=parse_roster(master_df)
     if roster.empty:
         raise ValueError("El Excel maestro no contiene pickers válidos.")
@@ -842,6 +867,8 @@ if roster is not None:
         st.caption(f"Turnos asignados: {matched_turn}/{total} · Excluidos: {int(excluded_series.sum())}")
         if unmatched:
             st.caption(f"{unmatched} picker(s) sin coincidencia en el maestro.")
+        email_match=int(base.get("_MASTER_MATCH",pd.Series(False,index=base.index)).fillna(False).astype(bool).sum())
+        st.caption(f"🔑 Cruce de identidad: CORREO primero · {email_match} registros identificados")
 
 # Retira columnas técnicas antes de mostrar/exportar.
 base=base.drop(columns=["_MASTER_MATCH"],errors="ignore")
