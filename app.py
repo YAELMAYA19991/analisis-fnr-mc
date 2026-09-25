@@ -5,9 +5,10 @@
 # ================================================================
 
 
-import io, re, json, os
+import io, re, json, os, smtplib
 from difflib import SequenceMatcher
 from datetime import datetime
+from email.message import EmailMessage
 import pandas as pd
 import streamlit as st
 
@@ -161,6 +162,8 @@ def load_store():
                 data.setdefault("master_overrides", {})
                 data.setdefault("master_excluded", [])
                 data.setdefault("seguimientos_documentos", [])
+                data.setdefault("supervisores", [])
+                data.setdefault("upload_meta", {})
                 if path != STORE_FILE:
                     try:
                         save_store(data)
@@ -169,7 +172,7 @@ def load_store():
                 return data
             except Exception:
                 continue
-    return {"pickers": {}, "feedback_rows": [], "recursos_formatos": [], "procesos": [], "excluded_orders": [], "master_overrides": {}, "master_excluded": [], "seguimientos_documentos": []}
+    return {"pickers": {}, "feedback_rows": [], "recursos_formatos": [], "procesos": [], "excluded_orders": [], "master_overrides": {}, "master_excluded": [], "seguimientos_documentos": [], "supervisores": [], "upload_meta": {}}
 
 def save_store(store):
     tmp = STORE_FILE + ".tmp"
@@ -251,9 +254,22 @@ def email_name_tokens(value):
     s=re.sub(r"^(?:jt)?\d+[._-]*", "", s)
     return name_tokens(s.replace(".", "_"))
 
+def extract_email_address(value):
+    """Extrae y normaliza el correo real aunque Excel traiga CODIGO + CORREO."""
+    s=str(value or "").strip().lower()
+    if s in {"", "nan", "none", "nat"}: return ""
+    m=re.search(r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}", s, flags=re.I)
+    if not m: return ""
+    email=m.group(0).strip().lower()
+    local,domain=email.split("@",1)
+    local=re.sub(r"^(?:jt)?\d+[._-]+", "", local)
+    return f"{local}@{domain}"
+
 def email_key(value):
-    """Llave de identidad principal: correo completo normalizado."""
-    s=str(value or "").strip().lower().replace(" ", "")
+    """Llave principal de identidad: el correo real normalizado."""
+    email=extract_email_address(value)
+    if email: return email
+    s=str(value or "").strip().lower().replace(" ","")
     if s in {"nan","none","nat"}: return ""
     return s
 
@@ -287,9 +303,10 @@ def parse_base(df):
     ped=col(df,["total_pedidos","pedidos_totales","pedidos"])
     sh=col(df,["turno","shift"]); ar=col(df,["area","departamento","department"])
     em=col(df,["codigo_correo","codigo + correo","correo","email","usuario"])
-    if not p or not l: raise ValueError("La base necesita PICKER y Total lineas.")
+    if not l or not em: raise ValueError("La base necesita Total lineas y una columna de CORREO / CODIGO + CORREO.")
+    picker_values=df[p].astype(str).str.strip() if p else df[em].astype(str).str.strip().map(email_name_tokens).map(lambda z:" ".join(sorted(z)))
     x=pd.DataFrame({
-        "PICKER":df[p].astype(str).str.strip(),
+        "PICKER":picker_values,
         "LINEAS":pd.to_numeric(df[l],errors="coerce").fillna(0),
         "PEDIDOS":pd.to_numeric(df[ped],errors="coerce").fillna(0) if ped else 0,
         "TURNO":df[sh].astype(str).str.strip() if sh else "No especificado",
@@ -300,7 +317,9 @@ def parse_base(df):
     x["_TOKEN_KEY"]=x["PICKER"].map(token_key)
     x["_CODE_KEY"]=x["CORREO"].map(extract_code)
     x["_EMAIL_TOKENS"]=x["CORREO"].map(email_name_tokens)
-    return x.sort_values("LINEAS").drop_duplicates("PICKER",keep="last")
+    x["_EMAIL_KEY"]=x["CORREO"].map(email_key)
+    has_email=x["_EMAIL_KEY"].astype(str).str.strip().ne("")
+    return pd.concat([x[has_email].sort_values("LINEAS").drop_duplicates("_EMAIL_KEY",keep="last"), x[~has_email].sort_values("LINEAS").drop_duplicates("PICKER",keep="last")],ignore_index=True)
 
 def parse_roster(df, turno_fijo=None):
     """Maestro consolidado: PICKER, TURNO, CODIGO + CORREO, SUPERVISOR y AREA_BASE."""
@@ -325,7 +344,8 @@ def parse_roster(df, turno_fijo=None):
     x["_CODE_KEY"]=x["CORREO"].map(extract_code)
     x["_EMAIL_TOKENS"]=x["CORREO"].map(email_name_tokens)
     x["_EMAIL_KEY"]=x["CORREO"].map(email_key)
-    x=x.drop_duplicates("_EMAIL_KEY",keep="last") if x["_EMAIL_KEY"].astype(str).str.strip().ne("").any() else x.drop_duplicates("_KEY",keep="last")
+    has_email=x["_EMAIL_KEY"].astype(str).str.strip().ne("")
+    x=pd.concat([x[has_email].drop_duplicates("_EMAIL_KEY",keep="last"), x[~has_email].drop_duplicates("_KEY",keep="last")],ignore_index=True)
     return x
 
 def _match_master_row(value, roster, code_value=""):
@@ -420,9 +440,11 @@ def apply_roster(base, roster):
     matches=[]
     for _,row in x.iterrows():
         ek=email_key(row.get("CORREO",""))
-        rr=roster_email.get(ek) if ek else None
-        if rr is None:
-            rr=_match_master_row(row.get("PICKER",""),roster,row.get("CORREO",""))
+        if ek:
+            # Si hay correo, el correo manda. El nombre NO sustituye un correo no encontrado.
+            rr=roster_email.get(ek)
+        else:
+            rr=_match_master_row(row.get("PICKER",""),roster,"")
         matches.append(rr)
 
     out=[]
@@ -467,15 +489,17 @@ def apply_manual_personnel(base, store):
     if "_EXCLUDED_PERSONNEL" not in x.columns: x["_EXCLUDED_PERSONNEL"]=False
     for i,row in x.iterrows():
         key=person_key(row.get("PICKER",""))
-        if not key: continue
-        if key in excluded:
+        ek=email_key(row.get("CORREO",""))
+        override_key=ek or key
+        if not override_key: continue
+        if key in excluded or ek in excluded:
             x.at[i,"_EXCLUDED_PERSONNEL"]=True
             x.at[i,"_MASTER_MATCH"]=True
             x.at[i,"TURNO"]="__EXCLUIDO__"
             x.at[i,"SUPERVISOR"]="Excluido"
             x.at[i,"AREA_BASE"]="Excluido"
             continue
-        ov=overrides.get(key)
+        ov=overrides.get(override_key) or overrides.get(key)
         if not ov: continue
         x.at[i,"_MANUAL_MATCH"]=True
         x.at[i,"_MASTER_MATCH"]=True
@@ -507,11 +531,14 @@ def effective_roster(roster, store):
             manual["_TOKEN_KEY"]=manual["PICKER"].map(token_key)
             manual["_CODE_KEY"]=manual["CORREO"].map(extract_code)
             manual["_EMAIL_TOKENS"]=manual["CORREO"].map(email_name_tokens)
+            manual["_EMAIL_KEY"]=manual["CORREO"].map(email_key)
             r=pd.concat([r,manual],ignore_index=True)
     if not r.empty:
         r["_KEY"]=r["PICKER"].map(person_key)
-        r=r[~r["_KEY"].isin(excluded)].copy()
-        r=r.drop_duplicates("_KEY",keep="last")
+        r["_EMAIL_KEY"]=r["CORREO"].map(email_key)
+        r=r[~r["_KEY"].isin(excluded) & ~r["_EMAIL_KEY"].isin(excluded)].copy()
+        has_email=r["_EMAIL_KEY"].astype(str).str.strip().ne("")
+        r=pd.concat([r[has_email].drop_duplicates("_EMAIL_KEY",keep="last"), r[~has_email].drop_duplicates("_KEY",keep="last")],ignore_index=True)
     return r
 
 def canonicalize_incidents(inc, base):
@@ -531,7 +558,7 @@ def canonicalize_incidents(inc, base):
         raw_email=email_key(row.get("CORREO",""))
         code=extract_code(row.get("CORREO","") or value)
         key=person_key(value); tk=token_key(value)
-        rr=by_email.get(raw_email) or by_key.get(key) or by_token.get(tk) or (by_code.get(code) if code else None)
+        rr=by_email.get(raw_email) if raw_email else (by_key.get(key) or by_token.get(tk) or (by_code.get(code) if code else None))
         if rr is not None:
             result.append(str(rr.get("PICKER",value)).strip())
             continue
@@ -567,10 +594,12 @@ def parse_inc(df,tipo):
     ar=col(df,["department","departamento","area","depto"])
     sh=col(df,["turno","shift"]); fe=col(df,["date","fecha","created_at"])
     qty=col(df,["cantidad","qty","quantity"])
-    if not p: raise ValueError(f"El detalle {tipo} necesita PICKER.")
+    em=col(df,["codigo_correo","codigo + correo","correo","email","usuario"])
+    if not em: raise ValueError(f"El detalle {tipo} necesita una columna de CORREO / CODIGO + CORREO.")
+    picker_values=df[p].astype(str).str.strip() if p else df[em].astype(str).str.strip().map(email_name_tokens).map(lambda z:" ".join(sorted(z)))
     x=pd.DataFrame({
-        "PICKER":df[p].astype(str).str.strip(),
-        "CORREO":df[col(df,["codigo_correo","codigo + correo","correo","email","usuario"])].astype(str).str.strip() if col(df,["codigo_correo","codigo + correo","correo","email","usuario"]) else "",
+        "PICKER":picker_values,
+        "CORREO":df[em].astype(str).str.strip(),
         "PRODUCTO":df[prod].astype(str).str.strip() if prod else "Sin producto",
         "ORDER_NUMBER":df[order].astype(str).str.strip() if order else "",
         "AREA":df[ar].astype(str).str.strip() if ar else "No especificada",
@@ -597,12 +626,13 @@ def attach(inc,base):
     ref_token=ref.drop_duplicates("_TOKEN_KEY").set_index("_TOKEN_KEY")
     ref_code=ref[ref["_CODE_KEY"].astype(str).str.strip().ne("")].drop_duplicates("_CODE_KEY").set_index("_CODE_KEY")
     def get_ref(row):
-        for key,mp in [(row["_EMAIL_KEY"],ref_email),(row["_KEY"],ref_exact),(row["_TOKEN_KEY"],ref_token),(row["_CODE_KEY"],ref_code)]:
+        lookup=[(row["_EMAIL_KEY"],ref_email)] if row["_EMAIL_KEY"] else [(row["_KEY"],ref_exact),(row["_TOKEN_KEY"],ref_token),(row["_CODE_KEY"],ref_code)]
+        for key,mp in lookup:
             if key and key in mp.index:
                 rr=mp.loc[key]
                 if isinstance(rr,pd.DataFrame): rr=rr.iloc[0]
                 return pd.Series([rr["PICKER"],rr["LINEAS"],rr["PEDIDOS"],rr["TURNO"],bool(rr.get("_EXCLUDED_PERSONNEL",False))])
-        return pd.Series([row["PICKER"],0,0,"No especificado"])
+        return pd.Series([row["PICKER"],0,0,"No especificado",False])
     vals=y.apply(get_ref,axis=1)
     vals.columns=["PICKER_REF","LINEAS","PEDIDOS","TURNO_REF","_EXCLUDED_PERSONNEL"]
     y=pd.concat([y.reset_index(drop=True),vals.reset_index(drop=True)],axis=1)
@@ -679,6 +709,13 @@ def _excluded_mask(df, column="_EXCLUDED_PERSONNEL"):
         return raw.any(axis=1)
     return raw.fillna(False).astype(bool)
 
+def safe_pct(num, den, decimals=2):
+    """Porcentaje robusto para pandas/Streamlit Cloud."""
+    n=pd.to_numeric(num,errors="coerce")
+    d=pd.to_numeric(den,errors="coerce")
+    out=n.div(d.where(d.ne(0),float("nan"))).mul(100)
+    return out.astype("float64").round(decimals)
+
 def groups(inc,base,key):
     """Agrupa FNR/MC por turno o área usando acceso por nombre de columna.
     Evita el acceso por atributo de pandas (p.ej. .LINEAS), que puede fallar
@@ -740,6 +777,46 @@ def _write_sheet(writer, df, sheet_name):
     name=re.sub(r"[\\/*?:\[\]]", "_", str(sheet_name))[:31] or "Hoja"
     x.to_excel(writer, sheet_name=name, index=False)
 
+def supervisor_email_keys(store):
+    keys=set(); names=set()
+    for item in store.get("supervisores",[]) or []:
+        if not isinstance(item,dict) or not item.get("activo",True): continue
+        ek=email_key(item.get("correo","")); nk=person_key(item.get("nombre",""))
+        if ek: keys.add(ek)
+        if nk: names.add(nk)
+    return keys,names
+
+def exclude_registered_supervisors(base, fnr, mc, store):
+    email_keys,name_keys=supervisor_email_keys(store)
+    if not email_keys and not name_keys: return base,fnr,mc
+    def mask(df):
+        if df is None or df.empty: return pd.Series(False,index=getattr(df,"index",[]))
+        emails=df.get("CORREO",pd.Series("",index=df.index)).map(email_key)
+        names=df.get("PICKER",pd.Series("",index=df.index)).map(person_key)
+        return emails.isin(email_keys) | (emails.eq("") & names.isin(name_keys))
+    return base.loc[~mask(base)].copy(), fnr.loc[~mask(fnr)].copy(), mc.loc[~mask(mc)].copy()
+
+def _secret(name, default=""):
+    try:
+        return str(st.secrets.get(name, default) or default)
+    except Exception:
+        return str(os.getenv(name, default) or default)
+
+def send_followup_email(subject, body, recipients, attachment_bytes=None, attachment_name="seguimiento.pdf"):
+    recipients=[x.strip() for x in str(recipients or "").split(",") if x.strip()]
+    host=_secret("SMTP_HOST"); user=_secret("SMTP_USER"); password=_secret("SMTP_PASSWORD")
+    port=int(_secret("SMTP_PORT","587") or 587); sender=_secret("SMTP_FROM",user)
+    if not recipients: return False,"No se capturaron destinatarios."
+    if not host or not user or not password: return False,"Correo no enviado: faltan SMTP_HOST, SMTP_USER o SMTP_PASSWORD en Secrets."
+    try:
+        msg=EmailMessage(); msg["Subject"]=subject; msg["From"]=sender; msg["To"]=", ".join(recipients); msg.set_content(body)
+        if attachment_bytes: msg.add_attachment(attachment_bytes,maintype="application",subtype="pdf",filename=attachment_name)
+        with smtplib.SMTP(host,port,timeout=20) as smtp:
+            smtp.starttls(); smtp.login(user,password); smtp.send_message(msg)
+        return True,"Copia enviada correctamente."
+    except Exception as exc:
+        return False,f"No fue posible enviar la copia: {exc}"
+
 def export(summary,fnr,mc,picker,roster=None):
     """Genera el Excel de salida sin romper el dashboard si algún dato viene irregular."""
     b=io.BytesIO()
@@ -776,6 +853,8 @@ store.setdefault("master_excluded", [])
 store.setdefault("procesos", [])
 store.setdefault("recursos_formatos", [])
 store.setdefault("seguimientos_documentos", [])
+store.setdefault("supervisores", [])
+store.setdefault("upload_meta", {})
 
 with st.sidebar:
     st.header("Control operativo")
@@ -790,6 +869,10 @@ with st.sidebar:
     uf=persist_upload(uf_upload,"detalle_fnr") if uf_upload else load_persisted_upload("detalle_fnr")
     um=persist_upload(um_upload,"detalle_mc") if um_upload else load_persisted_upload("detalle_mc")
     up=persist_upload(up_upload,"plantilla_personal") if up_upload else load_persisted_upload("plantilla_personal")
+    for _key,_upload,_label in [("base_picker",ub_upload,"Pickers/Líneas"),("detalle_fnr",uf_upload,"FNR"),("detalle_mc",um_upload,"Mala Calidad"),("plantilla_personal",up_upload,"Master Pickers")]:
+        if _upload is not None:
+            store.setdefault("upload_meta",{})[_key]={"fecha":datetime.now().strftime("%Y-%m-%d %H:%M:%S"),"archivo":str(getattr(_upload,"name",_label))}
+    save_store(store)
 
     status=persisted_status()
     labels={"base_picker":"Pickers/Líneas","detalle_fnr":"FNR","detalle_mc":"Mala Calidad","plantilla_personal":"Master Pickers"}
@@ -844,8 +927,9 @@ if excluded:
     mc=mc[~mc.ORDER_NUMBER.isin(excluded)].copy()
 fnr=attach(fnr,base); mc=attach(mc,base)
 fnr=_dedupe_columns(fnr); mc=_dedupe_columns(mc); base=_dedupe_columns(base)
+base,fnr,mc=exclude_registered_supervisors(base,fnr,mc,store)
 s=summary(base,fnr,mc)
-# Columna técnica de cruce: se usa para diagnóstico, no para mostrarla en el dashboard.
+cross_status=base.copy()
 master_match=base.get("_MASTER_MATCH",pd.Series(False,index=base.index)).copy()
 base_display=base.drop(columns=["_MASTER_MATCH"],errors="ignore")
 s=s.drop(columns=["_MASTER_MATCH"],errors="ignore")
@@ -1003,11 +1087,18 @@ base_view=base[base.PICKER.isin(s_view.PICKER)]
 fnr_view=fnr[fnr.PICKER.isin(s_view.PICKER)]
 mc_view=mc[mc.PICKER.isin(s_view.PICKER)]
 
-a,b,c,d,e,g,h,f,j=st.tabs(["🏠 Bodega","👤 Picker","🏷️ Artículos","📦 Pedidos","🌙 Turnos / Áreas","👥 Supervisores","🛡️ Seguimiento","📥 Exportar","📌 Pendientes & Procesos"])
+a,b,c,d,e,x,g,h,f,j=st.tabs(["🏠 Bodega","👤 Picker","🏷️ Artículos","📦 Pedidos","🌙 Turnos / Áreas","🧩 Correos / Cruce","👥 Supervisores","🛡️ Seguimiento","📥 Exportar","📌 Pendientes & Procesos"])
 
 with a:
     st.subheader(f"Resumen de bodega — {periodo}")
     st.caption("El contexto elegido aquí se comparte automáticamente con todas las pestañas.")
+    _meta=store.get("upload_meta",{}) or {}
+    _upload_rows=[]
+    for _k,_label in [("base_picker","Pickers / Líneas"),("detalle_fnr","FNR"),("detalle_mc","Mala Calidad"),("plantilla_personal","Master Pickers")]:
+        _m=_meta.get(_k,{}) or {}
+        _upload_rows.append({"Archivo":_label,"Última carga":_m.get("fecha","Sin registro"),"Nombre":_m.get("archivo","")})
+    with st.expander("🕒 Última carga de Excel",expanded=True):
+        st.dataframe(pd.DataFrame(_upload_rows),use_container_width=True,hide_index=True)
     ctx,turns,sups,areas=global_context(s_view)
     with st.container(border=True):
         st.markdown("**🎯 Contexto global de análisis**")
@@ -1137,56 +1228,37 @@ with b:
             _src_alias=[]
         rec=picker_record(store,sp,aliases=_src_alias)
         st.subheader("📝 Retroalimentación y seguimiento")
-        st.caption("Todo lo que registres aquí queda guardado en el historial del picker.")
-        fb_col, act_col=st.columns(2)
-        with fb_col:
-            with st.form(f"feedback_picker_form_{sp}", clear_on_submit=True):
-                fb_sup=st.text_input("Supervisor que registra",value=str(r.get("SUPERVISOR","")))
-                fortalezas=st.text_area("Fortalezas observadas")
-                mejora=st.text_area("Punto de mejora")
-                acuerdo=st.text_area("Acuerdo / acción de mejora")
-                if st.form_submit_button("Guardar retroalimentación", type="primary"):
-                    store.setdefault("feedback_rows",[]).append({
-                        "FECHA":datetime.now().strftime("%Y-%m-%d %H:%M"),"SUPERVISOR":fb_sup.strip() or "No especificado",
-                        "TURNO":str(r.get("TURNO","")),"PICKER":sp,"FNR_LINEAS_%":float(r["FNR_%"]),
-                        "MC_LINEAS_%":float(r["MC_%"]),"ESTADO":str(r["ESTADO"]),"FORTALEZAS":fortalezas,
-                        "PUNTO_MEJORA":mejora,"ACUERDO":acuerdo})
-                    save_store(store); st.success("Retroalimentación guardada."); st.rerun()
-        with act_col:
-            with st.form(f"accion_picker_form_{sp}", clear_on_submit=True):
-                act_type=st.selectbox("Tipo de seguimiento",["Llamada de atención","Advertencia verbal 1","Advertencia verbal 2","Acta 1","Acta 2","Acta 3","Cero tolerancia"])
-                act_sup=st.text_input("Supervisor",value=str(r.get("SUPERVISOR","")))
-                act_motivo=st.text_area("Motivo / detalle")
-                if st.form_submit_button("Guardar llamada / acta", type="primary"):
-                    rec.setdefault("acciones",[])
-                    rec["acciones"].append({"id":datetime.now().strftime("%Y%m%d%H%M%S%f"),"fecha":datetime.now().strftime("%Y-%m-%d %H:%M"),"accion":act_type,"supervisor":act_sup.strip() or "No especificado","motivo":act_motivo.strip()})
-                    save_store(store); st.success("Seguimiento guardado."); st.rerun()
+        st.caption("Solo se solicita el tipo de seguimiento. La retroalimentación opcional queda dentro del mismo registro.")
+        with st.form(f"accion_picker_form_{sp}", clear_on_submit=True):
+            act_type=st.selectbox("Tipo de seguimiento",["Llamada de atención","Advertencia verbal 1","Advertencia verbal 2","Acta 1","Acta 2","Acta 3","Cero tolerancia"])
+            act_sup=st.text_input("Supervisor",value=str(r.get("SUPERVISOR","")))
+            act_motivo=st.text_area("Motivo / detalle")
+            act_retro=st.text_area("Retroalimentación (opcional)",placeholder="Observación de retroalimentación, si aplica…")
+            if st.form_submit_button("Guardar seguimiento", type="primary"):
+                rec.setdefault("acciones",[])
+                rec["acciones"].append({"id":datetime.now().strftime("%Y%m%d%H%M%S%f"),"fecha":datetime.now().strftime("%Y-%m-%d %H:%M"),"accion":act_type,"supervisor":act_sup.strip() or "No especificado","motivo":act_motivo.strip(),"retroalimentacion":act_retro.strip()})
+                save_store(store); st.success("Seguimiento guardado."); st.rerun()
 
-        st.markdown("### 🔗 Formatos y recursos rápidos")
-        st.caption("Accede desde aquí a tus formatos de retroalimentación, llamadas de atención, actas y seguimiento.")
+        st.markdown("### 🔗 Formatos y recursos")
         recursos=store.get("recursos_formatos",[])
-        if recursos:
-            cols=st.columns(min(3,max(1,len(recursos))))
-            for idx,recurso in enumerate(recursos):
-                with cols[idx % len(cols)]:
-                    titulo=str(recurso.get("titulo","Formato")); tipo=str(recurso.get("tipo","Recurso")); url=str(recurso.get("url",""))
-                    st.markdown(f"<div class='justo-card'><div class='justo-kicker'>{tipo}</div><div class='justo-title' style='font-size:1rem'>{titulo}</div></div>",unsafe_allow_html=True)
-                    if url: st.link_button("🔗 Abrir formato",url,use_container_width=True)
-                    if st.button("🗑️ Quitar",key=f"delete_recurso_{idx}",use_container_width=True):
-                        store["recursos_formatos"].pop(idx); save_store(store); st.rerun()
-        else:
-            st.info("Todavía no hay formatos configurados. Puedes agregar aquí enlaces de Google Forms, Drive, Excel, Word u otra plataforma.")
-
-        with st.expander("⚙️ Administrar formatos / enlaces", expanded=False):
+        with st.expander(f"Ver formatos y enlaces ({len(recursos)})",expanded=False):
+            if recursos:
+                for idx,recurso in enumerate(recursos):
+                    tipo=str(recurso.get("tipo","Recurso")); titulo=str(recurso.get("titulo","Formato")); url=str(recurso.get("url",""))
+                    rr1,rr2,rr3=st.columns([1,4,1])
+                    rr1.caption(tipo); rr2.markdown(f"**{titulo}**")
+                    with rr3:
+                        if url: st.link_button("Abrir",url,use_container_width=True)
+                    if st.button("Quitar",key=f"delete_recurso_{sp}_{idx}"): store["recursos_formatos"].pop(idx); save_store(store); st.rerun()
+            else: st.info("No hay formatos configurados.")
             with st.form(f"recurso_form_{sp}", clear_on_submit=True):
                 rr1,rr2=st.columns([1,2])
                 with rr1: recurso_tipo=st.selectbox("Tipo",["Retroalimentación","Seguimiento","Llamada de atención","Acta","Otro"])
-                with rr2: recurso_titulo=st.text_input("Nombre del formato",placeholder="Ej. Formato de retroalimentación semanal")
+                with rr2: recurso_titulo=st.text_input("Nombre del formato",placeholder="Ej. Formato de seguimiento")
                 recurso_url=st.text_input("Enlace",placeholder="https://...")
                 if st.form_submit_button("➕ Guardar enlace",type="primary"):
                     url=recurso_url.strip()
-                    if not recurso_titulo.strip() or not url.startswith(("http://","https://")):
-                        st.error("Captura un nombre y un enlace válido que comience con http:// o https://.")
+                    if not recurso_titulo.strip() or not url.startswith(("http://","https://")): st.error("Captura un nombre y un enlace válido.")
                     else:
                         store.setdefault("recursos_formatos",[]).append({"tipo":recurso_tipo,"titulo":recurso_titulo.strip(),"url":url,"fecha":datetime.now().strftime("%Y-%m-%d %H:%M")}); save_store(store); st.success("Enlace guardado."); st.rerun()
 
@@ -1198,8 +1270,10 @@ with b:
             st.markdown("**Comentarios**")
             st.dataframe(pd.DataFrame(rec["comentarios"]).sort_values("fecha",ascending=False),use_container_width=True,hide_index=True)
         if rec.get("acciones"):
-            st.markdown("**Llamadas de atención / actas**")
-            st.dataframe(pd.DataFrame(rec["acciones"]).sort_values("fecha",ascending=False),use_container_width=True,hide_index=True)
+            st.markdown("**Seguimientos / actas**")
+            _ah=pd.DataFrame(rec["acciones"]).sort_values("fecha",ascending=False).rename(columns={"fecha":"Fecha","accion":"Tipo","supervisor":"Supervisor","motivo":"Motivo","retroalimentacion":"Retroalimentación"})
+            _cols=[c for c in ["Fecha","Tipo","Supervisor","Motivo","Retroalimentación"] if c in _ah.columns]
+            st.dataframe(_ah[_cols],use_container_width=True,hide_index=True)
 
         # El expediente documental es el mismo que usa la pestaña Seguimiento.
         # Así, los PDFs/enlaces cargados en Seguimiento también quedan visibles en Picker.
@@ -1280,10 +1354,70 @@ with e:
     st.dataframe(groups(msel,bsel,"AREA"),use_container_width=True,hide_index=True)
     st.warning("El % / líneas por área solo aparece si existe un denominador real de líneas por área.")
 
+with x:
+    st.subheader("🧩 Cruce por correo y personal no asignado")
+    st.caption("El CORREO es la llave principal. El nombre solo se usa como asociación cuando el Excel no trae correo.")
+    cross=cross_status.copy()
+    if not cross.empty:
+        cross["CORREO_KEY"]=cross.get("CORREO",pd.Series("",index=cross.index)).map(email_key)
+        cross["IDENTIFICADO"]=cross.get("_MASTER_MATCH",False).fillna(False).astype(bool) if "_MASTER_MATCH" in cross.columns else False
+        cross["MANUAL"]=cross.get("_MANUAL_MATCH",False).fillna(False).astype(bool) if "_MANUAL_MATCH" in cross.columns else False
+    unmatched_cross=cross[(~cross["IDENTIFICADO"]) & (~cross["CORREO_KEY"].eq(""))].copy() if not cross.empty else pd.DataFrame()
+    k1,k2,k3=st.columns(3)
+    k1.metric("Correos en base",f"{cross['CORREO_KEY'].nunique():,}" if not cross.empty else "0")
+    k2.metric("Correos sin asignar",f"{unmatched_cross['CORREO_KEY'].nunique():,}" if not unmatched_cross.empty else "0")
+    k3.metric("Asignaciones manuales",f"{len(store.get('master_overrides',{})):,}")
+    if unmatched_cross.empty:
+        st.success("No hay correos sin asignación en la base de Pickers.")
+    else:
+        view_cols=[c for c in ["PICKER","CORREO","LINEAS","PEDIDOS","TURNO","AREA_BASE"] if c in unmatched_cross.columns]
+        st.dataframe(unmatched_cross[view_cols].drop_duplicates("CORREO"),use_container_width=True,hide_index=True)
+        emails=sorted([str(v) for v in unmatched_cross["CORREO_KEY"].dropna().unique() if str(v).strip()])
+        with st.expander("➕ Asignar correo manualmente",expanded=True):
+            with st.form("manual_email_assignment_form",clear_on_submit=True):
+                correo_sel=st.selectbox("Correo sin asignar",emails)
+                row_opts=unmatched_cross[unmatched_cross["CORREO_KEY"]==correo_sel]
+                suggested_name=str(row_opts.iloc[0].get("PICKER","")) if not row_opts.empty else ""
+                picker_manual=st.text_input("Nombre canónico del picker",value=suggested_name)
+                mc1,mc2,mc3=st.columns(3)
+                with mc1: turno_manual=st.selectbox("Turno",["Matutino","Intermedio","Tarde","Nocturno","Turno de avance","Otro"])
+                with mc2:
+                    sup_options=[str(v) for v in sorted(s_view["SUPERVISOR"].dropna().unique()) if str(v).strip() and str(v)!="No asignado"]
+                    sup_manual=st.selectbox("Supervisor",["No asignado"]+sup_options)
+                with mc3:
+                    area_options=[str(v) for v in sorted(s_view["AREA_BASE"].dropna().unique()) if str(v).strip() and str(v)!="No especificada"]
+                    area_manual=st.selectbox("Área",["No especificada"]+area_options)
+                if st.form_submit_button("💾 Guardar asignación",type="primary"):
+                    if not correo_sel or not picker_manual.strip(): st.error("Correo y nombre son obligatorios.")
+                    else:
+                        store.setdefault("master_overrides",{})[correo_sel]={"PICKER":picker_manual.strip(),"CORREO":correo_sel,"TURNO":turno_manual,"SUPERVISOR":sup_manual,"AREA_BASE":area_manual,"FECHA":datetime.now().strftime("%Y-%m-%d %H:%M"),"ORIGEN":"Manual por correo"}
+                        save_store(store); st.success("Asignación guardada por correo. El cruce la utilizará en la siguiente carga."); st.rerun()
+    with st.expander("📋 Asignaciones manuales guardadas",expanded=False):
+        manual_rows=[]
+        for ek,ov in store.get("master_overrides",{}).items(): manual_rows.append({"CORREO":ov.get("CORREO",ek),"PICKER":ov.get("PICKER",""),"TURNO":ov.get("TURNO",""),"SUPERVISOR":ov.get("SUPERVISOR",""),"AREA":ov.get("AREA_BASE",""),"FECHA":ov.get("FECHA","")})
+        if manual_rows: st.dataframe(pd.DataFrame(manual_rows),use_container_width=True,hide_index=True)
+        else: st.info("Todavía no hay asignaciones manuales.")
+
 with g:
     ctx,_,_,_=global_context(s_view)
     st.subheader("👥 Supervisores")
-    st.caption("Vista operativa bajo el mismo contexto global. Las cantidades se mantienen y los KPIs conservan su porcentaje.")
+    st.caption("Vista operativa bajo el mismo contexto global. Los supervisores registrados por correo se excluyen automáticamente de incidencias y filtros de pickers.")
+    with st.expander("➕ Dar de alta supervisor",expanded=False):
+        with st.form("alta_supervisor_form",clear_on_submit=True):
+            sc1,sc2=st.columns(2)
+            with sc1: sup_nombre_nuevo=st.text_input("Nombre del supervisor")
+            with sc2: sup_correo_nuevo=st.text_input("Correo del supervisor")
+            sup_activo=st.checkbox("Excluirlo de incidencias y filtros",value=True)
+            if st.form_submit_button("💾 Guardar supervisor",type="primary"):
+                ek=email_key(sup_correo_nuevo)
+                if not sup_nombre_nuevo.strip() or not ek: st.error("Captura nombre y un correo válido.")
+                else:
+                    current=[z for z in store.get("supervisores",[]) if email_key(z.get("correo",""))!=ek]
+                    current.append({"nombre":sup_nombre_nuevo.strip(),"correo":ek,"activo":sup_activo,"fecha":datetime.now().strftime("%Y-%m-%d %H:%M")})
+                    store["supervisores"]=current; save_store(store); st.success("Supervisor guardado."); st.rerun()
+    _supreg=store.get("supervisores",[]) or []
+    if _supreg:
+        st.dataframe(pd.DataFrame([{"Supervisor":z.get("nombre",""),"Correo":z.get("correo",""),"Excluido":"Sí" if z.get("activo",True) else "No","Alta":z.get("fecha","")} for z in _supreg]),use_container_width=True,hide_index=True)
     sup_data=apply_context(s_view,ctx)
     reference=context_reference(s_view,ctx)
     render_context_banner(ctx,sup_data,reference,"Contexto heredado")
@@ -1291,8 +1425,8 @@ with g:
         sup_summary=(sup_data.groupby("SUPERVISOR",as_index=False)
             .agg(PICKERS=("PICKER","nunique"),LINEAS=("LINEAS","sum"),FNR=("FNR","sum"),MC=("MC","sum"))
             .sort_values("FNR",ascending=False))
-        sup_summary["FNR %"]=(sup_summary["FNR"]/sup_summary["LINEAS"].replace(0,pd.NA)*100).round(2)
-        sup_summary["MC %"]=(sup_summary["MC"]/sup_summary["LINEAS"].replace(0,pd.NA)*100).round(2)
+        sup_summary["FNR %"]=safe_pct(sup_summary["FNR"],sup_summary["LINEAS"])
+        sup_summary["MC %"]=safe_pct(sup_summary["MC"],sup_summary["LINEAS"])
         st.dataframe(sup_summary,use_container_width=True,hide_index=True)
         sup_focus=st.selectbox("Supervisor",["Todos"]+sorted([str(x) for x in sup_summary["SUPERVISOR"] if str(x).strip()]))
         if sup_focus!="Todos":
@@ -1302,132 +1436,124 @@ with g:
 
 with h:
     st.subheader("🛡️ Seguimiento")
-    st.caption("Consulta el historial por picker, revisa llamadas, advertencias y actas, y adjunta los PDFs para conservar evidencia.")
-
+    st.caption("Vista consolidada de todos los pickers: retroalimentaciones, seguimientos, actas y tolerancias. Filtra y ordena para ver rápidamente dónde hay más seguimiento.")
     ctx,_,_,_=global_context(s_view)
     selected_context=apply_context(s_view,ctx)
     render_context_banner(ctx,selected_context,context_reference(s_view,ctx),"Contexto heredado")
 
+    all_rows=[]
+    for _,rr in selected_context.iterrows():
+        picker=str(rr.get("PICKER","")); rec0=picker_record(store,picker,aliases=[str(rr.get("_SOURCE_PICKER",""))])
+        acciones=rec0.get("acciones",[]) or []
+        retro_legacy=[z for z in store.get("feedback_rows",[]) if str(z.get("PICKER",""))==picker]
+        retro_new=[z for z in acciones if str(z.get("retroalimentacion","")).strip()]
+        tipos=[str(z.get("accion","")) for z in acciones]
+        actas=sum(1 for t in tipos if "Acta" in t); llamadas=sum(1 for t in tipos if "Llamada" in t or "Advertencia" in t); cero=sum(1 for t in tipos if "Cero tolerancia" in t)
+        all_rows.append({"PICKER":picker,"TURNO":rr.get("TURNO",""),"SUPERVISOR":rr.get("SUPERVISOR",""),"AREA":rr.get("AREA_BASE",""),"RETROALIMENTACIONES":len(retro_legacy)+len(retro_new),"SEGUIMIENTOS":len(acciones),"ACTAS":actas,"LLAMADAS / ADVERTENCIAS":llamadas,"CERO TOLERANCIA":cero,"TOTAL":len(acciones)+len(retro_legacy),"ÚLTIMO SEGUIMIENTO":max([str(z.get("fecha","")) for z in acciones],default="")})
+    seguimiento_df=pd.DataFrame(all_rows)
+    if seguimiento_df.empty: st.info("No hay pickers disponibles para seguimiento.")
+    else:
+        fc1,fc2,fc3,fc4=st.columns(4)
+        search_seg=fc1.text_input("Buscar picker",placeholder="Nombre…",key="seguimiento_global_search")
+        seg_filter=fc2.selectbox("Estado",["Todos","Con actas","Sin actas","Con cero tolerancia","Sin seguimiento"],key="seguimiento_global_estado")
+        seg_sort=fc3.selectbox("Ordenar por",["ACTAS","SEGUIMIENTOS","CERO TOLERANCIA","RETROALIMENTACIONES","TOTAL"],key="seguimiento_global_sort")
+        seg_dir=fc4.selectbox("Orden",["Mayor a menor","Menor a mayor"],key="seguimiento_global_dir")
+        view=seguimiento_df.copy()
+        if search_seg.strip(): view=view[view["PICKER"].map(norm).str.contains(norm(search_seg),regex=False)]
+        if seg_filter=="Con actas": view=view[view["ACTAS"]>0]
+        elif seg_filter=="Sin actas": view=view[view["ACTAS"]==0]
+        elif seg_filter=="Con cero tolerancia": view=view[view["CERO TOLERANCIA"]>0]
+        elif seg_filter=="Sin seguimiento": view=view[view["SEGUIMIENTOS"]==0]
+        view=view.sort_values(seg_sort,ascending=(seg_dir=="Menor a mayor"))
+        st.dataframe(view,use_container_width=True,hide_index=True)
+        st.caption(f"{len(view):,} pickers visibles.")
+
+    st.divider()
     nombres=person_options(selected_context)
     with st.container(border=True):
-        st.markdown("**🔎 Buscar picker**")
+        st.markdown("**🔎 Abrir expediente individual**")
         buscar=st.text_input("Nombre del picker",placeholder="Escribe parte del nombre…",key="seguimiento_picker_search")
         opciones=nombres
         if buscar.strip():
-            term=norm(buscar)
-            opciones=[n for n in nombres if term in norm(n)]
-        seguimiento_picker=st.selectbox("Picker", ["Selecciona un picker"]+opciones, key="seguimiento_picker_select")
+            term=norm(buscar); opciones=[n for n in nombres if term in norm(n)]
+        seguimiento_picker=st.selectbox("Picker",["Selecciona un picker"]+opciones,key="seguimiento_picker_select")
 
     if seguimiento_picker == "Selecciona un picker":
-        st.info("Selecciona un picker para consultar su historial de seguimiento.")
+        st.info("Selecciona un picker para consultar y documentar su expediente.")
     else:
         r=s[s.PICKER==seguimiento_picker].iloc[0]
-        _src_alias=[]
-        try:
-            _src_alias=[str(selected_context[selected_context.PICKER==seguimiento_picker].iloc[0].get("_SOURCE_PICKER","")).strip()] if not selected_context[selected_context.PICKER==seguimiento_picker].empty else []
-        except Exception:
-            _src_alias=[]
-        rec=picker_record(store,seguimiento_picker,aliases=_src_alias)
-        acciones=rec.get("acciones",[]) or []
-        feedback=[x for x in store.get("feedback_rows",[]) if str(x.get("PICKER",""))==seguimiento_picker]
-        documentos=rec.get("documentos",[]) or []
-
-        st.markdown(
-            f"<div class='justo-card'><div class='justo-kicker'>Expediente de seguimiento</div>"
-            f"<div class='justo-title'>{seguimiento_picker}</div>"
-            f"<div class='justo-muted'>Turno: {r.TURNO} · Supervisor: {r.SUPERVISOR} · Área: {r.AREA_BASE}</div></div>",
-            unsafe_allow_html=True
-        )
-
+        rec=picker_record(store,seguimiento_picker,aliases=[str(r.get("_SOURCE_PICKER",""))])
+        acciones=rec.get("acciones",[]) or []; documentos=rec.get("documentos",[]) or []
+        st.markdown(f"<div class='justo-card'><div class='justo-kicker'>Expediente</div><div class='justo-title'>{seguimiento_picker}</div><div class='justo-muted'>Turno: {r.TURNO} · Supervisor: {r.SUPERVISOR} · Área: {r.AREA_BASE}</div></div>",unsafe_allow_html=True)
         k1,k2,k3,k4=st.columns(4)
-        k1.metric("Retroalimentaciones", f"{len(feedback):,}")
-        k2.metric("Seguimientos", f"{len(acciones):,}")
-        k3.metric("Actas / llamadas", f"{sum(1 for x in acciones if 'Acta' in str(x.get('accion','')) or 'Llamada' in str(x.get('accion',''))):,}")
-        k4.metric("PDF / documentos", f"{len(documentos):,}")
-
-        st.markdown("### 📋 Historial de acciones")
+        k1.metric("Retroalimentaciones",f"{sum(1 for z in acciones if str(z.get('retroalimentacion','')).strip()):,}")
+        k2.metric("Seguimientos",f"{len(acciones):,}")
+        k3.metric("Actas / tolerancias",f"{sum(1 for z in acciones if 'Acta' in str(z.get('accion','')) or 'Cero tolerancia' in str(z.get('accion',''))):,}")
+        k4.metric("Documentos",f"{len(documentos):,}")
+        st.markdown("### 📋 Historial de seguimiento")
         if acciones:
-            hist=pd.DataFrame(acciones).copy()
-            hist=hist.rename(columns={"fecha":"Fecha","accion":"Tipo","supervisor":"Supervisor","motivo":"Motivo"})
-            cols=[c for c in ["Fecha","Tipo","Supervisor","Motivo"] if c in hist.columns]
-            st.dataframe(hist[cols].sort_values("Fecha",ascending=False),use_container_width=True,hide_index=True)
-        else:
-            st.info("Este picker todavía no tiene llamadas, advertencias o actas registradas.")
-
-        st.markdown("### 📄 Actas y documentos de seguimiento")
-        st.caption("Arrastra un PDF aquí para asociarlo al picker. También puedes guardar un enlace si el documento está en Drive, SharePoint u otra plataforma.")
-        with st.form(f"seguimiento_documento_form_{seguimiento_picker}", clear_on_submit=True):
+            hist=pd.DataFrame(acciones).rename(columns={"fecha":"Fecha","accion":"Tipo","supervisor":"Supervisor","motivo":"Motivo","retroalimentacion":"Retroalimentación"})
+            cols=[c for c in ["Fecha","Tipo","Supervisor","Motivo","Retroalimentación"] if c in hist.columns]
+            st.dataframe(hist.sort_values("Fecha",ascending=False)[cols],use_container_width=True,hide_index=True)
+        else: st.info("Este picker todavía no tiene seguimientos registrados.")
+        st.markdown("### 📄 Subir seguimiento / acta")
+        st.caption("El PDF queda asociado al expediente. Si configuras SMTP en Secrets, puedes enviar automáticamente una copia a varias personas.")
+        with st.form(f"seguimiento_documento_form_{seguimiento_picker}",clear_on_submit=True):
             dc1,dc2=st.columns([1,2])
-            with dc1:
-                doc_tipo=st.selectbox("Tipo de documento", ["Acta 1","Acta 2","Acta 3","Llamada de atención","Advertencia verbal 1","Advertencia verbal 2","Otro"])
-            with dc2:
-                doc_titulo=st.text_input("Nombre / referencia", placeholder="Ej. Acta por FNR — septiembre 2026")
-            doc_detalle=st.text_area("Detalle / motivo", placeholder="Qué originó el seguimiento y cualquier dato importante…")
-            doc_pdf=st.file_uploader("📎 Adjuntar PDF", type=["pdf"], accept_multiple_files=False, key=f"seguimiento_pdf_{seguimiento_picker}")
-            doc_url=st.text_input("🔗 O vincular documento externo", placeholder="https://...")
-            if st.form_submit_button("💾 Guardar documento", type="primary"):
-                titulo=doc_titulo.strip() or (doc_pdf.name if doc_pdf is not None else doc_tipo)
-                url=doc_url.strip()
-                if doc_pdf is None and not url:
-                    st.error("Adjunta un PDF o captura un enlace externo.")
-                elif url and not url.startswith(("http://","https://")):
-                    st.error("El enlace debe comenzar con http:// o https://")
+            with dc1: doc_tipo=st.selectbox("Tipo de documento",["Acta 1","Acta 2","Acta 3","Llamada de atención","Advertencia verbal 1","Advertencia verbal 2","Cero tolerancia","Otro"])
+            with dc2: doc_titulo=st.text_input("Nombre / referencia",placeholder="Ej. Acta por FNR — septiembre 2026")
+            doc_detalle=st.text_area("Detalle / motivo",placeholder="Qué originó el seguimiento y cualquier dato importante…")
+            doc_pdf=st.file_uploader("📎 Adjuntar PDF",type=["pdf"],accept_multiple_files=False,key=f"seguimiento_pdf_{seguimiento_picker}")
+            doc_url=st.text_input("🔗 O vincular documento externo",placeholder="https://...")
+            enviar_copia=st.checkbox("Enviar copia por correo al guardar",value=False)
+            destinatarios=st.text_input("Destinatarios",placeholder="persona1@correo.com, persona2@correo.com") if enviar_copia else ""
+            if st.form_submit_button("💾 Guardar seguimiento / documento",type="primary"):
+                titulo=doc_titulo.strip() or (doc_pdf.name if doc_pdf is not None else doc_tipo); url=doc_url.strip()
+                if doc_pdf is None and not url: st.error("Adjunta un PDF o captura un enlace externo.")
+                elif url and not url.startswith(("http://","https://")): st.error("El enlace debe comenzar con http:// o https://")
                 else:
-                    registro={
-                        "id": datetime.now().strftime("%Y%m%d%H%M%S%f"),
-                        "fecha": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                        "tipo": doc_tipo,
-                        "titulo": titulo,
-                        "detalle": doc_detalle.strip(),
-                        "supervisor": str(r.get("SUPERVISOR","")),
-                        "url": url,
-                        "path":"",
-                        "archivo":""
-                    }
+                    registro={"id":datetime.now().strftime("%Y%m%d%H%M%S%f"),"fecha":datetime.now().strftime("%Y-%m-%d %H:%M"),"tipo":doc_tipo,"titulo":titulo,"detalle":doc_detalle.strip(),"supervisor":str(r.get("SUPERVISOR","")),"url":url,"path":"","archivo":"","destinatarios":destinatarios}
+                    pdf_bytes=None
                     if doc_pdf is not None:
-                        path,doc_id=save_followup_pdf(doc_pdf.getvalue(),seguimiento_picker,doc_pdf.name)
-                        registro["path"]=path
-                        registro["archivo"]=_safe_filename(doc_pdf.name)
-                    rec.setdefault("documentos",[]).append(registro)
-                    save_store(store)
-                    st.success("Documento de seguimiento guardado y asociado al picker.")
+                        path,_=save_followup_pdf(doc_pdf.getvalue(),seguimiento_picker,doc_pdf.name); registro["path"]=path; registro["archivo"]=_safe_filename(doc_pdf.name); pdf_bytes=doc_pdf.getvalue()
+                    rec.setdefault("documentos",[]).append(registro); save_store(store)
+                    if enviar_copia:
+                        ok,msg=send_followup_email(f"Seguimiento {doc_tipo} · {seguimiento_picker}",f"Se registró un {doc_tipo} para {seguimiento_picker}.\n\nDetalle: {doc_detalle.strip() or 'Sin detalle.'}",destinatarios,pdf_bytes,registro.get("archivo","seguimiento.pdf"))
+                        if ok: st.success(msg)
+                        else: st.warning(msg)
+                    else: st.success("Seguimiento / documento guardado.")
                     st.rerun()
-
-        documentos=sorted(rec.get("documentos",[]) or [], key=lambda x:str(x.get("fecha","")), reverse=True)
+        st.markdown("### 🔗 Enlaces consolidados")
+        recursos=store.get("recursos_formatos",[]) or []
+        with st.expander(f"Administrar formatos y enlaces ({len(recursos)})",expanded=False):
+            for idx,recurso in enumerate(recursos):
+                rr1,rr2,rr3=st.columns([1,5,1])
+                rr1.caption(str(recurso.get("tipo","Recurso"))); rr2.markdown(f"**{recurso.get('titulo','Formato')}**")
+                with rr3:
+                    if recurso.get("url"): st.link_button("Abrir",str(recurso.get("url")),use_container_width=True)
+                if st.button("Quitar",key=f"seg_recurso_del_{idx}"): store["recursos_formatos"].pop(idx); save_store(store); st.rerun()
+            with st.form("seg_recurso_form",clear_on_submit=True):
+                q1,q2=st.columns([1,2])
+                with q1: rt=st.selectbox("Tipo",["Retroalimentación","Seguimiento","Llamada de atención","Acta","Otro"])
+                with q2: rn=st.text_input("Nombre")
+                ru=st.text_input("Enlace",placeholder="https://...")
+                if st.form_submit_button("Agregar enlace"):
+                    if rn.strip() and ru.startswith(("http://","https://")):
+                        store.setdefault("recursos_formatos",[]).append({"tipo":rt,"titulo":rn.strip(),"url":ru.strip(),"fecha":datetime.now().strftime("%Y-%m-%d %H:%M")}); save_store(store); st.rerun()
+                    else: st.error("Nombre y enlace válido son obligatorios.")
+        documentos=sorted(rec.get("documentos",[]) or [],key=lambda z:str(z.get("fecha","")),reverse=True)
+        st.markdown("### 📎 Documentos del expediente")
         if documentos:
             for i,doc in enumerate(documentos):
-                tipo=str(doc.get("tipo","Documento"))
-                titulo=str(doc.get("titulo",doc.get("archivo",tipo)))
-                fecha=str(doc.get("fecha",""))
-                supervisor=str(doc.get("supervisor",r.get("SUPERVISOR","")))
                 archivo=load_followup_pdf(doc)
-                with st.container(border=True):
-                    a1,a2,a3=st.columns([1.2,2.8,1.2])
-                    with a1:
-                        st.markdown(f"**{tipo}**")
-                        st.caption(fecha)
-                    with a2:
-                        st.markdown(f"**{titulo}**")
-                        if doc.get("detalle"): st.caption(doc.get("detalle"))
-                        st.caption(f"Registró: {supervisor}")
-                    with a3:
-                        if archivo is not None:
-                            st.download_button("📥 Ver / descargar PDF", archivo, file_name=str(doc.get("archivo") or f"{tipo}.pdf"), mime="application/pdf", key=f"download_doc_{seguimiento_picker}_{doc.get('id',i)}", use_container_width=True)
-                        if doc.get("url"):
-                            st.link_button("🔗 Abrir enlace", str(doc.get("url")), use_container_width=True)
-                        if st.button("🗑️ Eliminar", key=f"delete_doc_{seguimiento_picker}_{doc.get('id',i)}", use_container_width=True):
-                            rec["documentos"]=[x for x in rec.get("documentos",[]) if x.get("id")!=doc.get("id")]
-                            save_store(store); st.rerun()
-        else:
-            st.info("No hay PDFs o documentos vinculados para este picker.")
-
-        st.markdown("### 📝 Retroalimentación registrada")
-        if feedback:
-            fbd=pd.DataFrame(feedback).copy()
-            columnas=[c for c in ["FECHA","SUPERVISOR","FORTALEZAS","PUNTO_MEJORA","ACUERDO"] if c in fbd.columns]
-            st.dataframe(fbd.sort_values("FECHA",ascending=False)[columnas],use_container_width=True,hide_index=True)
-        else:
-            st.info("No hay retroalimentaciones registradas para este picker.")
+                rr1,rr2,rr3=st.columns([1.2,5,1.4])
+                rr1.markdown(f"**{doc.get('tipo','Documento')}**"); rr1.caption(str(doc.get('fecha','')))
+                rr2.markdown(f"**{doc.get('titulo',doc.get('archivo','Documento'))}**")
+                if doc.get("detalle"): rr2.caption(str(doc.get("detalle")))
+                with rr3:
+                    if archivo is not None: st.download_button("Ver PDF",archivo,file_name=str(doc.get("archivo") or "seguimiento.pdf"),mime="application/pdf",key=f"seg_download_{seguimiento_picker}_{doc.get('id',i)}",use_container_width=True)
+                    if doc.get("url"): st.link_button("Abrir enlace",str(doc.get("url")),use_container_width=True)
+        else: st.info("No hay documentos vinculados a este expediente.")
 
 with f:
     st.download_button("📥 Descargar Excel completo",export(s,fnr,mc,None if sp=="Todos" else sp,roster),f"Analisis_FNR_MC_{periodo}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
