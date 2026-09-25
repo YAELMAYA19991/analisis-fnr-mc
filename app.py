@@ -1,3 +1,9 @@
+# ================================================================
+# PROPIEDAD / FIRMA DEL DESARROLLO
+# Desarrollado por: Yael Maya Ruíz
+# Control FNR & Mala Calidad · Operación Coyoacán
+# ================================================================
+
 
 import io, re, json, os
 from difflib import SequenceMatcher
@@ -51,8 +57,9 @@ def sheets_from_bytes(data):
         if not df.empty: out[sh]=clean(df)
     return out
 FNR_OBJ, MC_OBJ = 1.50, 1.00
-STORE_FILE = "picker_seguimiento.json"
 PERSIST_DIR = "app_data"
+STORE_FILE = os.path.join(PERSIST_DIR, "picker_seguimiento.json")
+LEGACY_STORE_FILE = "picker_seguimiento.json"
 PERSIST_FILES = {
     "base_picker": os.path.join(PERSIST_DIR, "base_picker.xlsx"),
     "detalle_fnr": os.path.join(PERSIST_DIR, "detalle_fnr.xlsx"),
@@ -136,20 +143,80 @@ def load_followup_pdf(doc):
         return None
 
 def load_store():
-    if os.path.exists(STORE_FILE):
-        try:
-            with open(STORE_FILE, "r", encoding="utf-8") as f: return json.load(f)
-        except Exception: pass
-    return {"pickers": {}}
+    """Carga el expediente persistente y migra el JSON antiguo si existe."""
+    ensure_persist_dir()
+    candidates=[STORE_FILE, LEGACY_STORE_FILE]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data=json.load(f)
+                if not isinstance(data, dict):
+                    continue
+                data.setdefault("pickers", {})
+                data.setdefault("feedback_rows", [])
+                data.setdefault("recursos_formatos", [])
+                data.setdefault("procesos", [])
+                data.setdefault("excluded_orders", [])
+                data.setdefault("master_overrides", {})
+                data.setdefault("master_excluded", [])
+                data.setdefault("seguimientos_documentos", [])
+                if path != STORE_FILE:
+                    try:
+                        save_store(data)
+                    except Exception:
+                        pass
+                return data
+            except Exception:
+                continue
+    return {"pickers": {}, "feedback_rows": [], "recursos_formatos": [], "procesos": [], "excluded_orders": [], "master_overrides": {}, "master_excluded": [], "seguimientos_documentos": []}
 
 def save_store(store):
     tmp = STORE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f: json.dump(store, f, ensure_ascii=False, indent=2)
     os.replace(tmp, STORE_FILE)
 
-def picker_record(store, picker):
-    rec = store.setdefault("pickers", {}).setdefault(picker, {"estado":"ACTIVO", "comentarios":[], "acciones":[], "documentos":[]})
-    rec.setdefault("estado", "ACTIVO"); rec.setdefault("comentarios", []); rec.setdefault("acciones", []); rec.setdefault("documentos", [])
+def picker_record(store, picker, aliases=None):
+    """Devuelve un único expediente por persona, aunque cambie el orden/formato del nombre.
+
+    También migra automáticamente expedientes antiguos guardados con el nombre
+    del Excel operativo hacia el nombre canónico del Maestro.
+    """
+    store.setdefault("pickers", {})
+    target=str(picker or "").strip()
+    aliases=[str(a).strip() for a in (aliases or []) if str(a).strip()]
+    candidates=[]
+    for name in [target]+aliases:
+        if name and name not in candidates: candidates.append(name)
+    found_key=None
+    # 1) coincidencia exacta / normalizada / por tokens
+    target_key=person_key(target); target_tokens=token_key(target)
+    for existing in list(store["pickers"].keys()):
+        if existing in candidates or (target_key and person_key(existing)==target_key) or (target_tokens and token_key(existing)==target_tokens):
+            found_key=existing; break
+    # 2) aliases
+    if found_key is None:
+        for alias in aliases:
+            ak=person_key(alias); at=token_key(alias)
+            for existing in list(store["pickers"].keys()):
+                if (ak and person_key(existing)==ak) or (at and token_key(existing)==at):
+                    found_key=existing; break
+            if found_key is not None: break
+    if found_key is None:
+        rec={"estado":"ACTIVO","comentarios":[],"acciones":[],"documentos":[]}
+        store["pickers"][target]=rec
+        return rec
+    rec=store["pickers"].pop(found_key)
+    rec.setdefault("estado","ACTIVO"); rec.setdefault("comentarios",[]); rec.setdefault("acciones",[]); rec.setdefault("documentos",[])
+    # Si ya existía un registro con el nombre canónico, fusionar sin perder historial.
+    if target in store["pickers"] and target != found_key:
+        current=store["pickers"][target]
+        current.setdefault("comentarios",[]); current.setdefault("acciones",[]); current.setdefault("documentos",[])
+        current["comentarios"]=current["comentarios"]+rec.get("comentarios",[])
+        current["acciones"]=current["acciones"]+rec.get("acciones",[])
+        current["documentos"]=current["documentos"]+rec.get("documentos",[])
+        return current
+    store["pickers"][target]=rec
     return rec
 
 def active_picker_names(store):
@@ -323,11 +390,19 @@ def _match_master_row(value, roster, code_value=""):
         if score>=0.58 and (score-second>=0.04 or score>=0.82): return rr
     # Coincidencia muy cercana para errores de escritura.
     if score>=0.90 and (score-second>=0.04 or score>=0.96): return rr
+    # Fallback controlado para nombres con segundo apellido, iniciales o pequeñas
+    # diferencias: exige al menos 2 tokens distintivos y que no haya empate cercano.
+    distinctive={t for t in toks if len(t)>=4}
+    best_dist={t for t in name_tokens(rr.get("PICKER","")) if len(t)>=4}
+    dist_overlap=len(distinctive & best_dist)
+    if len(distinctive)>=2 and dist_overlap>=2 and cov_in>=0.80 and (score-second>=0.08 or score>=0.76):
+        return rr
     return None
 
 def apply_roster(base, roster):
     if roster is None or roster.empty: return base
     x=base.copy()
+    x["_SOURCE_PICKER"]=x["PICKER"].astype(str).str.strip()
     matches=[]
     for _,row in x.iterrows():
         rr=_match_master_row(row.get("PICKER",""),roster,row.get("CORREO",""))
@@ -721,7 +796,10 @@ master_match=base.get("_MASTER_MATCH",pd.Series(False,index=base.index)).copy()
 base_display=base.drop(columns=["_MASTER_MATCH"],errors="ignore")
 s=s.drop(columns=["_MASTER_MATCH"],errors="ignore")
 # Registrar automáticamente pickers vistos en la operación, sin alterar su estado histórico.
-for _p in base["PICKER"].astype(str).str.strip().unique(): picker_record(store, _p)
+for _idx,_row in base.iterrows():
+    _p=str(_row.get("PICKER","")).strip()
+    _src=str(_row.get("_SOURCE_PICKER","")).strip()
+    if _p: picker_record(store, _p, aliases=[_src] if _src else [])
 save_store(store)
 
 if roster is not None:
@@ -995,7 +1073,12 @@ with b:
         )
         st.dataframe(orders(fnr,sp).head(25),use_container_width=True,hide_index=True)
 
-        rec=picker_record(store,sp)
+        _src_alias=[]
+        try:
+            _src_alias=[str(s[s.PICKER==sp].iloc[0].get("_SOURCE_PICKER","")).strip()] if not s[s.PICKER==sp].empty else []
+        except Exception:
+            _src_alias=[]
+        rec=picker_record(store,sp,aliases=_src_alias)
         st.subheader("📝 Retroalimentación y seguimiento")
         st.caption("Todo lo que registres aquí queda guardado en el historial del picker.")
         fb_col, act_col=st.columns(2)
@@ -1018,7 +1101,8 @@ with b:
                 act_sup=st.text_input("Supervisor",value=str(r.get("SUPERVISOR","")))
                 act_motivo=st.text_area("Motivo / detalle")
                 if st.form_submit_button("Guardar llamada / acta", type="primary"):
-                    rec["acciones"].append({"fecha":datetime.now().strftime("%Y-%m-%d %H:%M"),"accion":act_type,"supervisor":act_sup.strip() or "No especificado","motivo":act_motivo.strip()})
+                    rec.setdefault("acciones",[])
+                    rec["acciones"].append({"id":datetime.now().strftime("%Y%m%d%H%M%S%f"),"fecha":datetime.now().strftime("%Y-%m-%d %H:%M"),"accion":act_type,"supervisor":act_sup.strip() or "No especificado","motivo":act_motivo.strip()})
                     save_store(store); st.success("Seguimiento guardado."); st.rerun()
 
         st.markdown("### 🔗 Formatos y recursos rápidos")
@@ -1181,7 +1265,12 @@ with h:
         st.info("Selecciona un picker para consultar su historial de seguimiento.")
     else:
         r=s[s.PICKER==seguimiento_picker].iloc[0]
-        rec=picker_record(store,seguimiento_picker)
+        _src_alias=[]
+        try:
+            _src_alias=[str(selected_context[selected_context.PICKER==seguimiento_picker].iloc[0].get("_SOURCE_PICKER","")).strip()] if not selected_context[selected_context.PICKER==seguimiento_picker].empty else []
+        except Exception:
+            _src_alias=[]
+        rec=picker_record(store,seguimiento_picker,aliases=_src_alias)
         acciones=rec.get("acciones",[]) or []
         feedback=[x for x in store.get("feedback_rows",[]) if str(x.get("PICKER",""))==seguimiento_picker]
         documentos=rec.get("documentos",[]) or []
