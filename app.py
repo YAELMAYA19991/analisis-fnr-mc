@@ -497,6 +497,11 @@ def apply_roster(base, roster):
     x.loc[ok,"CORREO"]=x.loc[ok,"_MASTER_CORREO"]
     x.loc[ok,"SUPERVISOR"]=x.loc[ok,"_MASTER_SUPERVISOR"]
     x.loc[ok,"AREA_BASE"]=x.loc[ok,"_MASTER_AREA"]
+    # Contextos explícitos para FNR/MC y segmentaciones posteriores.
+    x["TURNO"]=x["TURNO"].fillna("").astype(str).str.strip()
+    x["AREA_BASE"]=x["AREA_BASE"].fillna("").astype(str).str.strip()
+    x.loc[x["TURNO"].eq(""),"TURNO"]="No especificado"
+    x.loc[x["AREA_BASE"].eq(""),"AREA_BASE"]="No especificada"
     return x.drop(columns=["_KEY","_TOKEN_KEY","_CODE_KEY","_EMAIL_TOKENS","_MASTER_PICKER","_MASTER_TURNO","_MASTER_CORREO","_MASTER_SUPERVISOR","_MASTER_AREA"],errors="ignore")
 
 def apply_manual_personnel(base, store):
@@ -600,41 +605,77 @@ def canonicalize_incidents(inc, base):
     return out
 
 def template_roster_from_upload(data):
-    """Construye la identidad exclusivamente desde la plantilla consolidada.
+    """Construye la identidad desde la PLANTILLA CONSOLIDADA.
 
-    No usa un Excel maestro externo. Puede leer Maestro_Personal y/o
-    Base_Pickers dentro del MISMO archivo de plantilla. La llave final es
-    CORREO_KEY; PICKER es el nombre asociado a ese correo.
+    CORREO_KEY es la llave única. La plantilla puede tener información
+    repartida entre Maestro_Personal y Base_Pickers (por ejemplo, un sheet
+    tiene correo/nombre y otro tiene turno/supervisor/área). Por eso NO se
+    elige una sola fila por correo: se consolidan los campos no vacíos de
+    todas las hojas de la plantilla para que el turno nunca se pierda.
     """
     ss=sheets_from_bytes(data) if isinstance(data,(bytes,bytearray)) else sheets(data)
     frames=[]
     for name,df in ss.items():
         n=norm(name)
-        if not any(k in n for k in ["maestro_personal","base_pickers","personal","plantilla"]):
+        if n in {"instrucciones","diagnostico_cruce","diagnostico"}:
             continue
-        em=col(df,["codigo_correo","codigo + correo","correo","email","usuario"])
-        p=col(df,["picker","picker_nombre","email_picker","nombre","persona"])
-        sh=col(df,["turno","shift"]); sup=col(df,["supervisor","supervisor_nombre","jefe","responsable"])
-        ar=col(df,["area_base","area","departamento","department"]); estado=col(df,["estado","estatus","status"])
+        em=col(df,["codigo_correo","codigo + correo","codigo correo","correo","email","usuario"])
         if not em:
             continue
+        p=col(df,["picker","picker_nombre","email_picker","nombre","persona"])
+        sh=col(df,["turno","shift"])
+        sup=col(df,["supervisor","supervisor_nombre","jefe","responsable"])
+        ar=col(df,["area_base","area","departamento","department"])
+        estado=col(df,["estado","estatus","status","estatus_cruce"])
         tmp=pd.DataFrame({
             "PICKER":df[p].fillna("").astype(str).str.strip() if p else "",
             "TURNO_MAESTRO":df[sh].fillna("").astype(str).str.strip() if sh else "",
             "CORREO":df[em].fillna("").astype(str).str.strip(),
-            "SUPERVISOR":df[sup].fillna("No asignado").astype(str).str.strip() if sup else "No asignado",
+            "SUPERVISOR":df[sup].fillna("").astype(str).str.strip() if sup else "",
             "AREA_MAESTRO":df[ar].fillna("").astype(str).str.strip() if ar else "",
-            "ESTADO_PLANTILLA":df[estado].fillna("ACTIVO").astype(str).str.strip() if estado else "ACTIVO"
+            "ESTADO_PLANTILLA":df[estado].fillna("").astype(str).str.strip() if estado else "",
         })
         tmp["_EMAIL_KEY"]=tmp["CORREO"].map(email_key)
         tmp=tmp[tmp["_EMAIL_KEY"].ne("")].copy()
-        frames.append(tmp)
+        if not tmp.empty:
+            tmp["_FUENTE_HOJA"]=str(name)
+            frames.append(tmp)
+
     if not frames:
-        raise ValueError("La plantilla consolidada necesita una columna CORREO / CODIGO + CORREO en Maestro_Personal o Base_Pickers.")
-    r=pd.concat(frames,ignore_index=True)
-    # Preferir filas con nombre, turno, supervisor y área completos.
-    r["_COMPLETITUD"]=r[["PICKER","TURNO_MAESTRO","SUPERVISOR","AREA_MAESTRO"]].astype(str).apply(lambda z: sum(v.strip() not in {"","nan","None","No asignado","No especificada"} for v in z),axis=1)
-    r=r.sort_values(["_EMAIL_KEY","_COMPLETITUD"]).drop_duplicates("_EMAIL_KEY",keep="last").drop(columns=["_COMPLETITUD"],errors="ignore")
+        raise ValueError("La plantilla consolidada necesita una columna CORREO / CODIGO + CORREO.")
+
+    raw=pd.concat(frames,ignore_index=True)
+
+    def useful(v):
+        z=str(v or "").strip()
+        return z not in {"", "nan", "None", "NaT", "No asignado", "No especificada", "__EXCLUIDO__"}
+
+    # Consolidar campo por campo por correo. Esto permite que una hoja aporte
+    # el turno y otra aporte supervisor/área sin perder ninguno.
+    rows=[]
+    for ek,g in raw.groupby("_EMAIL_KEY",sort=False):
+        row={"_EMAIL_KEY":ek}
+        for field in ["PICKER","TURNO_MAESTRO","CORREO","SUPERVISOR","AREA_MAESTRO","ESTADO_PLANTILLA"]:
+            vals=[v for v in g[field].tolist() if useful(v)]
+            row[field]=str(vals[0]).strip() if vals else ""
+        # Preferir el valor que aparezca más veces cuando existan varias fuentes.
+        for field in ["PICKER","TURNO_MAESTRO","SUPERVISOR","AREA_MAESTRO","ESTADO_PLANTILLA"]:
+            vals=[str(v).strip() for v in g[field].tolist() if useful(v)]
+            if vals:
+                counts=pd.Series(vals).value_counts()
+                row[field]=str(counts.index[0]).strip()
+        # El correo canónico siempre sale del valor con @.
+        emails=[str(v).strip() for v in g["CORREO"].tolist() if extract_email_address(v)]
+        row["CORREO"]=emails[0] if emails else str(g["CORREO"].iloc[0]).strip()
+        rows.append(row)
+
+    r=pd.DataFrame(rows)
+    # Si la plantilla tiene nombre vacío, usar el nombre del correo solo como
+    # descriptor; no se usa para cruzar identidad.
+    empty_name=r["PICKER"].astype(str).str.strip().eq("")
+    if empty_name.any():
+        r.loc[empty_name,"PICKER"]=r.loc[empty_name,"CORREO"].map(email_name_tokens).map(lambda z:" ".join(sorted(z)))
+
     r["_KEY"]=r["PICKER"].map(person_key)
     r["_TOKEN_KEY"]=r["PICKER"].map(token_key)
     r["_CODE_KEY"]=r["CORREO"].map(extract_code)
@@ -680,23 +721,42 @@ def parse_inc(df,tipo):
     return x
 
 def attach(inc,base):
-    """Adjunta contexto operativo a FNR/MC usando CORREO como única llave."""
+    """Adjunta contexto operativo ya resuelto por CORREO.
+
+    El turno y el área que llegan a FNR/MC se copian desde la base, la cual
+    previamente fue asociada a la plantilla por correo.
+    """
     if inc is None or inc.empty:
         return inc
-    ref_cols=[c for c in ["PICKER","LINEAS","PEDIDOS","TURNO","CORREO","_EXCLUDED_PERSONNEL"] if c in base.columns]
+    base=_dedupe_columns(base)
+    ref_cols=[c for c in ["PICKER","LINEAS","PEDIDOS","TURNO","AREA_BASE","SUPERVISOR","CORREO","_EXCLUDED_PERSONNEL"] if c in base.columns]
     ref=base[ref_cols].copy()
     ref["_EMAIL_KEY"]=ref.get("CORREO",pd.Series([""]*len(ref),index=ref.index)).map(email_key)
     ref=ref[ref["_EMAIL_KEY"].astype(str).str.strip().ne("")].drop_duplicates("_EMAIL_KEY").set_index("_EMAIL_KEY")
     y=inc.copy()
     y["_EMAIL_KEY"]=y.get("CORREO",pd.Series([""]*len(y),index=y.index)).map(email_key)
     y["_TEMPLATE_MATCH"]=False
+    y["TURNO_REF"]=y.get("TURNO",pd.Series(["No especificado"]*len(y),index=y.index)).astype(str).str.strip()
+    y["AREA_REF"]=y.get("AREA",pd.Series(["No especificada"]*len(y),index=y.index)).astype(str).str.strip()
     for i,row in y.iterrows():
         ek=row.get("_EMAIL_KEY","")
         if ek and ek in ref.index:
             rr=ref.loc[ek]
             y.at[i,"PICKER"]=str(rr.get("PICKER",row.get("PICKER",""))).strip()
             y.at[i,"CORREO"]=str(rr.get("CORREO",row.get("CORREO",""))).strip()
-            y.at[i,"TURNO"]=str(rr.get("TURNO",row.get("TURNO",""))).strip()
+            turno=str(rr.get("TURNO","")).strip()
+            area=str(rr.get("AREA_BASE","")).strip()
+            sup=str(rr.get("SUPERVISOR","")).strip()
+            if turno and turno not in {"nan","None","No especificado"}:
+                y.at[i,"TURNO"]=turno
+                y.at[i,"TURNO_REF"]=turno
+            else:
+                y.at[i,"TURNO_REF"]=str(row.get("TURNO","No especificado")).strip() or "No especificado"
+            if area and area not in {"nan","None","No especificada"}:
+                y.at[i,"AREA"]=area
+                y.at[i,"AREA_REF"]=area
+            if sup:
+                y.at[i,"SUPERVISOR_REF"]=sup
             y.at[i,"_TEMPLATE_MATCH"]=True
             if "_EXCLUDED_PERSONNEL" in ref.columns:
                 y.at[i,"_EXCLUDED_PERSONNEL"]=bool(rr.get("_EXCLUDED_PERSONNEL",False))
@@ -781,11 +841,12 @@ def safe_pct(num, den, decimals=2):
     return out.astype("float64").round(decimals)
 
 def groups(inc,base,key):
-    """Agrupa FNR/MC por turno o área usando acceso por nombre de columna.
-    Evita el acceso por atributo de pandas (p.ej. .LINEAS), que puede fallar
-    según la versión de pandas/Streamlit Cloud.
+    """Agrupa FNR/MC por turno o área usando el contexto ya cruzado por correo.
+    Acepta TURNO_REF/TURNO y AREA_REF/AREA para evitar que una diferencia de
+    nombre interno deje vacía la segmentación.
     """
     x=_dedupe_columns(inc)
+    base=_dedupe_columns(base)
     excluded_mask=_excluded_mask(x)
     if len(excluded_mask)==len(x):
         x=x.loc[~excluded_mask].copy()
@@ -793,26 +854,41 @@ def groups(inc,base,key):
         return pd.DataFrame(columns=["GRUPO","INCIDENCIAS","% DEL TOTAL","LINEAS","% / LINEAS"])
 
     if key=="TURNO":
-        x["GRUPO"]=x["TURNO_REF"].astype(str).str.strip()
-        den=(base.groupby("TURNO",as_index=False)["LINEAS"].sum()
-             .rename(columns={"TURNO":"GRUPO"}))
+        turn_col=next((c for c in ["TURNO_REF","TURNO","_MASTER_TURNO","TURNO_MAESTRO"] if c in x.columns),None)
+        if turn_col is None:
+            x["GRUPO"]="No especificado"
+        else:
+            x["GRUPO"]=x[turn_col].fillna("No especificado").astype(str).str.strip()
+            x.loc[x["GRUPO"].eq(""),"GRUPO"]="No especificado"
+        den_col="TURNO" if "TURNO" in base.columns else ("_MASTER_TURNO" if "_MASTER_TURNO" in base.columns else None)
+        if den_col:
+            den=(base.groupby(den_col,as_index=False)["LINEAS"].sum()
+                 .rename(columns={den_col:"GRUPO"}))
+        else:
+            den=None
     else:
-        x["GRUPO"]=x["AREA"].astype(str).str.strip()
-        if "AREA_BASE" in base.columns and (base["AREA_BASE"].astype(str).str.strip()!="No especificada").any():
-            den=(base.groupby("AREA_BASE",as_index=False)["LINEAS"].sum()
-                 .rename(columns={"AREA_BASE":"GRUPO"}))
+        area_col=next((c for c in ["AREA_REF","AREA","AREA_BASE","_MASTER_AREA","AREA_MAESTRO"] if c in x.columns),None)
+        if area_col is None:
+            x["GRUPO"]="No especificada"
+        else:
+            x["GRUPO"]=x[area_col].fillna("No especificada").astype(str).str.strip()
+            x.loc[x["GRUPO"].eq(""),"GRUPO"]="No especificada"
+        den_col="AREA_BASE" if "AREA_BASE" in base.columns else None
+        if den_col and (base[den_col].astype(str).str.strip()!="No especificada").any():
+            den=(base.groupby(den_col,as_index=False)["LINEAS"].sum()
+                 .rename(columns={den_col:"GRUPO"}))
         else:
             den=None
 
     g=x.groupby("GRUPO",as_index=False)["INCIDENCIAS"].sum()
-    total_inc=float(g["INCIDENCIAS"].sum())
-    g["% DEL TOTAL"]=(g["INCIDENCIAS"]/total_inc*100).round(2) if total_inc else 0.0
+    total_inc=float(pd.to_numeric(g["INCIDENCIAS"],errors="coerce").fillna(0).sum())
+    g["% DEL TOTAL"]=(pd.to_numeric(g["INCIDENCIAS"],errors="coerce").fillna(0)/total_inc*100).round(2) if total_inc else 0.0
 
     if den is not None:
         g=g.merge(den,on="GRUPO",how="left")
         g["LINEAS"]=pd.to_numeric(g["LINEAS"],errors="coerce").fillna(0.0)
-        den_lineas=g["LINEAS"].where(g["LINEAS"].ne(0), float("nan"))
-        g["% / LINEAS"]=pd.to_numeric(g["INCIDENCIAS"].div(den_lineas)*100,errors="coerce").round(2)
+        den_lineas=g["LINEAS"].where(g["LINEAS"].ne(0),float("nan"))
+        g["% / LINEAS"]=pd.to_numeric(g["INCIDENCIAS"],errors="coerce").fillna(0).div(den_lineas).mul(100).round(2)
     return g.sort_values("INCIDENCIAS",ascending=False)
 
 def _excel_safe_df(df):
