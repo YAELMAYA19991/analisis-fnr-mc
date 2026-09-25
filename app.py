@@ -632,14 +632,40 @@ def orders(inc,picker=None):
     x=inc if not picker or picker=="Todos" else inc[inc.PICKER==picker]
     return x.groupby("ORDER_NUMBER",as_index=False).agg(INCIDENCIAS=("INCIDENCIAS","sum"),PICKERS=("PICKER","nunique"),PRODUCTOS=("PRODUCTO","nunique")).sort_values(["INCIDENCIAS","PICKERS"],ascending=False)
 
+
+
+def _dedupe_columns(df):
+    """Elimina columnas duplicadas conservando la primera aparición.
+    Evita que pandas convierta df["columna"] en DataFrame y rompa filtros/booleanos.
+    """
+    if df is None:
+        return df
+    x=df.copy()
+    if getattr(x.columns, "duplicated", None) is not None and x.columns.duplicated().any():
+        x=x.loc[:, ~x.columns.duplicated(keep="first")].copy()
+    return x
+
+def _excluded_mask(df, column="_EXCLUDED_PERSONNEL"):
+    """Devuelve una Serie booleana segura aun cuando la columna exista duplicada."""
+    if df is None or len(df)==0:
+        return pd.Series(dtype=bool, index=getattr(df, "index", None))
+    if column not in df.columns:
+        return pd.Series(False, index=df.index, dtype=bool)
+    raw=df.loc[:, df.columns == column]
+    if isinstance(raw, pd.DataFrame):
+        raw=raw.apply(lambda c: c.fillna(False).astype(bool))
+        return raw.any(axis=1)
+    return raw.fillna(False).astype(bool)
+
 def groups(inc,base,key):
     """Agrupa FNR/MC por turno o área usando acceso por nombre de columna.
     Evita el acceso por atributo de pandas (p.ej. .LINEAS), que puede fallar
     según la versión de pandas/Streamlit Cloud.
     """
-    x=inc.copy()
-    if "_EXCLUDED_PERSONNEL" in x.columns:
-        x=x[~x["_EXCLUDED_PERSONNEL"].fillna(False)].copy()
+    x=_dedupe_columns(inc)
+    excluded_mask=_excluded_mask(x)
+    if len(excluded_mask)==len(x):
+        x=x.loc[~excluded_mask].copy()
     if x.empty:
         return pd.DataFrame(columns=["GRUPO","INCIDENCIAS","% DEL TOTAL","LINEAS","% / LINEAS"])
 
@@ -780,6 +806,7 @@ try:
         raise ValueError("El Excel maestro no contiene pickers válidos.")
     base=apply_roster(base,roster)
     base=apply_manual_personnel(base,store)
+    base=_dedupe_columns(base)
     roster=effective_roster(roster,store)
     # Normaliza FNR/MC contra los pickers canónicos de la base.
     fnr=canonicalize_incidents(fnr,base)
@@ -790,7 +817,9 @@ except Exception as e:
 if excluded:
     fnr=fnr[~fnr.ORDER_NUMBER.isin(excluded)].copy()
     mc=mc[~mc.ORDER_NUMBER.isin(excluded)].copy()
-fnr=attach(fnr,base); mc=attach(mc,base); s=summary(base,fnr,mc)
+fnr=attach(fnr,base); mc=attach(mc,base)
+fnr=_dedupe_columns(fnr); mc=_dedupe_columns(mc); base=_dedupe_columns(base)
+s=summary(base,fnr,mc)
 # Columna técnica de cruce: se usa para diagnóstico, no para mostrarla en el dashboard.
 master_match=base.get("_MASTER_MATCH",pd.Series(False,index=base.index)).copy()
 base_display=base.drop(columns=["_MASTER_MATCH"],errors="ignore")
@@ -933,9 +962,10 @@ def render_turn_comparison(selected_base, reference_base, selected_fnr, referenc
     c1.metric("FNR del contexto", f"{sfr:.2f}%" if sfr is not None else "N/D", f"vs {rfr:.2f}% del universo" if rfr is not None else "")
     c2.metric("MC del contexto", f"{s_mr:.2f}%" if s_mr is not None else "N/D", f"vs {r_mr:.2f}% del universo" if r_mr is not None else "")
 
-s_view=s.copy()
-if "_EXCLUDED_PERSONNEL" in s_view.columns:
-    s_view=s_view[~s_view["_EXCLUDED_PERSONNEL"].fillna(False)]
+s_view=_dedupe_columns(s)
+excluded_mask=_excluded_mask(s_view)
+if len(excluded_mask)==len(s_view):
+    s_view=s_view.loc[~excluded_mask].copy()
 
 # Defaults para pestañas que no necesitan filtros globales.
 sp="Todos"
