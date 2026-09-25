@@ -293,25 +293,43 @@ def sheets(upload):
     return out
 
 def choose(ss,words):
+    """Elige una hoja por nombre, ignorando mayúsculas, espacios y guiones."""
+    if not ss:
+        raise ValueError("El Excel no contiene hojas con datos.")
     for name,df in ss.items():
-        if any(norm(w) in norm(name) for w in words): return df
+        n=norm(name)
+        if any(norm(w) in n for w in words):
+            return df
     return next(iter(ss.values()))
 
 def parse_base(df):
+    """Lee la base operativa aunque NO traiga correo.
+
+    El correo se incorpora después desde Maestro_Personal/plantilla.
+    Así la plantilla sí funciona como fuente de identidad y los Excel
+    operativos no están obligados a repetir el correo en cada archivo.
+    """
     p=col(df,["picker","picker_nombre","nombre","email_picker","persona"])
-    l=col(df,["total_lineas","lineas_totales","lineas","total_lineas_pickeadas"])
-    ped=col(df,["total_pedidos","pedidos_totales","pedidos"])
+    l=col(df,["total_lineas","lineas_totales","lineas","total_lineas_pickeadas","lineas_totales_pickeadas"])
+    ped=col(df,["total_pedidos","pedidos_totales","pedidos","ordenes","total_ordenes"])
     sh=col(df,["turno","shift"]); ar=col(df,["area","departamento","department"])
     em=col(df,["codigo_correo","codigo + correo","correo","email","usuario"])
-    if not l or not em: raise ValueError("La base necesita Total lineas y una columna de CORREO / CODIGO + CORREO.")
-    picker_values=df[p].astype(str).str.strip() if p else df[em].astype(str).str.strip().map(email_name_tokens).map(lambda z:" ".join(sorted(z)))
+    if not l:
+        raise ValueError("La base necesita una columna de Total líneas / Líneas totales.")
+    # Si no hay nombre pero sí correo, el nombre se obtiene del correo como respaldo.
+    if p:
+        picker_values=df[p].fillna("").astype(str).str.strip()
+    elif em:
+        picker_values=df[em].fillna("").astype(str).str.strip().map(email_name_tokens).map(lambda z:" ".join(sorted(z)))
+    else:
+        raise ValueError("La base necesita PICKER/nombre o una columna de CORREO para identificar al personal.")
     x=pd.DataFrame({
         "PICKER":picker_values,
         "LINEAS":pd.to_numeric(df[l],errors="coerce").fillna(0),
         "PEDIDOS":pd.to_numeric(df[ped],errors="coerce").fillna(0) if ped else 0,
-        "TURNO":df[sh].astype(str).str.strip() if sh else "No especificado",
-        "AREA_BASE":df[ar].astype(str).str.strip() if ar else "No especificada",
-        "CORREO":df[em].astype(str).str.strip() if em else ""
+        "TURNO":df[sh].fillna("").astype(str).str.strip() if sh else "No especificado",
+        "AREA_BASE":df[ar].fillna("").astype(str).str.strip() if ar else "No especificada",
+        "CORREO":df[em].fillna("").astype(str).str.strip() if em else ""
     })
     x["_KEY"]=x["PICKER"].map(person_key)
     x["_TOKEN_KEY"]=x["PICKER"].map(token_key)
@@ -428,10 +446,16 @@ def _match_master_row(value, roster, code_value=""):
     return None
 
 def apply_roster(base, roster):
+    """Asocia los 3 Excel operativos con la PLANTILLA CONSOLIDADA.
+
+    La única llave de identidad entre archivos es CORREO.
+    El nombre canónico, turno, supervisor y área se toman de la plantilla.
+    Si un registro operativo no trae correo o el correo no existe en la
+    plantilla, queda como NO ASIGNADO; no se hace cruce aproximado por nombre.
+    """
     if roster is None or roster.empty: return base
     x=base.copy()
     x["_SOURCE_PICKER"]=x["PICKER"].astype(str).str.strip()
-    # CORREO es la llave principal. Solo si falta correo se usa la identidad por nombre.
     roster_email={}
     if "_EMAIL_KEY" in roster.columns:
         for _,rr in roster.iterrows():
@@ -444,7 +468,8 @@ def apply_roster(base, roster):
             # Si hay correo, el correo manda. El nombre NO sustituye un correo no encontrado.
             rr=roster_email.get(ek)
         else:
-            rr=_match_master_row(row.get("PICKER",""),roster,"")
+            # Sin correo no hacemos asociación por nombre.
+            rr=None
         matches.append(rr)
 
     out=[]
@@ -542,41 +567,79 @@ def effective_roster(roster, store):
     return r
 
 def canonicalize_incidents(inc, base):
-    """Lleva FNR/MC al nombre canónico de la base, usando nombre/código/correo."""
-    if inc is None or inc.empty or base is None or base.empty: return inc
-    out=inc.copy()
-    records=base.to_dict("records")
-    # Índices directos
-    by_email={email_key(r.get("CORREO","")):r for r in records if email_key(r.get("CORREO",""))}
-    by_key={person_key(r.get("PICKER","")):r for r in records if person_key(r.get("PICKER",""))}
-    by_token={token_key(r.get("PICKER","")):r for r in records if token_key(r.get("PICKER",""))}
-    by_code={extract_code(r.get("CORREO","")):r for r in records if extract_code(r.get("CORREO",""))}
+    """Asocia FNR/MC a la persona canónica usando exclusivamente CORREO.
 
+    El nombre que viene en el archivo operativo es descriptivo; el nombre
+    definitivo se toma de la plantilla consolidada mediante el correo.
+    """
+    if inc is None or inc.empty:
+        return inc
+    out=inc.copy()
+    base_email={}
+    for _,r in base.iterrows():
+        ek=email_key(r.get("CORREO",""))
+        if ek:
+            base_email[ek]=r
     result=[]
+    matched=[]
+    canonical_email=[]
     for _,row in out.iterrows():
-        value=str(row.get("PICKER","")).strip()
-        raw_email=email_key(row.get("CORREO",""))
-        code=extract_code(row.get("CORREO","") or value)
-        key=person_key(value); tk=token_key(value)
-        rr=by_email.get(raw_email) if raw_email else (by_key.get(key) or by_token.get(tk) or (by_code.get(code) if code else None))
+        ek=email_key(row.get("CORREO",""))
+        rr=base_email.get(ek) if ek else None
         if rr is not None:
-            result.append(str(rr.get("PICKER",value)).strip())
-            continue
-        # Resolver contra la lista de la base con la misma lógica de identidad.
-        toks=name_tokens(value); best=None; best_tuple=None
-        for cand in records:
-            ctoks=name_tokens(cand.get("PICKER","")); overlap=len(toks & ctoks)
-            cov=overlap/(len(toks) or 1); j=overlap/(len(toks|ctoks) or 1)
-            seq=SequenceMatcher(None,person_key(value),person_key(cand.get("PICKER",""))).ratio()
-            score=.55*cov+.20*j+.25*seq
-            tup=(score,cov,seq,cand)
-            if best_tuple is None or tup[:3]>best_tuple[:3]: best_tuple=tup; best=cand
-        if best_tuple and len(toks)>=2 and best_tuple[1]>=1 and best_tuple[0]>=.70:
-            result.append(str(best.get("PICKER",value)).strip())
+            result.append(str(rr.get("PICKER", row.get("PICKER",""))).strip())
+            canonical_email.append(str(rr.get("CORREO",row.get("CORREO",""))).strip())
+            matched.append(True)
         else:
-            result.append(value)
+            result.append(str(row.get("PICKER","")).strip())
+            canonical_email.append(str(row.get("CORREO","")).strip())
+            matched.append(False)
     out["PICKER"]=result
+    out["CORREO"]=canonical_email
+    out["_EMAIL_MATCH"]=matched
     return out
+
+def template_roster_from_upload(data):
+    """Construye la identidad exclusivamente desde la plantilla consolidada.
+
+    No usa un Excel maestro externo. Puede leer Maestro_Personal y/o
+    Base_Pickers dentro del MISMO archivo de plantilla. La llave final es
+    CORREO_KEY; PICKER es el nombre asociado a ese correo.
+    """
+    ss=sheets_from_bytes(data) if isinstance(data,(bytes,bytearray)) else sheets(data)
+    frames=[]
+    for name,df in ss.items():
+        n=norm(name)
+        if not any(k in n for k in ["maestro_personal","base_pickers","personal","plantilla"]):
+            continue
+        em=col(df,["codigo_correo","codigo + correo","correo","email","usuario"])
+        p=col(df,["picker","picker_nombre","email_picker","nombre","persona"])
+        sh=col(df,["turno","shift"]); sup=col(df,["supervisor","supervisor_nombre","jefe","responsable"])
+        ar=col(df,["area_base","area","departamento","department"]); estado=col(df,["estado","estatus","status"])
+        if not em:
+            continue
+        tmp=pd.DataFrame({
+            "PICKER":df[p].fillna("").astype(str).str.strip() if p else "",
+            "TURNO_MAESTRO":df[sh].fillna("").astype(str).str.strip() if sh else "",
+            "CORREO":df[em].fillna("").astype(str).str.strip(),
+            "SUPERVISOR":df[sup].fillna("No asignado").astype(str).str.strip() if sup else "No asignado",
+            "AREA_MAESTRO":df[ar].fillna("").astype(str).str.strip() if ar else "",
+            "ESTADO_PLANTILLA":df[estado].fillna("ACTIVO").astype(str).str.strip() if estado else "ACTIVO"
+        })
+        tmp["_EMAIL_KEY"]=tmp["CORREO"].map(email_key)
+        tmp=tmp[tmp["_EMAIL_KEY"].ne("")].copy()
+        frames.append(tmp)
+    if not frames:
+        raise ValueError("La plantilla consolidada necesita una columna CORREO / CODIGO + CORREO en Maestro_Personal o Base_Pickers.")
+    r=pd.concat(frames,ignore_index=True)
+    # Preferir filas con nombre, turno, supervisor y área completos.
+    r["_COMPLETITUD"]=r[["PICKER","TURNO_MAESTRO","SUPERVISOR","AREA_MAESTRO"]].astype(str).apply(lambda z: sum(v.strip() not in {"","nan","None","No asignado","No especificada"} for v in z),axis=1)
+    r=r.sort_values(["_EMAIL_KEY","_COMPLETITUD"]).drop_duplicates("_EMAIL_KEY",keep="last").drop(columns=["_COMPLETITUD"],errors="ignore")
+    r["_KEY"]=r["PICKER"].map(person_key)
+    r["_TOKEN_KEY"]=r["PICKER"].map(token_key)
+    r["_CODE_KEY"]=r["CORREO"].map(extract_code)
+    r["_EMAIL_TOKENS"]=r["CORREO"].map(email_name_tokens)
+    return r
 
 def roster_from_uploads(uploads):
     frames=[]
@@ -588,18 +651,24 @@ def roster_from_uploads(uploads):
     return r.drop_duplicates("PICKER",keep="last")
 
 def parse_inc(df,tipo):
-    p=col(df,["picker","picker_nombre","email_picker","nombre"])
+    """Lee FNR/MC con o sin correo.
+
+    Si el detalle no trae correo, se cruza después contra la base/plantilla
+    por el nombre y, una vez resuelto, se conserva el correo canónico del Master.
+    """
+    p=col(df,["picker","picker_nombre","email_picker","nombre","persona"])
     prod=col(df,["product","producto","item","articulo","artículo"])
     order=col(df,["order_number","order","pedido","numero_pedido","order_id"])
     ar=col(df,["department","departamento","area","depto"])
     sh=col(df,["turno","shift"]); fe=col(df,["date","fecha","created_at"])
     qty=col(df,["cantidad","qty","quantity"])
     em=col(df,["codigo_correo","codigo + correo","correo","email","usuario"])
-    if not em: raise ValueError(f"El detalle {tipo} necesita una columna de CORREO / CODIGO + CORREO.")
-    picker_values=df[p].astype(str).str.strip() if p else df[em].astype(str).str.strip().map(email_name_tokens).map(lambda z:" ".join(sorted(z)))
+    if not p and not em:
+        raise ValueError(f"El detalle {tipo} necesita PICKER/nombre o una columna de CORREO.")
+    picker_values=df[p].fillna("").astype(str).str.strip() if p else df[em].fillna("").astype(str).str.strip().map(email_name_tokens).map(lambda z:" ".join(sorted(z)))
     x=pd.DataFrame({
         "PICKER":picker_values,
-        "CORREO":df[em].astype(str).str.strip(),
+        "CORREO":df[em].fillna("").astype(str).str.strip() if em else "",
         "PRODUCTO":df[prod].astype(str).str.strip() if prod else "Sin producto",
         "ORDER_NUMBER":df[order].astype(str).str.strip() if order else "",
         "AREA":df[ar].astype(str).str.strip() if ar else "No especificada",
@@ -611,33 +680,28 @@ def parse_inc(df,tipo):
     return x
 
 def attach(inc,base):
-    ref=base[[c for c in ["PICKER","LINEAS","PEDIDOS","TURNO","CORREO","_EXCLUDED_PERSONNEL"] if c in base.columns]].copy()
-    ref["_KEY"]=ref["PICKER"].map(person_key)
-    ref["_TOKEN_KEY"]=ref["PICKER"].map(token_key)
-    ref["_CODE_KEY"]=ref.get("CORREO",pd.Series([""]*len(ref),index=ref.index)).map(extract_code)
-    y=inc.copy()
-    y["_KEY"]=y["PICKER"].map(person_key)
-    y["_TOKEN_KEY"]=y["PICKER"].map(token_key)
-    y["_CODE_KEY"]=y.get("CORREO",pd.Series([""]*len(y),index=y.index)).map(extract_code)
+    """Adjunta contexto operativo a FNR/MC usando CORREO como única llave."""
+    if inc is None or inc.empty:
+        return inc
+    ref_cols=[c for c in ["PICKER","LINEAS","PEDIDOS","TURNO","CORREO","_EXCLUDED_PERSONNEL"] if c in base.columns]
+    ref=base[ref_cols].copy()
     ref["_EMAIL_KEY"]=ref.get("CORREO",pd.Series([""]*len(ref),index=ref.index)).map(email_key)
+    ref=ref[ref["_EMAIL_KEY"].astype(str).str.strip().ne("")].drop_duplicates("_EMAIL_KEY").set_index("_EMAIL_KEY")
+    y=inc.copy()
     y["_EMAIL_KEY"]=y.get("CORREO",pd.Series([""]*len(y),index=y.index)).map(email_key)
-    ref_email=ref[ref["_EMAIL_KEY"].astype(str).str.strip().ne("")].drop_duplicates("_EMAIL_KEY").set_index("_EMAIL_KEY")
-    ref_exact=ref.drop_duplicates("_KEY").set_index("_KEY")
-    ref_token=ref.drop_duplicates("_TOKEN_KEY").set_index("_TOKEN_KEY")
-    ref_code=ref[ref["_CODE_KEY"].astype(str).str.strip().ne("")].drop_duplicates("_CODE_KEY").set_index("_CODE_KEY")
-    def get_ref(row):
-        lookup=[(row["_EMAIL_KEY"],ref_email)] if row["_EMAIL_KEY"] else [(row["_KEY"],ref_exact),(row["_TOKEN_KEY"],ref_token),(row["_CODE_KEY"],ref_code)]
-        for key,mp in lookup:
-            if key and key in mp.index:
-                rr=mp.loc[key]
-                if isinstance(rr,pd.DataFrame): rr=rr.iloc[0]
-                return pd.Series([rr["PICKER"],rr["LINEAS"],rr["PEDIDOS"],rr["TURNO"],bool(rr.get("_EXCLUDED_PERSONNEL",False))])
-        return pd.Series([row["PICKER"],0,0,"No especificado",False])
-    vals=y.apply(get_ref,axis=1)
-    vals.columns=["PICKER_REF","LINEAS","PEDIDOS","TURNO_REF","_EXCLUDED_PERSONNEL"]
-    y=pd.concat([y.reset_index(drop=True),vals.reset_index(drop=True)],axis=1)
-    y.loc[y["PICKER_REF"].astype(str).str.strip().ne(""),"PICKER"]=y.loc[y["PICKER_REF"].astype(str).str.strip().ne(""),"PICKER_REF"]
-    return y.drop(columns=["_KEY","_TOKEN_KEY","_CODE_KEY","_EMAIL_KEY"],errors="ignore")
+    y["_TEMPLATE_MATCH"]=False
+    for i,row in y.iterrows():
+        ek=row.get("_EMAIL_KEY","")
+        if ek and ek in ref.index:
+            rr=ref.loc[ek]
+            y.at[i,"PICKER"]=str(rr.get("PICKER",row.get("PICKER",""))).strip()
+            y.at[i,"CORREO"]=str(rr.get("CORREO",row.get("CORREO",""))).strip()
+            y.at[i,"TURNO"]=str(rr.get("TURNO",row.get("TURNO",""))).strip()
+            y.at[i,"_TEMPLATE_MATCH"]=True
+            if "_EXCLUDED_PERSONNEL" in ref.columns:
+                y.at[i,"_EXCLUDED_PERSONNEL"]=bool(rr.get("_EXCLUDED_PERSONNEL",False))
+    y.drop(columns=["_EMAIL_KEY"],errors="ignore",inplace=True)
+    return y
 
 def summary(base,fnr,mc):
     s=base.copy()
@@ -861,7 +925,7 @@ with st.sidebar:
     ub_upload=st.file_uploader("① Base de Pickers / Líneas",type=["xlsx","xls"],key="base_picker")
     uf_upload=st.file_uploader("② Detalle FNR",type=["xlsx","xls"],key="detalle_fnr")
     um_upload=st.file_uploader("③ Detalle Mala Calidad",type=["xlsx","xls"],key="detalle_mc")
-    up_upload=st.file_uploader("④ Plantilla consolidada de personal",type=["xlsx","xls"],key="plantilla_personal")
+    up_upload=st.file_uploader("④ Plantilla consolidada",type=["xlsx","xls"],key="plantilla_personal")
 
     # Cada archivo nuevo reemplaza automáticamente al guardado. Si solo se recarga
     # la página, la app recupera la última versión guardada sin pedir volver a subirla.
@@ -869,7 +933,7 @@ with st.sidebar:
     uf=persist_upload(uf_upload,"detalle_fnr") if uf_upload else load_persisted_upload("detalle_fnr")
     um=persist_upload(um_upload,"detalle_mc") if um_upload else load_persisted_upload("detalle_mc")
     up=persist_upload(up_upload,"plantilla_personal") if up_upload else load_persisted_upload("plantilla_personal")
-    for _key,_upload,_label in [("base_picker",ub_upload,"Pickers/Líneas"),("detalle_fnr",uf_upload,"FNR"),("detalle_mc",um_upload,"Mala Calidad"),("plantilla_personal",up_upload,"Master Pickers")]:
+    for _key,_upload,_label in [("base_picker",ub_upload,"Pickers/Líneas"),("detalle_fnr",uf_upload,"FNR"),("detalle_mc",um_upload,"Mala Calidad"),("plantilla_personal",up_upload,"Plantilla consolidada")]:
         if _upload is not None:
             store.setdefault("upload_meta",{})[_key]={"fecha":datetime.now().strftime("%Y-%m-%d %H:%M:%S"),"archivo":str(getattr(_upload,"name",_label))}
     save_store(store)
@@ -879,7 +943,7 @@ with st.sidebar:
     guardados=[labels[k] for k,v in status.items() if v]
     if guardados:
         st.success("Archivos guardados: " + ", ".join(guardados))
-    st.caption("Los 3 archivos operativos siguen separados. El Excel maestro concentra PICKER, TURNO, CODIGO + CORREO, SUPERVISOR y AREA_BASE. Los archivos quedan guardados para los siguientes recargados de la página.")
+    st.caption("Los 3 Excel operativos se cruzan con la PLANTILLA CONSOLIDADA usando CORREO como única llave. La plantilla aporta el nombre asociado, turno, supervisor y área. El nombre no se usa para hacer coincidencias entre archivos.")
     st.divider()
     periodo=st.text_input("Periodo",value=str(store.get("periodo",datetime.now().strftime("%Y-%m"))),key="periodo_persistente")
     saved_excluded="\n".join(str(x) for x in store.get("excluded_orders",[]) if str(x).strip())
@@ -891,27 +955,19 @@ with st.sidebar:
     save_store(store)
 
 if not (ub and uf and um and up):
-    st.info("Carga los 3 Excel operativos y la plantilla consolidada de personal para comenzar.")
-    st.markdown("**Archivos:** ① Pickers/Líneas · ② FNR · ③ Mala Calidad · ④ Master Pickers (PICKER, TURNO, CODIGO + CORREO, SUPERVISOR, AREA_BASE).")
+    st.info("Carga los 3 Excel operativos y la plantilla consolidada para comenzar. Para que el cruce sea por correo, los registros que deban asociarse deben traer CORREO / CODIGO + CORREO.")
+    st.markdown("**Fuentes:** ① Pickers/Líneas · ② FNR · ③ Mala Calidad · ④ Plantilla consolidada (correo → nombre asociado, turno, supervisor y área).")
     st.stop()
 
 try:
     base=parse_base(choose(sheets_from_bytes(ub.getvalue()),["picker","lineas","resumen"]))
     fnr=parse_inc(choose(sheets_from_bytes(uf.getvalue()),["fnr","detalle"]),"FNR")
     mc=parse_inc(choose(sheets_from_bytes(um.getvalue()),["mc","mala"]),"MC")
-    # La plantilla maestra actual tiene una sola hoja: Base_Pickers.
-    # Columnas: PICKER, TURNO, CODIGO + CORREO, SUPERVISOR, AREA_BASE.
-    master_sheets=sheets_from_bytes(up.getvalue())
-    # Si existe Maestro_Personal, es la fuente principal porque contiene el universo de correos.
-    if "Maestro_Personal" in master_sheets:
-        master_df=master_sheets["Maestro_Personal"]
-    elif "Base_Pickers" in master_sheets:
-        master_df=master_sheets["Base_Pickers"]
-    else:
-        master_df=choose(master_sheets,["maestro_personal","base_pickers","personal","maestro","turno"])
-    roster=parse_roster(master_df)
+    # LA PLANTILLA CONSOLIDADA es la única fuente de identidad.
+    # No se usa un Excel maestro externo.
+    roster=template_roster_from_upload(up.getvalue())
     if roster.empty:
-        raise ValueError("El Excel maestro no contiene pickers válidos.")
+        raise ValueError("La plantilla consolidada no contiene correos válidos.")
     base=apply_roster(base,roster)
     base=apply_manual_personnel(base,store)
     base=_dedupe_columns(base)
@@ -1356,7 +1412,7 @@ with e:
 
 with x:
     st.subheader("🧩 Cruce por correo y personal no asignado")
-    st.caption("El CORREO es la llave principal. El nombre solo se usa como asociación cuando el Excel no trae correo.")
+    st.caption("La PLANTILLA CONSOLIDADA define la identidad. CORREO es la llave principal; el PICKER/nombre se obtiene de la asociación de ese correo en la plantilla.")
     cross=cross_status.copy()
     if not cross.empty:
         cross["CORREO_KEY"]=cross.get("CORREO",pd.Series("",index=cross.index)).map(email_key)
