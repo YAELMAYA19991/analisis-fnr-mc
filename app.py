@@ -502,6 +502,8 @@ def apply_roster(base, roster):
     x["AREA_BASE"]=x["AREA_BASE"].fillna("").astype(str).str.strip()
     x.loc[x["TURNO"].eq(""),"TURNO"]="No especificado"
     x.loc[x["AREA_BASE"].eq(""),"AREA_BASE"]="No especificada"
+    # CORREO_KEY queda visible para que TODOS los cruces posteriores usen la misma llave.
+    x["CORREO_KEY"]=x["CORREO"].map(email_key)
     return x.drop(columns=["_KEY","_TOKEN_KEY","_CODE_KEY","_EMAIL_TOKENS","_MASTER_PICKER","_MASTER_TURNO","_MASTER_CORREO","_MASTER_SUPERVISOR","_MASTER_AREA"],errors="ignore")
 
 def apply_manual_personnel(base, store):
@@ -1048,20 +1050,55 @@ try:
     base=apply_manual_personnel(base,store)
     base=_dedupe_columns(base)
     roster=effective_roster(roster,store)
-    # Normaliza FNR/MC contra los pickers canónicos de la base.
-    fnr=canonicalize_incidents(fnr,base)
-    mc=canonicalize_incidents(mc,base)
+    # FNR/MC se identifican directamente contra la PLANTILLA por correo.
+    # NO dependen de que el picker exista primero en la base de líneas.
+    fnr=canonicalize_incidents(fnr,roster)
+    mc=canonicalize_incidents(mc,roster)
 except Exception as e:
     st.error(f"Error en los archivos cargados: {e}"); st.stop()
 
 if excluded:
     fnr=fnr[~fnr.ORDER_NUMBER.isin(excluded)].copy()
     mc=mc[~mc.ORDER_NUMBER.isin(excluded)].copy()
-fnr=attach(fnr,base); mc=attach(mc,base)
+# Para FNR/MC, el contexto de turno/área/supervisor viene de la plantilla por correo.
+identity_for_attach=context_identity if 'context_identity' in globals() else _context_identity_view(roster)
+fnr=attach(fnr,identity_for_attach); mc=attach(mc,identity_for_attach)
+fnr["CORREO_KEY"]=fnr.get("CORREO",pd.Series("",index=fnr.index)).map(email_key)
+mc["CORREO_KEY"]=mc.get("CORREO",pd.Series("",index=mc.index)).map(email_key)
 fnr=_dedupe_columns(fnr); mc=_dedupe_columns(mc); base=_dedupe_columns(base)
 base,fnr,mc=exclude_registered_supervisors(base,fnr,mc,store)
 s=summary(base,fnr,mc)
-cross_status=base.copy()
+# Estado de cruce de TODOS los archivos: Pickers/Líneas + FNR + MC.
+# La llave es CORREO_KEY; cualquier registro sin coincidencia con la plantilla
+# se concentra en la pestaña 🧩 Correos / Cruce para asignación manual.
+def _cross_frame(df, fuente):
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["FUENTE","PICKER","CORREO","CORREO_KEY","TURNO","SUPERVISOR","AREA_BASE","IDENTIFICADO"])
+    y=df.copy()
+    y["CORREO_KEY"]=y.get("CORREO",pd.Series("",index=y.index)).map(email_key)
+    if fuente=="Pickers / Líneas":
+        ident=y.get("_MASTER_MATCH",False)
+        area=y.get("AREA_BASE",pd.Series("",index=y.index))
+    else:
+        ident=y.get("_TEMPLATE_MATCH",y.get("_EMAIL_MATCH",False))
+        area=y.get("AREA_REF",y.get("AREA",pd.Series("",index=y.index)))
+    out=pd.DataFrame({
+        "FUENTE":fuente,
+        "PICKER":y.get("PICKER",pd.Series("",index=y.index)).astype(str).str.strip(),
+        "CORREO":y.get("CORREO",pd.Series("",index=y.index)).astype(str).str.strip(),
+        "CORREO_KEY":y["CORREO_KEY"],
+        "TURNO":y.get("TURNO",y.get("TURNO_REF",pd.Series("No especificado",index=y.index))).astype(str).str.strip(),
+        "SUPERVISOR":y.get("SUPERVISOR",y.get("SUPERVISOR_REF",pd.Series("No asignado",index=y.index))).astype(str).str.strip(),
+        "AREA_BASE":area.astype(str).str.strip(),
+        "IDENTIFICADO":pd.Series(ident,index=y.index).fillna(False).astype(bool),
+    })
+    return out
+
+cross_status=pd.concat([
+    _cross_frame(base,"Pickers / Líneas"),
+    _cross_frame(fnr,"FNR"),
+    _cross_frame(mc,"Mala Calidad"),
+],ignore_index=True)
 master_match=base.get("_MASTER_MATCH",pd.Series(False,index=base.index)).copy()
 base_display=base.drop(columns=["_MASTER_MATCH"],errors="ignore")
 s=s.drop(columns=["_MASTER_MATCH"],errors="ignore")
@@ -1146,17 +1183,53 @@ def global_context(df):
     if ctx.get("area") not in areas: ctx["area"]="Todos"
     return ctx,turns,sups,areas
 
-def apply_context(df, ctx, include_turn=True):
-    return apply_person_filters(
-        df,
+def _context_identity_view(roster):
+    """Universo de contexto GLOBAL tomado directamente de la plantilla consolidada.
+
+    CORREO_KEY es la llave; PICKER/nombre solo es el nombre asociado que se muestra.
+    """
+    if roster is None or roster.empty:
+        return pd.DataFrame(columns=["PICKER","TURNO","SUPERVISOR","AREA_BASE","CORREO","CORREO_KEY"])
+    r=roster.copy()
+    r["PICKER"]=r.get("PICKER",pd.Series("",index=r.index)).fillna("").astype(str).str.strip()
+    r["TURNO"]=r.get("TURNO_MAESTRO",pd.Series("",index=r.index)).fillna("").astype(str).str.strip()
+    r["SUPERVISOR"]=r.get("SUPERVISOR",pd.Series("",index=r.index)).fillna("").astype(str).str.strip()
+    r["AREA_BASE"]=r.get("AREA_MAESTRO",pd.Series("",index=r.index)).fillna("").astype(str).str.strip()
+    r["CORREO"]=r.get("CORREO",pd.Series("",index=r.index)).fillna("").astype(str).str.strip()
+    r["CORREO_KEY"]=r["CORREO"].map(email_key)
+    r=r[r["CORREO_KEY"].ne("")].copy()
+    r.loc[r["TURNO"].eq(""),"TURNO"]="No especificado"
+    r.loc[r["SUPERVISOR"].eq(""),"SUPERVISOR"]="No asignado"
+    r.loc[r["AREA_BASE"].eq(""),"AREA_BASE"]="No especificada"
+    return r.drop_duplicates("CORREO_KEY",keep="last")
+
+def _records_for_context(df, ctx, identity_df, include_turn=True):
+    """Filtra cualquier dataset operativo usando los CORREO_KEY seleccionados en plantilla."""
+    if df is None or df.empty:
+        return df.copy() if isinstance(df,pd.DataFrame) else pd.DataFrame()
+    ids=apply_person_filters(
+        identity_df,
         "Todos",
         ctx.get("turno","Todos") if include_turn else "Todos",
         ctx.get("supervisor","Todos"),
         ctx.get("area","Todos"),
     )
+    keys=set(ids["CORREO_KEY"].astype(str)) if "CORREO_KEY" in ids.columns else set()
+    out=df.copy()
+    out["CORREO_KEY"]=out.get("CORREO",pd.Series("",index=out.index)).map(email_key)
+    return out[out["CORREO_KEY"].isin(keys)].copy()
 
-def context_reference(df, ctx):
-    """Base de comparación: mantiene supervisor/área, pero abre todos los turnos."""
+def apply_context(df, ctx, include_turn=True, identity_df=None):
+    if identity_df is not None:
+        return _records_for_context(df,ctx,identity_df,include_turn)
+    return apply_person_filters(
+        df,"Todos",ctx.get("turno","Todos") if include_turn else "Todos",
+        ctx.get("supervisor","Todos"),ctx.get("area","Todos"))
+
+def context_reference(df, ctx, identity_df=None):
+    """Base de comparación: supervisor/área de la plantilla, todos los turnos."""
+    if identity_df is not None:
+        return _records_for_context(df,ctx,identity_df,False)
     return apply_person_filters(df,"Todos","Todos",ctx.get("supervisor","Todos"),ctx.get("area","Todos"))
 
 def render_context_banner(ctx, selected_df, reference_df, label="Contexto de análisis"):
@@ -1210,6 +1283,10 @@ excluded_mask=_excluded_mask(s_view)
 if len(excluded_mask)==len(s_view):
     s_view=s_view.loc[~excluded_mask].copy()
 
+# El CONTEXTO GLOBAL sale de la PLANTILLA CONSOLIDADA, no del nombre del Excel operativo.
+# Cada pestaña después filtra sus propios registros por CORREO_KEY.
+context_identity=_context_identity_view(roster)
+
 # Defaults para pestañas que no necesitan filtros globales.
 sp="Todos"
 stn="Todos"
@@ -1226,12 +1303,12 @@ with a:
     st.caption("El contexto elegido aquí se comparte automáticamente con todas las pestañas.")
     _meta=store.get("upload_meta",{}) or {}
     _upload_rows=[]
-    for _k,_label in [("base_picker","Pickers / Líneas"),("detalle_fnr","FNR"),("detalle_mc","Mala Calidad"),("plantilla_personal","Master Pickers")]:
+    for _k,_label in [("base_picker","Pickers / Líneas"),("detalle_fnr","FNR"),("detalle_mc","Mala Calidad"),("plantilla_personal","Plantilla consolidada")]:
         _m=_meta.get(_k,{}) or {}
         _upload_rows.append({"Archivo":_label,"Última carga":_m.get("fecha","Sin registro"),"Nombre":_m.get("archivo","")})
     with st.expander("🕒 Última carga de Excel",expanded=True):
         st.dataframe(pd.DataFrame(_upload_rows),use_container_width=True,hide_index=True)
-    ctx,turns,sups,areas=global_context(s_view)
+    ctx,turns,sups,areas=global_context(context_identity)
     with st.container(border=True):
         st.markdown("**🎯 Contexto global de análisis**")
         c1,c2,c3=st.columns(3)
@@ -1245,8 +1322,8 @@ with a:
     ctx["supervisor"]=st.session_state.get("global_supervisor","Todos")
     ctx["area"]=st.session_state.get("global_area","Todos")
 
-    s_bodega=apply_context(s_view,ctx)
-    s_reference=context_reference(s_view,ctx)
+    s_bodega=apply_context(s_view,ctx,identity_df=context_identity)
+    s_reference=context_reference(s_view,ctx,identity_df=context_identity)
     base_bodega=base[base.PICKER.isin(s_bodega.PICKER)]
     fnr_bodega=fnr[fnr.PICKER.isin(s_bodega.PICKER)]
     mc_bodega=mc[mc.PICKER.isin(s_bodega.PICKER)]
@@ -1283,11 +1360,11 @@ with a:
     st.dataframe(s_bodega,use_container_width=True,hide_index=True)
 
 with b:
-    ctx,_,_,_=global_context(s_view)
-    selected_context=apply_context(s_view,ctx)
+    ctx,_,_,_=global_context(context_identity)
+    selected_context=apply_context(s_view,ctx,identity_df=context_identity)
     st.subheader("👤 Ficha de picker")
     st.caption("El turno, supervisor y área se heredan del contexto elegido en Bodega. Aquí solo buscas el picker.")
-    render_context_banner(ctx,selected_context,context_reference(s_view,ctx),"Contexto heredado")
+    render_context_banner(ctx,selected_context,context_reference(s_view,ctx,identity_df=context_identity),"Contexto heredado")
     names=person_options(selected_context)
     with st.container(border=True):
         search=st.text_input("🔎 Buscar picker",placeholder="Escribe parte del nombre…",key="picker_page_search")
@@ -1437,11 +1514,11 @@ with b:
             st.info("Este picker todavía no tiene retroalimentaciones, seguimientos ni documentos registrados.")
 
 with c:
-    ctx,_,_,_=global_context(s_view)
+    ctx,_,_,_=global_context(context_identity)
     st.subheader("🏷️ Artículos")
     st.caption("Esta página respeta el mismo turno, supervisor y área seleccionados en Bodega.")
-    selected=apply_context(s_view,ctx)
-    render_context_banner(ctx,selected,context_reference(s_view,ctx),"Contexto heredado")
+    selected=apply_context(s_view,ctx,identity_df=context_identity)
+    render_context_banner(ctx,selected,context_reference(s_view,ctx,identity_df=context_identity),"Contexto heredado")
     tipo=st.radio("Tipo",["FNR","MC"],horizontal=True,key="articulos_tipo")
     data=fnr if tipo=="FNR" else mc
     data=data[data.PICKER.isin(selected.PICKER)]
@@ -1450,11 +1527,11 @@ with c:
     st.caption(f"{len(art):,} artículos con incidencia · {int(art.CANTIDAD.sum()) if not art.empty else 0:,} incidencias dentro del contexto seleccionado.")
 
 with d:
-    ctx,_,_,_=global_context(s_view)
+    ctx,_,_,_=global_context(context_identity)
     st.subheader("📦 Pedidos")
     st.caption("Esta página respeta el mismo turno, supervisor y área seleccionados en Bodega.")
-    selected=apply_context(s_view,ctx)
-    render_context_banner(ctx,selected,context_reference(s_view,ctx),"Contexto heredado")
+    selected=apply_context(s_view,ctx,identity_df=context_identity)
+    render_context_banner(ctx,selected,context_reference(s_view,ctx,identity_df=context_identity),"Contexto heredado")
     tipo=st.radio("Incidencia",["FNR","MC"],horizontal=True,key="pedidos_tipo")
     data=fnr if tipo=="FNR" else mc
     data=data[data.PICKER.isin(selected.PICKER)]
@@ -1463,11 +1540,11 @@ with d:
     st.caption("PICKERS indica cuántos pickers aparecen en el mismo pedido.")
 
 with e:
-    ctx,_,_,_=global_context(s_view)
+    ctx,_,_,_=global_context(context_identity)
     st.subheader("🌙 Turnos / Áreas")
     st.caption("El contexto seleccionado se mantiene, pero el comparativo conserva todos los turnos para no perder proporciones.")
-    selected=apply_context(s_view,ctx)
-    reference=context_reference(s_view,ctx)
+    selected=apply_context(s_view,ctx,identity_df=context_identity)
+    reference=context_reference(s_view,ctx,identity_df=context_identity)
     render_context_banner(ctx,selected,reference,"Contexto heredado")
     bsel=base[base.PICKER.isin(selected.PICKER)]
     fsel=fnr[fnr.PICKER.isin(selected.PICKER)]
@@ -1488,22 +1565,20 @@ with e:
 
 with x:
     st.subheader("🧩 Cruce por correo y personal no asignado")
-    st.caption("La PLANTILLA CONSOLIDADA define la identidad. CORREO es la llave principal; el PICKER/nombre se obtiene de la asociación de ese correo en la plantilla.")
+    st.caption("La PLANTILLA CONSOLIDADA es el contexto. CORREO_KEY es la única llave de identidad; el nombre, turno, supervisor y área se asocian desde la plantilla. Los registros que no empaten se concentran aquí.")
     cross=cross_status.copy()
     if not cross.empty:
-        cross["CORREO_KEY"]=cross.get("CORREO",pd.Series("",index=cross.index)).map(email_key)
-        cross["IDENTIFICADO"]=cross.get("_MASTER_MATCH",False).fillna(False).astype(bool) if "_MASTER_MATCH" in cross.columns else False
-        cross["MANUAL"]=cross.get("_MANUAL_MATCH",False).fillna(False).astype(bool) if "_MANUAL_MATCH" in cross.columns else False
-    unmatched_cross=cross[(~cross["IDENTIFICADO"]) & (~cross["CORREO_KEY"].eq(""))].copy() if not cross.empty else pd.DataFrame()
+        cross["MANUAL"]=cross["CORREO_KEY"].map(lambda z: bool(store.get("master_overrides",{}).get(str(z))))
+    unmatched_cross=cross[(~cross["IDENTIFICADO"]) & (cross["CORREO_KEY"].astype(str).str.strip().ne(""))].copy() if not cross.empty else pd.DataFrame()
     k1,k2,k3=st.columns(3)
-    k1.metric("Correos en base",f"{cross['CORREO_KEY'].nunique():,}" if not cross.empty else "0")
-    k2.metric("Correos sin asignar",f"{unmatched_cross['CORREO_KEY'].nunique():,}" if not unmatched_cross.empty else "0")
+    k1.metric("Correos de los 3 archivos",f"{cross['CORREO_KEY'].nunique():,}" if not cross.empty else "0")
+    k2.metric("Correos sin empatar",f"{unmatched_cross['CORREO_KEY'].nunique():,}" if not unmatched_cross.empty else "0")
     k3.metric("Asignaciones manuales",f"{len(store.get('master_overrides',{})):,}")
     if unmatched_cross.empty:
-        st.success("No hay correos sin asignación en la base de Pickers.")
+        st.success("✅ Todos los correos de los 3 archivos están empatados con la plantilla consolidada.")
     else:
-        view_cols=[c for c in ["PICKER","CORREO","LINEAS","PEDIDOS","TURNO","AREA_BASE"] if c in unmatched_cross.columns]
-        st.dataframe(unmatched_cross[view_cols].drop_duplicates("CORREO"),use_container_width=True,hide_index=True)
+        view_cols=[c for c in ["FUENTE","PICKER","CORREO","TURNO","SUPERVISOR","AREA_BASE"] if c in unmatched_cross.columns]
+        st.dataframe(unmatched_cross[view_cols].drop_duplicates(["FUENTE","CORREO"]),use_container_width=True,hide_index=True)
         emails=sorted([str(v) for v in unmatched_cross["CORREO_KEY"].dropna().unique() if str(v).strip()])
         with st.expander("➕ Asignar correo manualmente",expanded=True):
             with st.form("manual_email_assignment_form",clear_on_submit=True):
@@ -1531,7 +1606,7 @@ with x:
         else: st.info("Todavía no hay asignaciones manuales.")
 
 with g:
-    ctx,_,_,_=global_context(s_view)
+    ctx,_,_,_=global_context(context_identity)
     st.subheader("👥 Supervisores")
     st.caption("Vista operativa bajo el mismo contexto global. Los supervisores registrados por correo se excluyen automáticamente de incidencias y filtros de pickers.")
     with st.expander("➕ Dar de alta supervisor",expanded=False):
@@ -1550,8 +1625,8 @@ with g:
     _supreg=store.get("supervisores",[]) or []
     if _supreg:
         st.dataframe(pd.DataFrame([{"Supervisor":z.get("nombre",""),"Correo":z.get("correo",""),"Excluido":"Sí" if z.get("activo",True) else "No","Alta":z.get("fecha","")} for z in _supreg]),use_container_width=True,hide_index=True)
-    sup_data=apply_context(s_view,ctx)
-    reference=context_reference(s_view,ctx)
+    sup_data=apply_context(s_view,ctx,identity_df=context_identity)
+    reference=context_reference(s_view,ctx,identity_df=context_identity)
     render_context_banner(ctx,sup_data,reference,"Contexto heredado")
     if not sup_data.empty:
         sup_summary=(sup_data.groupby("SUPERVISOR",as_index=False)
@@ -1569,9 +1644,9 @@ with g:
 with h:
     st.subheader("🛡️ Seguimiento")
     st.caption("Vista consolidada de todos los pickers: retroalimentaciones, seguimientos, actas y tolerancias. Filtra y ordena para ver rápidamente dónde hay más seguimiento.")
-    ctx,_,_,_=global_context(s_view)
-    selected_context=apply_context(s_view,ctx)
-    render_context_banner(ctx,selected_context,context_reference(s_view,ctx),"Contexto heredado")
+    ctx,_,_,_=global_context(context_identity)
+    selected_context=apply_context(s_view,ctx,identity_df=context_identity)
+    render_context_banner(ctx,selected_context,context_reference(s_view,ctx,identity_df=context_identity),"Contexto heredado")
 
     all_rows=[]
     for _,rr in selected_context.iterrows():
