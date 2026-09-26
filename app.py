@@ -1389,13 +1389,14 @@ with a:
     ctx["supervisor"]=st.session_state.get("global_supervisor","Todos")
     ctx["area"]=st.session_state.get("global_area","Todos")
 
-    # Aplicar el mismo contexto por CORREO_KEY a cada fuente. Filtrar FNR/MC
-    # usando los nombres del resumen podía dejar Artículos y Pedidos vacíos
-    # cuando el nombre operativo difería del canónico de la plantilla.
-    base_bodega=apply_context(base,ctx,identity_df=context_identity)
+    # La base ya trae TURNO/SUPERVISOR/AREA_BASE asignados desde la plantilla.
+    # Filtrarla por CORREO_KEY aquí podía eliminarla completa si el Excel de
+    # líneas no traía correo, aunque su contexto ya estuviera asignado.
+    # FNR/MC sí se filtran por CORREO_KEY contra la plantilla consolidada.
+    base_bodega=apply_context(base,ctx)
     fnr_bodega=apply_context(fnr,ctx,identity_df=context_identity)
     mc_bodega=apply_context(mc,ctx,identity_df=context_identity)
-    base_reference=context_reference(base,ctx,identity_df=context_identity)
+    base_reference=context_reference(base,ctx)
     fnr_reference=context_reference(fnr,ctx,identity_df=context_identity)
     mc_reference=context_reference(mc,ctx,identity_df=context_identity)
     s_bodega=summary(base_bodega,fnr_bodega,mc_bodega)
