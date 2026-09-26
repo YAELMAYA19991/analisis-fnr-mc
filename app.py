@@ -2143,7 +2143,7 @@ with h:
             else: st.info("Este picker todavía no tiene seguimientos registrados.")
         with st.container(border=True):
             st.markdown("### 📄 Subir seguimiento / acta")
-            st.caption("Registra el documento en este expediente. Puedes adjuntar un PDF, reutilizar un enlace guardado o agregar uno nuevo.")
+            st.caption("Registra el documento en este expediente. Adjunta un PDF o selecciona un enlace guardado; puedes administrar los enlaces en la sección de abajo.")
             recursos=store.get("recursos_formatos",[]) or []
             recurso_lookup={}
             for i,z in enumerate(recursos):
@@ -2152,27 +2152,27 @@ with h:
             recurso_opciones=["Sin enlace guardado"]+list(recurso_lookup)
             with st.container(border=True):
                 st.markdown("**🔗 Reutilizar un enlace de seguimiento**")
-                recurso_seleccionado=st.selectbox("Enlace guardado",recurso_opciones,key=f"seguimiento_enlace_guardado_{person_key(seguimiento_picker)}")
+                recurso_seleccionado=st.selectbox("Selecciona un enlace guardado",recurso_opciones,key=f"seguimiento_enlace_guardado_{person_key(seguimiento_picker)}")
                 recurso_actual=recurso_lookup.get(recurso_seleccionado)
                 if recurso_actual:
-                    st.link_button(f"Abrir: {recurso_actual.get('titulo','Enlace de seguimiento')}",str(recurso_actual.get("url","")))
-                    st.caption("Si guardas el documento, este enlace quedará asociado al expediente seleccionado.")
+                    st.info(f"**Listo para reutilizar:** {recurso_actual.get('tipo','Seguimiento')} · {recurso_actual.get('titulo','Enlace de seguimiento')}")
+                    st.link_button("Vista previa del enlace",str(recurso_actual.get("url","")))
+                else:
+                    st.caption("Elige un enlace guardado para asociarlo a este seguimiento.")
             with st.form(f"seguimiento_documento_form_{seguimiento_picker}",clear_on_submit=True):
                 dc1,dc2=st.columns([1,2])
                 with dc1: doc_tipo=st.selectbox("Tipo de documento",["Acta 1","Acta 2","Acta 3","Llamada de atención","Advertencia verbal 1","Advertencia verbal 2","Cero tolerancia","Otro"])
                 with dc2: doc_titulo=st.text_input("Nombre / referencia",placeholder="Ej. Acta por FNR — septiembre 2026")
                 doc_detalle=st.text_area("Detalle / motivo",placeholder="Qué originó el seguimiento y cualquier dato importante…")
                 doc_pdf=st.file_uploader("📎 Adjuntar PDF",type=["pdf"],accept_multiple_files=False,key=f"seguimiento_pdf_{seguimiento_picker}")
-                doc_url=st.text_input("Enlace adicional (opcional)",placeholder="https://...")
                 enviar_copia=st.checkbox("Enviar copia por correo al guardar",value=False)
                 destinatarios=st.text_input("Destinatarios",placeholder="persona1@correo.com, persona2@correo.com") if enviar_copia else ""
                 if st.form_submit_button("💾 Guardar seguimiento / documento",type="primary"):
-                    url=doc_url.strip() or (str(recurso_actual.get("url","")).strip() if recurso_actual else "")
+                    url=str(recurso_actual.get("url","")).strip() if recurso_actual else ""
                     titulo=doc_titulo.strip() or (doc_pdf.name if doc_pdf is not None else (str(recurso_actual.get("titulo",doc_tipo)) if recurso_actual else doc_tipo))
-                    if doc_pdf is None and not url: st.error("Adjunta un PDF o captura un enlace externo.")
-                    elif url and not url.startswith(("http://","https://")): st.error("El enlace debe comenzar con http:// o https://")
+                    if doc_pdf is None and not url: st.error("Adjunta un PDF o selecciona un enlace guardado.")
                     else:
-                        registro={"id":datetime.now().strftime("%Y%m%d%H%M%S%f"),"fecha":datetime.now().strftime("%Y-%m-%d %H:%M"),"tipo":doc_tipo,"titulo":titulo,"detalle":doc_detalle.strip(),"supervisor":str(r.get("SUPERVISOR","")),"url":url,"url_titulo":(str(recurso_actual.get("titulo","")) if recurso_actual and not doc_url.strip() else ""),"path":"","archivo":"","destinatarios":destinatarios}
+                        registro={"id":datetime.now().strftime("%Y%m%d%H%M%S%f"),"fecha":datetime.now().strftime("%Y-%m-%d %H:%M"),"tipo":doc_tipo,"titulo":titulo,"detalle":doc_detalle.strip(),"supervisor":str(r.get("SUPERVISOR","")),"url":url,"url_titulo":(str(recurso_actual.get("titulo","")) if recurso_actual else ""),"path":"","archivo":"","destinatarios":destinatarios}
                         pdf_bytes=None
                         if doc_pdf is not None:
                             path,_=save_followup_pdf(doc_pdf.getvalue(),seguimiento_picker,doc_pdf.name); registro["path"]=path; registro["archivo"]=_safe_filename(doc_pdf.name); pdf_bytes=doc_pdf.getvalue()
@@ -2186,18 +2186,23 @@ with h:
         st.markdown("### 🔗 Enlaces de seguimiento")
         st.caption("Guarda aquí enlaces reutilizables; podrás seleccionarlos al registrar un documento en cualquier expediente.")
         with st.expander(f"Administrar enlaces de seguimiento ({len(recursos)})",expanded=False):
+            st.info("Agrega cada enlace aquí una sola vez. Después podrás reutilizarlo desde el formulario del expediente.")
             for idx,recurso in enumerate(recursos):
-                rr1,rr2,rr3=st.columns([1,5,1])
-                rr1.caption(str(recurso.get("tipo","Recurso"))); rr2.markdown(f"**{recurso.get('titulo','Formato')}**")
-                with rr3:
-                    if recurso.get("url"): st.link_button("Abrir",str(recurso.get("url")),use_container_width=True)
-                if st.button("Quitar",key=f"seg_recurso_del_{idx}"): store["recursos_formatos"].pop(idx); save_store(store); st.rerun()
+                with st.container(border=True):
+                    rr1,rr2,rr3=st.columns([4,1.3,1])
+                    with rr1:
+                        st.markdown(f"**🔗 {recurso.get('titulo','Formato')}**")
+                        st.caption(f"🟦 {recurso.get('tipo','Recurso')} · Agregado {recurso.get('fecha','')}")
+                    with rr2:
+                        if recurso.get("url"): st.link_button("Abrir enlace",str(recurso.get("url")),use_container_width=True)
+                    with rr3:
+                        if st.button("Quitar",key=f"seg_recurso_del_{idx}",use_container_width=True): store["recursos_formatos"].pop(idx); save_store(store); st.rerun()
             with st.form("seg_recurso_form",clear_on_submit=True):
                 q1,q2=st.columns([1,2])
                 with q1: rt=st.selectbox("Tipo",["Retroalimentación","Seguimiento","Llamada de atención","Acta","Otro"])
                 with q2: rn=st.text_input("Nombre")
                 ru=st.text_input("Enlace",placeholder="https://...")
-                if st.form_submit_button("Agregar enlace"):
+                if st.form_submit_button("Guardar enlace reutilizable"):
                     if rn.strip() and ru.startswith(("http://","https://")):
                         store.setdefault("recursos_formatos",[]).append({"tipo":rt,"titulo":rn.strip(),"url":ru.strip(),"fecha":datetime.now().strftime("%Y-%m-%d %H:%M")}); save_store(store); st.rerun()
                     else: st.error("Nombre y enlace válido son obligatorios.")
