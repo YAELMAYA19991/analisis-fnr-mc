@@ -5,7 +5,7 @@
 # ================================================================
 
 
-import io, re, json, os, smtplib
+import io, re, json, os, smtplib, zipfile
 from difflib import SequenceMatcher
 from datetime import datetime
 from email.message import EmailMessage
@@ -59,6 +59,8 @@ def sheets_from_bytes(data):
     return out
 FNR_OBJ, MC_OBJ = 1.50, 1.00
 PERSIST_DIR = "app_data"
+UPLOAD_HISTORY_DIR = os.path.join(PERSIST_DIR, "upload_history")
+MAX_UPLOAD_HISTORY = 20
 STORE_FILE = os.path.join(PERSIST_DIR, "picker_seguimiento.json")
 LEGACY_STORE_FILE = "picker_seguimiento.json"
 PERSIST_FILES = {
@@ -72,14 +74,57 @@ def ensure_persist_dir():
     os.makedirs(PERSIST_DIR, exist_ok=True)
 
 def persist_upload(upload, key):
-    """Guarda físicamente el Excel cargado para que sobreviva a un rerun/refresh."""
+    """Guarda el Excel actual y una copia versionada para el historial local."""
     if upload is None:
         return None
     ensure_persist_dir()
     path=PERSIST_FILES[key]
+    data=upload.getvalue()
+    history_dir=os.path.join(UPLOAD_HISTORY_DIR,key)
+    os.makedirs(history_dir,exist_ok=True)
+    prior=sorted([os.path.join(history_dir,n) for n in os.listdir(history_dir) if os.path.isfile(os.path.join(history_dir,n))])
+    same_as_latest=False
+    if prior:
+        try:
+            with open(prior[-1],"rb") as f: same_as_latest=(f.read()==data)
+        except Exception: pass
+    if not same_as_latest:
+        stamp=datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        safe=re.sub(r"[^A-Za-z0-9._-]+","_",os.path.basename(str(getattr(upload,"name","archivo.xlsx"))))[:100]
+        hist_path=os.path.join(history_dir,f"{stamp}_{safe or 'archivo.xlsx'}")
+        with open(hist_path,"wb") as f: f.write(data)
+        saved=sorted([os.path.join(history_dir,n) for n in os.listdir(history_dir) if os.path.isfile(os.path.join(history_dir,n))])
+        for old in saved[:-MAX_UPLOAD_HISTORY]:
+            try: os.remove(old)
+            except OSError: pass
     with open(path, "wb") as f:
-        f.write(upload.getvalue())
-    return io.BytesIO(upload.getvalue())
+        f.write(data)
+    return io.BytesIO(data)
+
+def upload_history_rows():
+    rows=[]
+    labels={"base_picker":"Base de Pickers / Líneas","detalle_fnr":"Detalle FNR","detalle_mc":"Detalle Mala Calidad","plantilla_personal":"Plantilla consolidada"}
+    if not os.path.isdir(UPLOAD_HISTORY_DIR): return rows
+    for key,label in labels.items():
+        folder=os.path.join(UPLOAD_HISTORY_DIR,key)
+        if not os.path.isdir(folder): continue
+        for name in sorted(os.listdir(folder),reverse=True):
+            path=os.path.join(folder,name)
+            if not os.path.isfile(path): continue
+            try:
+                rows.append({"Archivo":label,"Versión":name,"Fecha de carga":datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d %H:%M:%S"),"Tamaño (MB)":round(os.path.getsize(path)/1048576,2)})
+            except OSError: pass
+    return rows
+
+def upload_history_zip():
+    out=io.BytesIO()
+    with zipfile.ZipFile(out,"w",compression=zipfile.ZIP_DEFLATED) as zf:
+        if os.path.isdir(UPLOAD_HISTORY_DIR):
+            for root,_,files in os.walk(UPLOAD_HISTORY_DIR):
+                for name in files:
+                    path=os.path.join(root,name)
+                    zf.write(path,os.path.relpath(path,UPLOAD_HISTORY_DIR))
+    return out.getvalue()
 
 def load_persisted_upload(key):
     """Recupera el último Excel guardado cuando el uploader está vacío."""
@@ -336,8 +381,21 @@ def parse_base(df):
     x["_CODE_KEY"]=x["CORREO"].map(extract_code)
     x["_EMAIL_TOKENS"]=x["CORREO"].map(email_name_tokens)
     x["_EMAIL_KEY"]=x["CORREO"].map(email_key)
-    has_email=x["_EMAIL_KEY"].astype(str).str.strip().ne("")
-    return pd.concat([x[has_email].sort_values("LINEAS").drop_duplicates("_EMAIL_KEY",keep="last"), x[~has_email].sort_values("LINEAS").drop_duplicates("PICKER",keep="last")],ignore_index=True)
+    # Sumar todas las filas de una persona: conservar solo la de más líneas
+    # descartaba producción cuando el Excel separaba turnos o áreas.
+    x["_IDENTITY_KEY"]=x.apply(lambda r: ("email:"+r["_EMAIL_KEY"]) if str(r["_EMAIL_KEY"]).strip() else (("name:"+r["_KEY"]) if str(r["_KEY"]).strip() else ("row:"+str(r.name))),axis=1)
+    rows=[]
+    for _,g in x.groupby("_IDENTITY_KEY",sort=False):
+        row=g.iloc[g["LINEAS"].astype(float).argmax()].copy()
+        row["LINEAS"]=pd.to_numeric(g["LINEAS"],errors="coerce").fillna(0).sum()
+        row["PEDIDOS"]=pd.to_numeric(g["PEDIDOS"],errors="coerce").fillna(0).sum()
+        for field,plural in [("TURNO","Varios turnos"),("AREA_BASE","Varias áreas")]:
+            vals=[str(v).strip() for v in g[field].tolist() if str(v).strip() and str(v).strip().lower() not in {"nan","none"}]
+            unique=list(dict.fromkeys(vals))
+            row[field]=unique[0] if len(unique)==1 else (plural if unique else ("No especificado" if field=="TURNO" else "No especificada"))
+        rows.append(row)
+    out=pd.DataFrame(rows).drop(columns=["_IDENTITY_KEY"],errors="ignore")
+    return out.reset_index(drop=True)
 
 def parse_roster(df, turno_fijo=None):
     """Maestro consolidado: PICKER, TURNO, CODIGO + CORREO, SUPERVISOR y AREA_BASE."""
@@ -465,11 +523,13 @@ def apply_roster(base, roster):
     for _,row in x.iterrows():
         ek=email_key(row.get("CORREO",""))
         if ek:
-            # Si hay correo, el correo manda. El nombre NO sustituye un correo no encontrado.
+            # El correo es la llave preferida; si falta o no está en la plantilla,
+            # intentar una coincidencia conservadora por nombre.
             rr=roster_email.get(ek)
         else:
-            # Sin correo no hacemos asociación por nombre.
             rr=None
+        if rr is None:
+            rr=_match_master_row(row.get("_SOURCE_PICKER",row.get("PICKER","")),roster,row.get("CORREO",""))
         matches.append(rr)
 
     out=[]
@@ -593,6 +653,8 @@ def canonicalize_incidents(inc, base):
     for _,row in out.iterrows():
         ek=email_key(row.get("CORREO",""))
         rr=base_email.get(ek) if ek else None
+        if rr is None:
+            rr=_match_master_row(row.get("PICKER",""),base,row.get("CORREO",""))
         if rr is not None:
             result.append(str(rr.get("PICKER", row.get("PICKER",""))).strip())
             canonical_email.append(str(rr.get("CORREO",row.get("CORREO",""))).strip())
@@ -1021,6 +1083,14 @@ with st.sidebar:
     guardados=[labels[k] for k,v in status.items() if v]
     if guardados:
         st.success("Archivos guardados: " + ", ".join(guardados))
+    with st.expander("🗂️ Historial de archivos Excel",expanded=False):
+        _history=upload_history_rows()
+        if _history:
+            st.dataframe(pd.DataFrame(_history),use_container_width=True,hide_index=True)
+            st.download_button("Descargar respaldo del historial (.zip)",upload_history_zip(),"Historial_Excel_FNR_MC.zip","application/zip",key="download_excel_history")
+            st.caption("Se conservan hasta 20 versiones por archivo en el almacenamiento local de la app. Descarga el ZIP para guardar una copia fuera de Streamlit.")
+        else:
+            st.info("Aún no hay versiones en el historial. Se registra una versión al cargar cada Excel.")
     st.caption("Los 3 Excel operativos se cruzan con la PLANTILLA CONSOLIDADA usando CORREO como única llave. La plantilla aporta el nombre asociado, turno, supervisor y área. El nombre no se usa para hacer coincidencias entre archivos.")
     st.divider()
     periodo=st.text_input("Periodo",value=str(store.get("periodo",datetime.now().strftime("%Y-%m"))),key="periodo_persistente")
@@ -1565,22 +1635,24 @@ with e:
 
 with x:
     st.subheader("🧩 Cruce por correo y personal no asignado")
-    st.caption("La PLANTILLA CONSOLIDADA es el contexto. CORREO_KEY es la única llave de identidad; el nombre, turno, supervisor y área se asocian desde la plantilla. Los registros que no empaten se concentran aquí.")
+    st.caption("El cruce intenta primero CORREO y, si falta o no coincide, usa una coincidencia conservadora por nombre. Aquí aparecen los registros que todavía no se pudieron asociar.")
     cross=cross_status.copy()
     if not cross.empty:
         cross["MANUAL"]=cross["CORREO_KEY"].map(lambda z: bool(store.get("master_overrides",{}).get(str(z))))
-    unmatched_cross=cross[(~cross["IDENTIFICADO"]) & (cross["CORREO_KEY"].astype(str).str.strip().ne(""))].copy() if not cross.empty else pd.DataFrame()
+        cross["ID_PERSONA"]=cross.apply(lambda r: str(r.get("CORREO_KEY","")).strip() or ("nombre:"+person_key(r.get("PICKER",""))),axis=1)
+    unmatched_cross=cross[~cross["IDENTIFICADO"]].copy() if not cross.empty else pd.DataFrame()
     k1,k2,k3=st.columns(3)
-    k1.metric("Correos de los 3 archivos",f"{cross['CORREO_KEY'].nunique():,}" if not cross.empty else "0")
-    k2.metric("Correos sin empatar",f"{unmatched_cross['CORREO_KEY'].nunique():,}" if not unmatched_cross.empty else "0")
+    k1.metric("Personas en los 3 archivos",f"{cross['ID_PERSONA'].nunique():,}" if not cross.empty else "0")
+    k2.metric("Registros sin empatar",f"{len(unmatched_cross):,}" if not unmatched_cross.empty else "0")
     k3.metric("Asignaciones manuales",f"{len(store.get('master_overrides',{})):,}")
     if unmatched_cross.empty:
-        st.success("✅ Todos los correos de los 3 archivos están empatados con la plantilla consolidada.")
+        st.success("✅ Todos los registros de Pickers, FNR y Mala Calidad están asociados a la plantilla.")
     else:
         view_cols=[c for c in ["FUENTE","PICKER","CORREO","TURNO","SUPERVISOR","AREA_BASE"] if c in unmatched_cross.columns]
         st.dataframe(unmatched_cross[view_cols].drop_duplicates(["FUENTE","CORREO"]),use_container_width=True,hide_index=True)
         emails=sorted([str(v) for v in unmatched_cross["CORREO_KEY"].dropna().unique() if str(v).strip()])
-        with st.expander("➕ Asignar correo manualmente",expanded=True):
+        if emails:
+          with st.expander("➕ Asignar correo manualmente",expanded=True):
             with st.form("manual_email_assignment_form",clear_on_submit=True):
                 correo_sel=st.selectbox("Correo sin asignar",emails)
                 row_opts=unmatched_cross[unmatched_cross["CORREO_KEY"]==correo_sel]
@@ -1599,6 +1671,8 @@ with x:
                     else:
                         store.setdefault("master_overrides",{})[correo_sel]={"PICKER":picker_manual.strip(),"CORREO":correo_sel,"TURNO":turno_manual,"SUPERVISOR":sup_manual,"AREA_BASE":area_manual,"FECHA":datetime.now().strftime("%Y-%m-%d %H:%M"),"ORIGEN":"Manual por correo"}
                         save_store(store); st.success("Asignación guardada por correo. El cruce la utilizará en la siguiente carga."); st.rerun()
+        else:
+            st.info("Estos registros no traen correo. Revisa que sus nombres coincidan con la plantilla; el cruce automático por nombre ya se intentó.")
     with st.expander("📋 Asignaciones manuales guardadas",expanded=False):
         manual_rows=[]
         for ek,ov in store.get("master_overrides",{}).items(): manual_rows.append({"CORREO":ov.get("CORREO",ek),"PICKER":ov.get("PICKER",""),"TURNO":ov.get("TURNO",""),"SUPERVISOR":ov.get("SUPERVISOR",""),"AREA":ov.get("AREA_BASE",""),"FECHA":ov.get("FECHA","")})
