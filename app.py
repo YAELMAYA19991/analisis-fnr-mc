@@ -100,7 +100,21 @@ def _cloud_request(method,path,data=None,content_type="application/json",missing
             return response.read()
     except urllib.error.HTTPError as exc:
         detail=exc.read().decode("utf-8","replace")[:500]
-        if missing_ok and exc.code==404: return None
+        # Supabase Storage may return HTTP 400 while its JSON body reports a
+        # missing object as statusCode 404 / code NoSuchKey. Treat that as a
+        # normal empty result for optional reads (first cloud startup, absent
+        # current upload, or missing old asset), just like a direct HTTP 404.
+        missing_resource=exc.code==404
+        if missing_ok and not missing_resource:
+            try:
+                error_body=json.loads(detail)
+                missing_resource=(
+                    str(error_body.get("statusCode",""))=="404"
+                    or error_body.get("code")=="NoSuchKey"
+                )
+            except Exception:
+                pass
+        if missing_ok and missing_resource: return None
         raise RuntimeError(f"Almacenamiento en nube respondió HTTP {exc.code}: {detail}") from exc
     except Exception as exc:
         raise RuntimeError(f"No se pudo conectar con el almacenamiento en nube: {exc}") from exc
