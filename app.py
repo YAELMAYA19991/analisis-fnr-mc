@@ -9,6 +9,7 @@ import io, re, json, os, smtplib, zipfile, urllib.request, urllib.error, urllib.
 from difflib import SequenceMatcher
 from datetime import datetime
 from email.message import EmailMessage
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -427,6 +428,7 @@ def load_store():
     return data
 
 def save_store(store):
+    ensure_persist_dir()
     tmp = STORE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f: json.dump(store, f, ensure_ascii=False, indent=2)
     os.replace(tmp, STORE_FILE)
