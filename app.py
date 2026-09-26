@@ -299,6 +299,15 @@ def email_name_tokens(value):
     s=re.sub(r"^(?:jt)?\d+[._-]*", "", s)
     return name_tokens(s.replace(".", "_"))
 
+def identity_name_tokens(value):
+    """Quita códigos del identificador y devuelve los tokens del nombre."""
+    s=str(value or "").strip()
+    if not s or s.lower() in {"nan","none","nat"}: return set()
+    if "@" in s: return email_name_tokens(s)
+    s=re.sub(r"^(?:jt)?\d+[._\-\s]*", "", s, flags=re.I)
+    s=re.sub(r"(?<![a-z0-9])(?:jt)?\d+(?![a-z0-9])", " ", s, flags=re.I)
+    return name_tokens(s.replace(".", "_"))
+
 def extract_email_address(value):
     """Extrae y normaliza el correo real aunque Excel traiga CODIGO + CORREO."""
     s=str(value or "").strip().lower()
@@ -361,20 +370,29 @@ def parse_base(df):
     em=col(df,["codigo_correo","codigo + correo","correo","email","usuario"])
     if not l:
         raise ValueError("La base necesita una columna de Total líneas / Líneas totales.")
-    # Si no hay nombre pero sí correo, el nombre se obtiene del correo como respaldo.
+    # Conservar lo que viene en PICKER como descriptor/origen. En algunas
+    # bases operativas esta columna trae código + correo, aunque CORREO no exista.
     if p:
         picker_values=df[p].fillna("").astype(str).str.strip()
     elif em:
         picker_values=df[em].fillna("").astype(str).str.strip().map(email_name_tokens).map(lambda z:" ".join(sorted(z)))
     else:
         raise ValueError("La base necesita PICKER/nombre o una columna de CORREO para identificar al personal.")
+    correo_values=df[em].fillna("").astype(str).str.strip() if em else pd.Series("",index=df.index,dtype=str)
+    correo_values=correo_values.mask(
+        correo_values.eq("") | correo_values.str.lower().isin({"nan","none","nat"}),
+        picker_values.where(
+            picker_values.map(lambda v: bool(extract_email_address(v) or extract_code(v))),
+            ""
+        )
+    )
     x=pd.DataFrame({
         "PICKER":picker_values,
         "LINEAS":pd.to_numeric(df[l],errors="coerce").fillna(0),
         "PEDIDOS":pd.to_numeric(df[ped],errors="coerce").fillna(0) if ped else 0,
         "TURNO":df[sh].fillna("").astype(str).str.strip() if sh else "No especificado",
         "AREA_BASE":df[ar].fillna("").astype(str).str.strip() if ar else "No especificada",
-        "CORREO":df[em].fillna("").astype(str).str.strip() if em else ""
+        "CORREO":correo_values
     })
     x["_KEY"]=x["PICKER"].map(person_key)
     x["_TOKEN_KEY"]=x["PICKER"].map(token_key)
@@ -440,9 +458,10 @@ def _match_master_row(value, roster, code_value=""):
     """
     if roster is None or roster.empty: return None
     value=str(value or "").strip()
-    key=person_key(value); toks=name_tokens(value)
+    toks=identity_name_tokens(value)
+    key=person_key(" ".join(sorted(toks)))
     code=extract_code(code_value) or extract_code(value)
-    email_toks=email_name_tokens(code_value)
+    email_toks=email_name_tokens(code_value) or toks
 
     # 1. Nombre exacto
     hits=roster[roster["_KEY"].astype(str)==key] if key else roster.iloc[0:0]
@@ -450,7 +469,7 @@ def _match_master_row(value, roster, code_value=""):
 
     # 2. Todas las palabras coinciden, sin importar orden
     if toks:
-        hits=roster[roster["_TOKEN_KEY"].astype(str)==token_key(value)]
+        hits=roster[roster["_TOKEN_KEY"].astype(str)=="_".join(sorted(toks))]
         if len(hits)==1: return hits.iloc[0]
 
     # 3. Código único
@@ -512,6 +531,11 @@ def apply_roster(base, roster):
     plantilla, queda como NO ASIGNADO; no se hace cruce aproximado por nombre.
     """
     if roster is None or roster.empty: return base
+    roster=roster.copy()
+    # template_roster_from_upload debe exponer esta llave, pero calcularla aquí
+    # también protege el cruce si el maestro llega desde otra ruta.
+    if "_EMAIL_KEY" not in roster.columns:
+        roster["_EMAIL_KEY"]=roster.get("CORREO",pd.Series("",index=roster.index)).map(email_key)
     x=base.copy()
     x["_SOURCE_PICKER"]=x["PICKER"].astype(str).str.strip()
     roster_email={}
@@ -523,12 +547,13 @@ def apply_roster(base, roster):
     for _,row in x.iterrows():
         ek=email_key(row.get("CORREO",""))
         if ek:
-            # El correo es la llave preferida; si falta o no está en la plantilla,
-            # intentar una coincidencia conservadora por nombre.
             rr=roster_email.get(ek)
         else:
             rr=None
-        # No asignar por parecido de nombre: solo el correo identifica de forma unívoca.
+        # Recuperar la ruta que funcionaba en la versión anterior: el correo
+        # tiene prioridad; si falta, usar la resolución conservadora por código/nombre.
+        if rr is None:
+            rr=_match_master_row(row.get("_SOURCE_PICKER",row.get("PICKER","")),roster,row.get("CORREO",""))
         matches.append(rr)
 
     out=[]
@@ -563,6 +588,26 @@ def apply_roster(base, roster):
     x.loc[x["AREA_BASE"].eq(""),"AREA_BASE"]="No especificada"
     # CORREO_KEY queda visible para que TODOS los cruces posteriores usen la misma llave.
     x["CORREO_KEY"]=x["CORREO"].map(email_key)
+    # Un mismo picker puede venir en varias filas con correo/código/nombre en
+    # formatos distintos. Agrupar después de resolverlo evita repetir FNR/MC
+    # en el resumen final.
+    x["_IDENTITY_KEY"]=x.apply(
+        lambda r: ("email:"+str(r.get("CORREO_KEY",""))) if str(r.get("CORREO_KEY"," ")).strip()
+        else ("name:"+person_key(r.get("PICKER","")) if person_key(r.get("PICKER","")) else "row:"+str(r.name)),
+        axis=1,
+    )
+    consolidated=[]
+    for _,g in x.groupby("_IDENTITY_KEY",sort=False):
+        matched=g["_MASTER_MATCH"].fillna(False).astype(bool) if "_MASTER_MATCH" in g.columns else pd.Series(False,index=g.index)
+        row=g.loc[matched].iloc[0].copy() if matched.any() else g.iloc[0].copy()
+        for field in ["LINEAS","PEDIDOS"]:
+            if field in g.columns:
+                row[field]=pd.to_numeric(g[field],errors="coerce").fillna(0).sum()
+        for field in ["_MASTER_MATCH","_MANUAL_MATCH","_EXCLUDED_PERSONNEL"]:
+            if field in g.columns:
+                row[field]=g[field].fillna(False).astype(bool).any()
+        consolidated.append(row)
+    x=pd.DataFrame(consolidated).drop(columns=["_IDENTITY_KEY"],errors="ignore")
     return x.drop(columns=["_KEY","_TOKEN_KEY","_CODE_KEY","_EMAIL_TOKENS","_MASTER_PICKER","_MASTER_TURNO","_MASTER_CORREO","_MASTER_SUPERVISOR","_MASTER_AREA"],errors="ignore")
 
 def apply_manual_personnel(base, store):
@@ -652,6 +697,8 @@ def canonicalize_incidents(inc, base):
     for _,row in out.iterrows():
         ek=email_key(row.get("CORREO",""))
         rr=base_email.get(ek) if ek else None
+        if rr is None:
+            rr=_match_master_row(row.get("PICKER",""),base,row.get("CORREO",""))
         if rr is not None:
             result.append(str(rr.get("PICKER", row.get("PICKER",""))).strip())
             canonical_email.append(str(rr.get("CORREO",row.get("CORREO",""))).strip())
@@ -739,6 +786,7 @@ def template_roster_from_upload(data):
 
     r["_KEY"]=r["PICKER"].map(person_key)
     r["_TOKEN_KEY"]=r["PICKER"].map(token_key)
+    r["_EMAIL_KEY"]=r["CORREO"].map(email_key)
     r["_CODE_KEY"]=r["CORREO"].map(extract_code)
     r["_EMAIL_TOKENS"]=r["CORREO"].map(email_name_tokens)
     return r
@@ -1389,18 +1437,17 @@ with a:
     ctx["supervisor"]=st.session_state.get("global_supervisor","Todos")
     ctx["area"]=st.session_state.get("global_area","Todos")
 
-    # La base ya trae TURNO/SUPERVISOR/AREA_BASE asignados desde la plantilla.
-    # Filtrarla por CORREO_KEY aquí podía eliminarla completa si el Excel de
-    # líneas no traía correo, aunque su contexto ya estuviera asignado.
-    # FNR/MC sí se filtran por CORREO_KEY contra la plantilla consolidada.
-    base_bodega=apply_context(base,ctx)
-    fnr_bodega=apply_context(fnr,ctx,identity_df=context_identity)
-    mc_bodega=apply_context(mc,ctx,identity_df=context_identity)
-    base_reference=context_reference(base,ctx)
-    fnr_reference=context_reference(fnr,ctx,identity_df=context_identity)
-    mc_reference=context_reference(mc,ctx,identity_df=context_identity)
-    s_bodega=summary(base_bodega,fnr_bodega,mc_bodega)
-    s_reference=summary(base_reference,fnr_reference,mc_reference)
+    # Mantener el flujo de la versión anterior que sí cargaba el contexto:
+    # primero filtra el resumen canónico desde plantilla y después aplica
+    # esos pickers a base, FNR y MC.
+    s_bodega=apply_context(s_view,ctx,identity_df=context_identity)
+    s_reference=context_reference(s_view,ctx,identity_df=context_identity)
+    base_bodega=base[base.PICKER.isin(s_bodega.PICKER)]
+    fnr_bodega=fnr[fnr.PICKER.isin(s_bodega.PICKER)]
+    mc_bodega=mc[mc.PICKER.isin(s_bodega.PICKER)]
+    base_reference=base[base.PICKER.isin(s_reference.PICKER)]
+    fnr_reference=fnr[fnr.PICKER.isin(s_reference.PICKER)]
+    mc_reference=mc[mc.PICKER.isin(s_reference.PICKER)]
     render_context_banner(ctx,s_bodega,s_reference)
 
     lines=base_bodega.LINEAS.sum(); F=fnr_bodega.INCIDENCIAS.sum(); M=mc_bodega.INCIDENCIAS.sum()
