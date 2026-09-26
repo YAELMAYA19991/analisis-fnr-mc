@@ -535,6 +535,14 @@ def email_key(value):
     if s in {"nan","none","nat"}: return ""
     return s
 
+def person_context_key(row):
+    """Llave de filtros: correo para personal registrado, nombre para Sin registrar."""
+    category=str(row.get("CATEGORIA","Picker") or "Picker").strip()
+    if category=="Sin registrar":
+        return "sin-registrar:"+(person_key(row.get("PICKER","")) or "sin-nombre")
+    ek=email_key(row.get("CORREO",""))
+    return "correo:"+ek if ek else "persona:"+(person_key(row.get("PICKER","")) or "sin-nombre")
+
 def clean(df):
     x=df.copy(); x.columns=[norm(c) for c in x.columns]; return x
 
@@ -1077,14 +1085,57 @@ def attach(inc,base):
             y.at[i,"_TEMPLATE_MATCH"]=True
             if "_EXCLUDED_PERSONNEL" in ref.columns:
                 y.at[i,"_EXCLUDED_PERSONNEL"]=bool(rr.get("_EXCLUDED_PERSONNEL",False))
+    matched=(y.get("_EMAIL_MATCH",y.get("_TEMPLATE_MATCH",pd.Series(False,index=y.index)))
+             .fillna(False).astype(bool))
+    y["CATEGORIA"]=np.where(matched,"Picker","Sin registrar")
     y.drop(columns=["_EMAIL_KEY"],errors="ignore",inplace=True)
     return y
 
 def summary(base,fnr,mc):
-    s=base.copy()
-    f=fnr.groupby("PICKER",as_index=False).INCIDENCIAS.sum().rename(columns={"INCIDENCIAS":"FNR"})
-    m=mc.groupby("PICKER",as_index=False).INCIDENCIAS.sum().rename(columns={"INCIDENCIAS":"MC"})
-    s=s.merge(f,on="PICKER",how="left").merge(m,on="PICKER",how="left")
+    keys=["CATEGORIA","PICKER"]
+    b=base.copy()
+    if "CATEGORIA" not in b:
+        matched=b.get("_MASTER_MATCH",pd.Series(False,index=b.index)).fillna(False).astype(bool)
+        manual=b.get("_MANUAL_MATCH",pd.Series(False,index=b.index)).fillna(False).astype(bool)
+        b["CATEGORIA"]=np.where(matched|manual,"Picker","Sin registrar")
+    b["PICKER"]=b.get("PICKER",pd.Series("Sin registrar",index=b.index)).fillna("").astype(str).str.strip()
+    b.loc[b["PICKER"].eq(""),"PICKER"]="Sin registrar"
+    for field in ["LINEAS","PEDIDOS"]:
+        if field not in b: b[field]=0
+
+    # Incluye personal que aparece en FNR/MC aunque no tenga registro en la base
+    # de líneas. Su tasa queda N/D cuando no existe denominador real.
+    meta=[b]
+    for inc in [fnr,mc]:
+        if inc is None or inc.empty: continue
+        q=inc.copy()
+        if "CATEGORIA" not in q:
+            matched=q.get("_EMAIL_MATCH",q.get("_TEMPLATE_MATCH",pd.Series(False,index=q.index))).fillna(False).astype(bool)
+            q["CATEGORIA"]=np.where(matched,"Picker","Sin registrar")
+        q["PICKER"]=q.get("PICKER",pd.Series("Sin registrar",index=q.index)).fillna("").astype(str).str.strip()
+        q.loc[q["PICKER"].eq(""),"PICKER"]="Sin registrar"
+        q["LINEAS"]=0.0; q["PEDIDOS"]=0.0
+        q["AREA_BASE"]=q.get("AREA_BASE",q.get("AREA",pd.Series("No especificada",index=q.index)))
+        q["SUPERVISOR"]=q.get("SUPERVISOR",q.get("SUPERVISOR_REF",pd.Series("No asignado",index=q.index)))
+        meta.append(q)
+    meta_df=pd.concat(meta,ignore_index=True,sort=False)
+    for field in ["LINEAS","PEDIDOS"]:
+        meta_df[field]=pd.to_numeric(meta_df.get(field,0),errors="coerce").fillna(0)
+    metadata_fields=[c for c in ["TURNO","SUPERVISOR","AREA_BASE","CORREO"] if c in meta_df.columns]
+    agg={"LINEAS":"sum","PEDIDOS":"sum"}
+    agg.update({c:lambda values: next((str(v).strip() for v in values if str(v).strip() and str(v).strip().lower() not in {"nan","none"}),"") for c in metadata_fields})
+    for flag in ["_EXCLUDED_PERSONNEL","_MASTER_MATCH","_MANUAL_MATCH"]:
+        if flag in meta_df.columns:
+            meta_df[flag]=meta_df[flag].astype("boolean").fillna(False).astype(bool)
+            agg[flag]="any"
+    if "_SOURCE_PICKER" in meta_df.columns:
+        agg["_SOURCE_PICKER"]=lambda values: next((str(v).strip() for v in values if str(v).strip() and str(v).strip().lower() not in {"nan","none"}),"")
+    s=meta_df.groupby(keys,as_index=False,dropna=False).agg(agg)
+    f=(fnr.groupby(keys,as_index=False,dropna=False).INCIDENCIAS.sum().rename(columns={"INCIDENCIAS":"FNR"})
+       if fnr is not None and not fnr.empty else pd.DataFrame(columns=keys+["FNR"]))
+    m=(mc.groupby(keys,as_index=False,dropna=False).INCIDENCIAS.sum().rename(columns={"INCIDENCIAS":"MC"})
+       if mc is not None and not mc.empty else pd.DataFrame(columns=keys+["MC"]))
+    s=s.merge(f,on=keys,how="outer").merge(m,on=keys,how="outer")
     s[["FNR","MC"]]=s[["FNR","MC"]].fillna(0)
     # Asegurar columnas numéricas y evitar pd.NA + round() incompatibles con algunas versiones de pandas
     s["LINEAS"]=pd.to_numeric(s["LINEAS"],errors="coerce").fillna(0.0)
@@ -1385,6 +1436,9 @@ try:
         raise ValueError("La plantilla consolidada no contiene correos válidos.")
     base=apply_roster(base,roster)
     base=apply_manual_personnel(base,store)
+    _base_match=(base.get("_MASTER_MATCH",pd.Series(False,index=base.index)).fillna(False).astype(bool)
+                 | base.get("_MANUAL_MATCH",pd.Series(False,index=base.index)).fillna(False).astype(bool))
+    base["CATEGORIA"]=np.where(_base_match,"Picker","Sin registrar")
     base=_dedupe_columns(base)
     roster=effective_roster(roster,store)
     # FNR/MC se identifican directamente contra la PLANTILLA por correo.
@@ -1410,7 +1464,7 @@ s=summary(base,fnr,mc)
 # se concentra en la pestaña 🧩 Correos / Cruce para asignación manual.
 def _cross_frame(df, fuente):
     if df is None or df.empty:
-        return pd.DataFrame(columns=["FUENTE","PICKER","CORREO","CORREO_KEY","TURNO","SUPERVISOR","AREA_BASE","IDENTIFICADO"])
+        return pd.DataFrame(columns=["FUENTE","CATEGORIA","PICKER","CORREO","CORREO_KEY","TURNO","SUPERVISOR","AREA_BASE","IDENTIFICADO"])
     y=df.copy()
     y["CORREO_KEY"]=y.get("CORREO",pd.Series("",index=y.index)).map(email_key)
     if fuente=="Pickers / Líneas":
@@ -1421,6 +1475,7 @@ def _cross_frame(df, fuente):
         area=y.get("AREA_REF",y.get("AREA",pd.Series("",index=y.index)))
     out=pd.DataFrame({
         "FUENTE":fuente,
+        "CATEGORIA":y.get("CATEGORIA",pd.Series("Picker",index=y.index)).astype(str).str.strip(),
         "PICKER":y.get("PICKER",pd.Series("",index=y.index)).astype(str).str.strip(),
         "CORREO":y.get("CORREO",pd.Series("",index=y.index)).astype(str).str.strip(),
         "CORREO_KEY":y["CORREO_KEY"],
@@ -1456,7 +1511,7 @@ if roster is not None:
         st.success(f"Personal identificado: {matched}/{total}")
         st.caption(f"Turnos asignados: {matched_turn}/{total} · Excluidos: {int(excluded_series.sum())}")
         if unmatched:
-            st.caption(f"{unmatched} picker(s) sin coincidencia en el maestro.")
+            st.caption(f"{unmatched} registro(s) en la categoría Sin registrar.")
         email_match=int(base.get("_MASTER_MATCH",pd.Series(False,index=base.index)).fillna(False).astype(bool).sum())
         st.caption(f"🔑 Cruce de identidad: CORREO primero · {email_match} registros identificados")
 
@@ -1520,14 +1575,16 @@ def global_context(df):
     if ctx.get("area") not in areas: ctx["area"]="Todos"
     return ctx,turns,sups,areas
 
-def _context_identity_view(roster):
-    """Universo de contexto GLOBAL tomado directamente de la plantilla consolidada.
+def _context_identity_view(roster,base=None,fnr=None,mc=None):
+    """Universo de contexto: plantilla consolidada más personal Sin registrar.
 
-    CORREO_KEY es la llave; PICKER/nombre solo es el nombre asociado que se muestra.
+    El correo identifica al personal registrado; el nombre normalizado identifica
+    por separado a quienes no están en la plantilla.
     """
     if roster is None or roster.empty:
-        return pd.DataFrame(columns=["PICKER","TURNO","SUPERVISOR","AREA_BASE","CORREO","CORREO_KEY"])
-    r=roster.copy()
+        r=pd.DataFrame(columns=["PICKER","TURNO","SUPERVISOR","AREA_BASE","CORREO","CORREO_KEY","_CONTEXT_KEY","CATEGORIA"])
+    else:
+        r=roster.copy()
     r["PICKER"]=r.get("PICKER",pd.Series("",index=r.index)).fillna("").astype(str).str.strip()
     r["TURNO"]=r.get("TURNO_MAESTRO",pd.Series("",index=r.index)).fillna("").astype(str).str.strip()
     r["SUPERVISOR"]=r.get("SUPERVISOR",pd.Series("",index=r.index)).fillna("").astype(str).str.strip()
@@ -1538,7 +1595,28 @@ def _context_identity_view(roster):
     r.loc[r["TURNO"].eq(""),"TURNO"]="No especificado"
     r.loc[r["SUPERVISOR"].eq(""),"SUPERVISOR"]="No asignado"
     r.loc[r["AREA_BASE"].eq(""),"AREA_BASE"]="No especificada"
-    return r.drop_duplicates("CORREO_KEY",keep="last")
+    r["CATEGORIA"]="Picker"
+    r["_CONTEXT_KEY"]=r["CORREO_KEY"].map(lambda z:"correo:"+str(z))
+    r=r[r["CORREO_KEY"].ne("")].copy()
+    extra=[]
+    for source in [base,fnr,mc]:
+        if source is None or source.empty: continue
+        q=source.copy()
+        if "CATEGORIA" not in q: continue
+        q=q[q["CATEGORIA"].astype(str).eq("Sin registrar")]
+        for _,row in q.iterrows():
+            name=str(row.get("PICKER","") or "").strip() or "Sin registrar"
+            extra.append({
+                "PICKER":name,
+                "TURNO":str(row.get("TURNO",row.get("TURNO_REF","No especificado")) or "No especificado").strip(),
+                "SUPERVISOR":str(row.get("SUPERVISOR",row.get("SUPERVISOR_REF","No asignado")) or "No asignado").strip(),
+                "AREA_BASE":str(row.get("AREA_BASE",row.get("AREA_REF",row.get("AREA","No especificada"))) or "No especificada").strip(),
+                "CORREO":"","CORREO_KEY":"","CATEGORIA":"Sin registrar",
+                "_CONTEXT_KEY":"sin-registrar:"+(person_key(name) or "sin-nombre"),
+            })
+    if extra:
+        r=pd.concat([r,pd.DataFrame(extra)],ignore_index=True,sort=False)
+    return r.drop_duplicates("_CONTEXT_KEY",keep="last")
 
 def _records_for_context(df, ctx, identity_df, include_turn=True):
     """Filtra cualquier dataset operativo usando los CORREO_KEY seleccionados en plantilla."""
@@ -1551,10 +1629,13 @@ def _records_for_context(df, ctx, identity_df, include_turn=True):
         ctx.get("supervisor","Todos"),
         ctx.get("area","Todos"),
     )
-    keys=set(ids["CORREO_KEY"].astype(str)) if "CORREO_KEY" in ids.columns else set()
     out=df.copy()
-    out["CORREO_KEY"]=out.get("CORREO",pd.Series("",index=out.index)).map(email_key)
-    return out[out["CORREO_KEY"].isin(keys)].copy()
+    ids=ids.copy()
+    if "_CONTEXT_KEY" not in ids:
+        ids["_CONTEXT_KEY"]=ids.apply(person_context_key,axis=1)
+    keys=set(ids["_CONTEXT_KEY"].astype(str))
+    out["_CONTEXT_KEY"]=out.apply(person_context_key,axis=1)
+    return out[out["_CONTEXT_KEY"].isin(keys)].copy()
 
 def apply_context(df, ctx, include_turn=True, identity_df=None):
     if identity_df is not None:
@@ -1562,6 +1643,16 @@ def apply_context(df, ctx, include_turn=True, identity_df=None):
     return apply_person_filters(
         df,"Todos",ctx.get("turno","Todos") if include_turn else "Todos",
         ctx.get("supervisor","Todos"),ctx.get("area","Todos"))
+
+def select_summary_people(df,summary_df):
+    """Filtra por categoría y nombre para conservar aparte Sin registrar."""
+    if df is None or df.empty or summary_df is None or summary_df.empty:
+        return df.iloc[0:0].copy() if isinstance(df,pd.DataFrame) else pd.DataFrame()
+    if "CATEGORIA" not in df.columns or "CATEGORIA" not in summary_df.columns:
+        return df[df["PICKER"].isin(summary_df["PICKER"])].copy()
+    allowed=set(zip(summary_df["CATEGORIA"].astype(str),summary_df["PICKER"].astype(str)))
+    mask=df.apply(lambda r:(str(r.get("CATEGORIA","Picker")),str(r.get("PICKER",""))) in allowed,axis=1)
+    return df.loc[mask].copy()
 
 def context_reference(df, ctx, identity_df=None):
     """Base de comparación: supervisor/área de la plantilla, todos los turnos."""
@@ -1575,12 +1666,14 @@ def render_context_banner(ctx, selected_df, reference_df, label="Contexto de an�
         v=ctx.get(k,"Todos")
         if v!="Todos": parts.append(f"{lab}: {v}")
     scope=" · ".join(parts) if parts else "Todos los turnos"
-    sel_p=len(selected_df)
-    ref_p=len(reference_df)
+    sel_p=int(selected_df.get("CATEGORIA",pd.Series("Picker",index=selected_df.index)).astype(str).eq("Picker").sum())
+    sel_u=int(selected_df.get("CATEGORIA",pd.Series("Picker",index=selected_df.index)).astype(str).eq("Sin registrar").sum())
+    ref_p=int(reference_df.get("CATEGORIA",pd.Series("Picker",index=reference_df.index)).astype(str).eq("Picker").sum())
     pct=(sel_p/ref_p*100) if ref_p else 0
+    count_text=f"{sel_p:,} pickers · {sel_u:,} sin registrar" if sel_u else f"{sel_p:,} pickers"
     st.markdown(
         f"<div class='context-banner'><div class='context-title'>🎯 {label}: {scope}</div>"
-        f"<div class='context-detail'>{sel_p:,} pickers · {pct:.1f}% del universo de comparación · Las demás pestañas utilizan este mismo contexto.</div></div>",
+        f"<div class='context-detail'>{count_text} · {pct:.1f}% del universo de comparación · Las demás pestañas utilizan este mismo contexto.</div></div>",
         unsafe_allow_html=True)
 
 def render_soft_kpis(cards):
@@ -1622,16 +1715,16 @@ if len(excluded_mask)==len(s_view):
 
 # El CONTEXTO GLOBAL sale de la PLANTILLA CONSOLIDADA, no del nombre del Excel operativo.
 # Cada pestaña después filtra sus propios registros por CORREO_KEY.
-context_identity=_context_identity_view(roster)
+context_identity=_context_identity_view(roster,base,fnr,mc)
 
 # Defaults para pestañas que no necesitan filtros globales.
 sp="Todos"
 stn="Todos"
 ssup="Todos"
 sar="Todos"
-base_view=base[base.PICKER.isin(s_view.PICKER)]
-fnr_view=fnr[fnr.PICKER.isin(s_view.PICKER)]
-mc_view=mc[mc.PICKER.isin(s_view.PICKER)]
+base_view=select_summary_people(base,s_view)
+fnr_view=select_summary_people(fnr,s_view)
+mc_view=select_summary_people(mc,s_view)
 
 a,b,e,x,g,h,f,j=st.tabs(["🏠 Bodega","👤 Picker","🌙 Turnos / Áreas","🧩 Correos / Cruce","👥 Supervisores","🛡️ Seguimiento","📥 Exportar","📌 Pendientes & Procesos"])
 
@@ -1664,25 +1757,28 @@ with a:
     # esos pickers a base, FNR y MC.
     s_bodega=apply_context(s_view,ctx,identity_df=context_identity)
     s_reference=context_reference(s_view,ctx,identity_df=context_identity)
-    base_bodega=base[base.PICKER.isin(s_bodega.PICKER)]
-    fnr_bodega=fnr[fnr.PICKER.isin(s_bodega.PICKER)]
-    mc_bodega=mc[mc.PICKER.isin(s_bodega.PICKER)]
-    base_reference=base[base.PICKER.isin(s_reference.PICKER)]
-    fnr_reference=fnr[fnr.PICKER.isin(s_reference.PICKER)]
-    mc_reference=mc[mc.PICKER.isin(s_reference.PICKER)]
+    base_bodega=select_summary_people(base,s_bodega)
+    fnr_bodega=select_summary_people(fnr,s_bodega)
+    mc_bodega=select_summary_people(mc,s_bodega)
+    base_reference=select_summary_people(base,s_reference)
+    fnr_reference=select_summary_people(fnr,s_reference)
+    mc_reference=select_summary_people(mc,s_reference)
     render_context_banner(ctx,s_bodega,s_reference)
 
     lines=base_bodega.LINEAS.sum(); F=fnr_bodega.INCIDENCIAS.sum(); M=mc_bodega.INCIDENCIAS.sum()
     total_pedidos,fnr_pedidos,mc_pedidos,fnr_rate,mc_rate=monthly_kpis(base_bodega,fnr_bodega,mc_bodega)
+    _picker_count=int(s_bodega.get("CATEGORIA",pd.Series("Picker",index=s_bodega.index)).astype(str).eq("Picker").sum())
+    _unregistered_count=int(s_bodega.get("CATEGORIA",pd.Series("Picker",index=s_bodega.index)).astype(str).eq("Sin registrar").sum())
+    _reference_picker_count=int(s_reference.get("CATEGORIA",pd.Series("Picker",index=s_reference.index)).astype(str).eq("Picker").sum())
     render_soft_kpis([
         ("Líneas",f"{lines:,.0f}",f"{lines/base_reference.LINEAS.sum()*100:.1f}% del universo" if base_reference.LINEAS.sum() else "Sin referencia","blue"),
         ("Pedidos",f"{total_pedidos:,.0f}",f"{total_pedidos/base_reference.PEDIDOS.sum()*100:.1f}% del universo" if base_reference.PEDIDOS.sum() else "Sin referencia","green"),
-        ("Pickers",f"{len(s_bodega):,}",f"{len(s_bodega)/len(s_reference)*100:.1f}% del universo" if len(s_reference) else "Sin referencia","blue"),
+        ("Pickers",f"{_picker_count:,}",f"{_picker_count/_reference_picker_count*100:.1f}% del universo · {_unregistered_count:,} sin registrar" if _reference_picker_count else f"{_unregistered_count:,} sin registrar","blue"),
     ])
     render_soft_kpis([
         ("FNR mensual",f"{fnr_rate:.2f}%" if fnr_rate is not None else "N/D","Objetivo < 1.50%","red"),
         ("MC mensual",f"{mc_rate:.2f}%" if mc_rate is not None else "N/D","Objetivo < 1.00%","amber"),
-        ("Fuera objetivo",f"{int((s_bodega.ESTADO=="🔴 FUERA DE OBJETIVO").sum()):,}",f"de {len(s_bodega):,} pickers","red"),
+        ("Fuera objetivo",f"{int(((s_bodega.ESTADO=="🔴 FUERA DE OBJETIVO") & s_bodega.CATEGORIA.eq("Picker")).sum()):,}",f"de {_picker_count:,} pickers · {_unregistered_count:,} sin registrar","red"),
     ])
     if fnr_rate is not None and mc_rate is not None:
         st.caption(f"KPI mensual del contexto: {fnr_pedidos:,} pedidos con FNR / {total_pedidos:,} pedidos = {fnr_rate:.2f}% · {mc_pedidos:,} pedidos con MC / {total_pedidos:,} pedidos = {mc_rate:.2f}%")
@@ -1724,7 +1820,7 @@ with b:
     st.subheader("👤 Ficha de picker")
     st.caption("El turno, supervisor y área se heredan del contexto elegido en Bodega. Aquí solo buscas el picker.")
     render_context_banner(ctx,selected_context,context_reference(s_view,ctx,identity_df=context_identity),"Contexto heredado")
-    names=person_options(selected_context)
+    names=person_options(selected_context[selected_context.get("CATEGORIA",pd.Series("Picker",index=selected_context.index)).astype(str).eq("Picker")])
     with st.container(border=True):
         search=st.text_input("🔎 Buscar picker",placeholder="Escribe parte del nombre…",key="picker_page_search")
         filtered_names=names
@@ -1879,12 +1975,12 @@ with e:
     selected=apply_context(s_view,ctx,identity_df=context_identity)
     reference=context_reference(s_view,ctx,identity_df=context_identity)
     render_context_banner(ctx,selected,reference,"Contexto heredado")
-    bsel=base[base.PICKER.isin(selected.PICKER)]
-    fsel=fnr[fnr.PICKER.isin(selected.PICKER)]
-    msel=mc[mc.PICKER.isin(selected.PICKER)]
-    bref=base[base.PICKER.isin(reference.PICKER)]
-    fref=fnr[fnr.PICKER.isin(reference.PICKER)]
-    mref=mc[mc.PICKER.isin(reference.PICKER)]
+    bsel=select_summary_people(base,selected)
+    fsel=select_summary_people(fnr,selected)
+    msel=select_summary_people(mc,selected)
+    bref=select_summary_people(base,reference)
+    fref=select_summary_people(fnr,reference)
+    mref=select_summary_people(mc,reference)
     render_turn_comparison(bsel,bref,fsel,fref,msel,mref)
     st.subheader("FNR por turno")
     st.dataframe(groups(fsel,bsel,"TURNO"),use_container_width=True,hide_index=True)
@@ -1898,7 +1994,7 @@ with e:
 
 with x:
     st.subheader("🧩 Cruce por correo y personal no asignado")
-    st.caption("El cruce intenta primero CORREO y, si falta o no coincide, usa una coincidencia conservadora por nombre. Aquí aparecen los registros que todavía no se pudieron asociar.")
+    st.caption("El cruce intenta primero CORREO y, si falta o no coincide, usa una coincidencia conservadora por nombre. El personal que no aparece en la plantilla se conserva en resultados como Sin registrar.")
     cross=cross_status.copy()
     if not cross.empty:
         cross["MANUAL"]=cross["CORREO_KEY"].map(lambda z: bool(store.get("master_overrides",{}).get(str(z))))
@@ -1983,6 +2079,7 @@ with h:
     st.caption("Vista consolidada de todos los pickers: retroalimentaciones, seguimientos, actas y tolerancias. Filtra y ordena para ver rápidamente dónde hay más seguimiento.")
     ctx,_,_,_=global_context(context_identity)
     selected_context=apply_context(s_view,ctx,identity_df=context_identity)
+    selected_context=selected_context[selected_context.get("CATEGORIA",pd.Series("Picker",index=selected_context.index)).astype(str).eq("Picker")].copy()
     render_context_banner(ctx,selected_context,context_reference(s_view,ctx,identity_df=context_identity),"Contexto heredado")
 
     all_rows=[]
