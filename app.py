@@ -1061,7 +1061,7 @@ if excluded:
     fnr=fnr[~fnr.ORDER_NUMBER.isin(excluded)].copy()
     mc=mc[~mc.ORDER_NUMBER.isin(excluded)].copy()
 # Para FNR/MC, el contexto de turno/área/supervisor viene de la plantilla por correo.
-identity_for_attach=context_identity if 'context_identity' in globals() else _context_identity_view(roster)
+identity_for_attach=roster.rename(columns={"TURNO_MAESTRO":"TURNO","AREA_MAESTRO":"AREA_BASE"}).copy()
 fnr=attach(fnr,identity_for_attach); mc=attach(mc,identity_for_attach)
 fnr["CORREO_KEY"]=fnr.get("CORREO",pd.Series("",index=fnr.index)).map(email_key)
 mc["CORREO_KEY"]=mc.get("CORREO",pd.Series("",index=mc.index)).map(email_key)
