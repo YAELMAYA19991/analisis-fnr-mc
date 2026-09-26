@@ -1389,14 +1389,17 @@ with a:
     ctx["supervisor"]=st.session_state.get("global_supervisor","Todos")
     ctx["area"]=st.session_state.get("global_area","Todos")
 
-    s_bodega=apply_context(s_view,ctx,identity_df=context_identity)
-    s_reference=context_reference(s_view,ctx,identity_df=context_identity)
-    base_bodega=base[base.PICKER.isin(s_bodega.PICKER)]
-    fnr_bodega=fnr[fnr.PICKER.isin(s_bodega.PICKER)]
-    mc_bodega=mc[mc.PICKER.isin(s_bodega.PICKER)]
-    base_reference=base[base.PICKER.isin(s_reference.PICKER)]
-    fnr_reference=fnr[fnr.PICKER.isin(s_reference.PICKER)]
-    mc_reference=mc[mc.PICKER.isin(s_reference.PICKER)]
+    # Aplicar el mismo contexto por CORREO_KEY a cada fuente. Filtrar FNR/MC
+    # usando los nombres del resumen podía dejar Artículos y Pedidos vacíos
+    # cuando el nombre operativo difería del canónico de la plantilla.
+    base_bodega=apply_context(base,ctx,identity_df=context_identity)
+    fnr_bodega=apply_context(fnr,ctx,identity_df=context_identity)
+    mc_bodega=apply_context(mc,ctx,identity_df=context_identity)
+    base_reference=context_reference(base,ctx,identity_df=context_identity)
+    fnr_reference=context_reference(fnr,ctx,identity_df=context_identity)
+    mc_reference=context_reference(mc,ctx,identity_df=context_identity)
+    s_bodega=summary(base_bodega,fnr_bodega,mc_bodega)
+    s_reference=summary(base_reference,fnr_reference,mc_reference)
     render_context_banner(ctx,s_bodega,s_reference)
 
     lines=base_bodega.LINEAS.sum(); F=fnr_bodega.INCIDENCIAS.sum(); M=mc_bodega.INCIDENCIAS.sum()
