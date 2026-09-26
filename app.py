@@ -5,7 +5,7 @@
 # ================================================================
 
 
-import io, re, json, os, smtplib, zipfile
+import io, re, json, os, smtplib, zipfile, urllib.request, urllib.error, urllib.parse
 from difflib import SequenceMatcher
 from datetime import datetime
 from email.message import EmailMessage
@@ -69,12 +69,80 @@ PERSIST_FILES = {
     "detalle_mc": os.path.join(PERSIST_DIR, "detalle_mc.xlsx"),
     "plantilla_personal": os.path.join(PERSIST_DIR, "master_pickers.xlsx"),
 }
+CLOUD_STORE_KEY="state/picker_seguimiento.json"
+_CLOUD_BUCKET_CHECKED=False
+
+def cloud_config():
+    """Credenciales de Supabase Storage desde secrets o variables de entorno."""
+    url=_secret("SUPABASE_URL").strip().rstrip("/")
+    key=_secret("SUPABASE_SERVICE_ROLE_KEY").strip()
+    bucket=_secret("SUPABASE_STORAGE_BUCKET","control-fnr-mc").strip() or "control-fnr-mc"
+    return url,key,bucket
+
+def cloud_enabled():
+    url,key,_=cloud_config()
+    return bool(url and key)
+
+def _cloud_request(method,path,data=None,content_type="application/json",missing_ok=False,extra_headers=None):
+    url,key,_=cloud_config()
+    if not url or not key:
+        raise RuntimeError("Falta configurar SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY.")
+    request=urllib.request.Request(url+path,data=data,method=method)
+    request.add_header("apikey",key)
+    request.add_header("Authorization",f"Bearer {key}")
+    if content_type: request.add_header("Content-Type",content_type)
+    for name,value in (extra_headers or {}).items(): request.add_header(name,value)
+    try:
+        with urllib.request.urlopen(request,timeout=30) as response:
+            return response.read()
+    except urllib.error.HTTPError as exc:
+        detail=exc.read().decode("utf-8","replace")[:500]
+        if missing_ok and exc.code==404: return None
+        raise RuntimeError(f"Almacenamiento en nube respondió HTTP {exc.code}: {detail}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"No se pudo conectar con el almacenamiento en nube: {exc}") from exc
+
+def _cloud_ensure_bucket():
+    global _CLOUD_BUCKET_CHECKED
+    if _CLOUD_BUCKET_CHECKED or not cloud_enabled(): return
+    _,_,bucket=cloud_config()
+    bucket_path=urllib.parse.quote(bucket,safe="")
+    found=_cloud_request("GET",f"/storage/v1/bucket/{bucket_path}",missing_ok=True)
+    if found is None:
+        _cloud_request("POST","/storage/v1/bucket",json.dumps({"id":bucket,"name":bucket,"public":False}).encode("utf-8"))
+    _CLOUD_BUCKET_CHECKED=True
+
+def cloud_upload(key,data,content_type="application/octet-stream"):
+    """Guarda un objeto en el bucket privado con reemplazo idempotente."""
+    _cloud_ensure_bucket()
+    _,_,bucket=cloud_config()
+    bucket_path=urllib.parse.quote(bucket,safe="")
+    object_path=urllib.parse.quote(str(key).lstrip("/"),safe="/")
+    return _cloud_request("POST",f"/storage/v1/object/{bucket_path}/{object_path}",bytes(data),content_type,
+                          extra_headers={"x-upsert":"true","cache-control":"no-store"})
+
+def cloud_download(key,missing_ok=True):
+    if not cloud_enabled(): return None
+    _cloud_ensure_bucket()
+    _,_,bucket=cloud_config()
+    bucket_path=urllib.parse.quote(bucket,safe="")
+    object_path=urllib.parse.quote(str(key).lstrip("/"),safe="/")
+    return _cloud_request("GET",f"/storage/v1/object/authenticated/{bucket_path}/{object_path}",missing_ok=missing_ok)
+
+def cloud_list(prefix,limit=1000):
+    if not cloud_enabled(): return []
+    _cloud_ensure_bucket()
+    _,_,bucket=cloud_config()
+    body=json.dumps({"prefix":str(prefix).strip("/"),"limit":int(limit),"offset":0,"sortBy":{"column":"name","order":"desc"}}).encode("utf-8")
+    raw=_cloud_request("POST",f"/storage/v1/object/list/{urllib.parse.quote(bucket,safe='')}",body)
+    try: return json.loads(raw.decode("utf-8"))
+    except Exception as exc: raise RuntimeError("La nube devolvió una respuesta de historial inválida.") from exc
 
 def ensure_persist_dir():
     os.makedirs(PERSIST_DIR, exist_ok=True)
 
 def persist_upload(upload, key):
-    """Guarda el Excel actual y una copia versionada para el historial local."""
+    """Guarda el Excel actual y una copia versionada local y en la nube."""
     if upload is None:
         return None
     ensure_persist_dir()
@@ -82,28 +150,49 @@ def persist_upload(upload, key):
     data=upload.getvalue()
     history_dir=os.path.join(UPLOAD_HISTORY_DIR,key)
     os.makedirs(history_dir,exist_ok=True)
-    prior=sorted([os.path.join(history_dir,n) for n in os.listdir(history_dir) if os.path.isfile(os.path.join(history_dir,n))])
-    same_as_latest=False
-    if prior:
-        try:
-            with open(prior[-1],"rb") as f: same_as_latest=(f.read()==data)
-        except Exception: pass
-    if not same_as_latest:
+    current_key=f"uploads/current/{key}.xlsx"
+    if cloud_enabled():
+        cloud_prior=cloud_download(current_key,missing_ok=True)
+        changed=cloud_prior!=data
+    else:
+        prior=sorted([os.path.join(history_dir,n) for n in os.listdir(history_dir) if os.path.isfile(os.path.join(history_dir,n))])
+        same_as_latest=False
+        if prior:
+            try:
+                with open(prior[-1],"rb") as f: same_as_latest=(f.read()==data)
+            except Exception: pass
+        changed=not same_as_latest
+    if changed:
         stamp=datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         safe=re.sub(r"[^A-Za-z0-9._-]+","_",os.path.basename(str(getattr(upload,"name","archivo.xlsx"))))[:100]
         hist_path=os.path.join(history_dir,f"{stamp}_{safe or 'archivo.xlsx'}")
         with open(hist_path,"wb") as f: f.write(data)
+        if cloud_enabled():
+            cloud_upload(f"upload_history/{key}/{os.path.basename(hist_path)}",data,"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         saved=sorted([os.path.join(history_dir,n) for n in os.listdir(history_dir) if os.path.isfile(os.path.join(history_dir,n))])
         for old in saved[:-MAX_UPLOAD_HISTORY]:
             try: os.remove(old)
             except OSError: pass
     with open(path, "wb") as f:
         f.write(data)
+    if cloud_enabled():
+        cloud_upload(current_key,data,"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    if changed:
+        try: upload_history_zip.clear()
+        except Exception: pass
     return io.BytesIO(data)
 
 def upload_history_rows():
     rows=[]
     labels={"base_picker":"Base de Pickers / Líneas","detalle_fnr":"Detalle FNR","detalle_mc":"Detalle Mala Calidad","plantilla_personal":"Plantilla consolidada"}
+    if cloud_enabled():
+        for key,label in labels.items():
+            for item in cloud_list(f"upload_history/{key}",MAX_UPLOAD_HISTORY+5):
+                name=str(item.get("name","")).strip()
+                if not name or item.get("id") is None: continue
+                meta=item.get("metadata") or {}
+                rows.append({"Archivo":label,"Versión":name,"Fecha de carga":str(item.get("updated_at") or item.get("created_at") or ""),"Tamaño (MB)":round(float(meta.get("size",0) or 0)/1048576,2)})
+        return rows
     if not os.path.isdir(UPLOAD_HISTORY_DIR): return rows
     for key,label in labels.items():
         folder=os.path.join(UPLOAD_HISTORY_DIR,key)
@@ -116,10 +205,20 @@ def upload_history_rows():
             except OSError: pass
     return rows
 
+@st.cache_data(show_spinner=False,max_entries=1,ttl=300)
 def upload_history_zip():
     out=io.BytesIO()
     with zipfile.ZipFile(out,"w",compression=zipfile.ZIP_DEFLATED) as zf:
-        if os.path.isdir(UPLOAD_HISTORY_DIR):
+        if cloud_enabled():
+            for key in ["base_picker","detalle_fnr","detalle_mc","plantilla_personal"]:
+                prefix=f"upload_history/{key}"
+                for item in cloud_list(prefix,MAX_UPLOAD_HISTORY+5):
+                    name=str(item.get("name","")).strip()
+                    if not name or item.get("id") is None: continue
+                    object_key=f"{prefix}/{name}"
+                    data=cloud_download(object_key,missing_ok=True)
+                    if data is not None: zf.writestr(f"{key}/{name}",data)
+        elif os.path.isdir(UPLOAD_HISTORY_DIR):
             for root,_,files in os.walk(UPLOAD_HISTORY_DIR):
                 for name in files:
                     path=os.path.join(root,name)
@@ -129,6 +228,12 @@ def upload_history_zip():
 def load_persisted_upload(key):
     """Recupera el último Excel guardado cuando el uploader está vacío."""
     path=PERSIST_FILES[key]
+    if cloud_enabled():
+        data=cloud_download(f"uploads/current/{key}.xlsx",missing_ok=True)
+        if data is not None:
+            ensure_persist_dir()
+            with open(path,"wb") as f: f.write(data)
+            return io.BytesIO(data)
     if not os.path.exists(path):
         return None
     try:
@@ -136,12 +241,38 @@ def load_persisted_upload(key):
             data=f.read()
         if not data:
             return None
+        if cloud_enabled():
+            cloud_upload(f"uploads/current/{key}.xlsx",data,"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         return io.BytesIO(data)
     except Exception:
         return None
 
 def persisted_status():
-    return {k: os.path.exists(v) and os.path.getsize(v) > 0 for k,v in PERSIST_FILES.items()}
+    status={k: os.path.exists(v) and os.path.getsize(v)>0 for k,v in PERSIST_FILES.items()}
+    if cloud_enabled():
+        remote={str(item.get("name","")) for item in cloud_list("uploads/current",20) if item.get("id") is not None}
+        status={k:(f"{k}.xlsx" in remote) or status[k] for k in status}
+    return status
+
+def migrate_local_upload_history_to_cloud():
+    """Copia al bucket versiones de Excel que solo existan en disco local."""
+    if not cloud_enabled() or not os.path.isdir(UPLOAD_HISTORY_DIR): return 0
+    moved=0
+    for key in ["base_picker","detalle_fnr","detalle_mc","plantilla_personal"]:
+        folder=os.path.join(UPLOAD_HISTORY_DIR,key)
+        if not os.path.isdir(folder): continue
+        prefix=f"upload_history/{key}"
+        existing={str(x.get("name","")) for x in cloud_list(prefix,MAX_UPLOAD_HISTORY+10) if x.get("id") is not None}
+        for name in os.listdir(folder):
+            path=os.path.join(folder,name)
+            if not os.path.isfile(path) or name in existing: continue
+            with open(path,"rb") as f: data=f.read()
+            cloud_upload(f"{prefix}/{name}",data,"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            moved+=1
+    if moved:
+        try: upload_history_zip.clear()
+        except Exception: pass
+    return moved
 
 def _safe_filename(name):
     base=os.path.basename(str(name or "imagen"))
@@ -152,13 +283,25 @@ def save_process_image(data, process_id, filename):
     ensure_persist_dir()
     folder=os.path.join(PERSIST_DIR,"process_images",str(process_id))
     os.makedirs(folder, exist_ok=True)
-    path=os.path.join(folder,_safe_filename(filename))
+    safe=_safe_filename(filename)
+    path=os.path.join(folder,safe)
     with open(path,"wb") as f: f.write(data)
+    if cloud_enabled():
+        key=f"process_images/{_safe_filename(process_id)}/{safe}"
+        cloud_upload(key,data,"image/"+(safe.rsplit(".",1)[-1].lower() if "." in safe else "jpeg"))
+        return "cloud://"+key
     return path
 
 def load_process_images(process):
     result=[]
     for path in process.get("imagenes",[]):
+        if str(path).startswith("cloud://"):
+            key=str(path)[len("cloud://"):]
+            try:
+                data=cloud_download(key,missing_ok=True)
+                if data is not None: result.append((os.path.basename(key),data))
+            except Exception: pass
+            continue
         if os.path.exists(path):
             try:
                 with open(path,"rb") as f: result.append((path, f.read()))
@@ -177,10 +320,17 @@ def save_followup_pdf(data, picker, filename):
     safe=_safe_filename(filename)
     path=os.path.join(folder, safe)
     with open(path, "wb") as f: f.write(data)
+    if cloud_enabled():
+        key=f"seguimiento_pdfs/{person_key(picker) or 'picker'}/{doc_id}/{safe}"
+        cloud_upload(key,data,"application/pdf")
+        return "cloud://"+key, doc_id
     return path, doc_id
 
 def load_followup_pdf(doc):
     path=str(doc.get("path", ""))
+    if path.startswith("cloud://"):
+        try: return cloud_download(path[len("cloud://"):],missing_ok=True)
+        except Exception: return None
     if not path or not os.path.exists(path):
         return None
     try:
@@ -188,9 +338,51 @@ def load_followup_pdf(doc):
     except Exception:
         return None
 
+def migrate_local_assets_to_cloud(store):
+    """Migra PDFs e imágenes existentes al bucket y actualiza sus referencias."""
+    if not cloud_enabled(): return 0,0
+    moved=0; missing=0; changed=False
+    def migrate(path,kind):
+        nonlocal moved,missing,changed
+        path=str(path or "")
+        if not path or path.startswith("cloud://"): return path
+        if not os.path.isfile(path):
+            missing+=1
+            return path
+        try:
+            relative=os.path.relpath(path,PERSIST_DIR).replace(os.sep,"/")
+            if relative.startswith("../") or relative=="..": relative=f"legacy/{kind}/{_safe_filename(os.path.basename(path))}"
+            with open(path,"rb") as f: data=f.read()
+            mime="application/pdf" if path.lower().endswith(".pdf") else "application/octet-stream"
+            cloud_upload(relative,data,mime)
+            moved+=1; changed=True
+            return "cloud://"+relative
+        except Exception:
+            raise
+    for process in store.get("procesos",[]) or []:
+        updated=[]
+        for path in process.get("imagenes",[]) or []:
+            updated.append(migrate(path,"process_images"))
+        process["imagenes"]=updated
+    for record in (store.get("pickers",{}) or {}).values():
+        for doc in record.get("documentos",[]) or []:
+            old=doc.get("path",""); new=migrate(old,"seguimiento_pdfs")
+            if new!=old: doc["path"]=new
+    for doc in store.get("seguimientos_documentos",[]) or []:
+        old=doc.get("path",""); new=migrate(old,"seguimiento_pdfs")
+        if new!=old: doc["path"]=new
+    if changed: save_store(store)
+    return moved,missing
+
 def load_store():
     """Carga el expediente persistente y migra el JSON antiguo si existe."""
     ensure_persist_dir()
+    cloud_data=cloud_download(CLOUD_STORE_KEY,missing_ok=True) if cloud_enabled() else None
+    if cloud_data is not None:
+        data=json.loads(cloud_data.decode("utf-8"))
+        if not isinstance(data,dict): raise RuntimeError("El expediente guardado en la nube no contiene un objeto JSON válido.")
+        for key,value in {"pickers":{},"feedback_rows":[],"recursos_formatos":[],"procesos":[],"excluded_orders":[],"master_overrides":{},"master_excluded":[],"seguimientos_documentos":[],"supervisores":[],"upload_meta":{}}.items(): data.setdefault(key,value)
+        return data
     candidates=[STORE_FILE, LEGACY_STORE_FILE]
     for path in candidates:
         if os.path.exists(path):
@@ -209,20 +401,19 @@ def load_store():
                 data.setdefault("seguimientos_documentos", [])
                 data.setdefault("supervisores", [])
                 data.setdefault("upload_meta", {})
-                if path != STORE_FILE:
-                    try:
-                        save_store(data)
-                    except Exception:
-                        pass
+                if path != STORE_FILE or cloud_enabled(): save_store(data)
                 return data
             except Exception:
                 continue
-    return {"pickers": {}, "feedback_rows": [], "recursos_formatos": [], "procesos": [], "excluded_orders": [], "master_overrides": {}, "master_excluded": [], "seguimientos_documentos": [], "supervisores": [], "upload_meta": {}}
+    data={"pickers": {}, "feedback_rows": [], "recursos_formatos": [], "procesos": [], "excluded_orders": [], "master_overrides": {}, "master_excluded": [], "seguimientos_documentos": [], "supervisores": [], "upload_meta": {}}
+    if cloud_enabled(): save_store(data)
+    return data
 
 def save_store(store):
     tmp = STORE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f: json.dump(store, f, ensure_ascii=False, indent=2)
     os.replace(tmp, STORE_FILE)
+    if cloud_enabled(): cloud_upload(CLOUD_STORE_KEY,json.dumps(store,ensure_ascii=False,indent=2).encode("utf-8"),"application/json")
 
 def picker_record(store, picker, aliases=None):
     """Devuelve un único expediente por persona, aunque cambie el orden/formato del nombre.
@@ -1095,6 +1286,8 @@ st.caption("Control operativo de pickers, calidad, seguimiento y procesos")
 
 # Estado persistente: se carga antes de construir los widgets.
 store=load_store()
+cloud_migrated,cloud_missing=migrate_local_assets_to_cloud(store)
+cloud_history_migrated=migrate_local_upload_history_to_cloud()
 store.setdefault("excluded_orders", [])
 store.setdefault("feedback_rows", [])
 store.setdefault("master_overrides", {})
@@ -1107,6 +1300,18 @@ store.setdefault("upload_meta", {})
 
 with st.sidebar:
     st.header("Control operativo")
+    if cloud_enabled():
+        _,_,cloud_bucket=cloud_config()
+        st.success(f"☁️ Respaldo en nube activo · {cloud_bucket}")
+        if cloud_migrated:
+            st.caption(f"Se migraron {cloud_migrated} documentos e imágenes al almacenamiento privado.")
+        if cloud_history_migrated:
+            st.caption(f"Se migraron {cloud_history_migrated} versiones previas de Excel al historial en nube.")
+        if cloud_missing:
+            st.warning(f"{cloud_missing} archivos antiguos no estaban disponibles en el servidor para migrarlos.")
+    else:
+        st.warning("Respaldo en nube pendiente: configura SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY en los secretos del servidor.")
+        st.caption('Agrega también SUPABASE_STORAGE_BUCKET="control-fnr-mc". El bucket privado se crea automáticamente al conectar.')
     ub_upload=st.file_uploader("① Base de Pickers / Líneas",type=["xlsx","xls"],key="base_picker")
     uf_upload=st.file_uploader("② Detalle FNR",type=["xlsx","xls"],key="detalle_fnr")
     um_upload=st.file_uploader("③ Detalle Mala Calidad",type=["xlsx","xls"],key="detalle_mc")
