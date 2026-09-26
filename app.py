@@ -5,7 +5,7 @@
 # ================================================================
 
 
-import io, re, json, os, smtplib, zipfile, urllib.request, urllib.error, urllib.parse
+import io, re, json, os, smtplib, ssl, zipfile, urllib.request, urllib.error, urllib.parse
 from difflib import SequenceMatcher
 from datetime import datetime
 from email.message import EmailMessage
@@ -1313,19 +1313,32 @@ def _secret(name, default=""):
         return str(os.getenv(name, default) or default)
 
 def send_followup_email(subject, body, recipients, attachment_bytes=None, attachment_name="seguimiento.pdf"):
-    recipients=[x.strip() for x in str(recipients or "").split(",") if x.strip()]
-    host=_secret("SMTP_HOST"); user=_secret("SMTP_USER"); password=_secret("SMTP_PASSWORD")
-    port=int(_secret("SMTP_PORT","587") or 587); sender=_secret("SMTP_FROM",user)
-    if not recipients: return False,"No se capturaron destinatarios."
-    if not host or not user or not password: return False,"Correo no enviado: faltan SMTP_HOST, SMTP_USER o SMTP_PASSWORD en Secrets."
+    recipients=[x.strip() for x in re.split(r"[,;]",str(recipients or "")) if x.strip()]
+    host=_secret("SMTP_HOST").strip(); user=_secret("SMTP_USER").strip(); password=_secret("SMTP_PASSWORD")
+    sender=_secret("SMTP_FROM",user).strip() or user
+    if not recipients: return False,"No se capturaron destinatarios. Escribe al menos un correo."
+    invalid=[x for x in recipients if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+",x)]
+    if invalid: return False,"Revisa los correos: "+", ".join(invalid)
+    if not host or not user or not password:
+        return False,"Correo no enviado: configura SMTP_HOST, SMTP_USER, SMTP_PASSWORD y SMTP_PORT en los Secrets del servidor. SMTP_FROM es opcional."
     try:
-        msg=EmailMessage(); msg["Subject"]=subject; msg["From"]=sender; msg["To"]=", ".join(recipients); msg.set_content(body)
-        if attachment_bytes: msg.add_attachment(attachment_bytes,maintype="application",subtype="pdf",filename=attachment_name)
-        with smtplib.SMTP(host,port,timeout=20) as smtp:
-            smtp.starttls(); smtp.login(user,password); smtp.send_message(msg)
-        return True,"Copia enviada correctamente."
+        port=int(_secret("SMTP_PORT","587") or 587)
+        msg=EmailMessage(); msg["Subject"]=subject; msg["From"]=sender; msg["To"] = ", ".join(recipients); msg.set_content(body)
+        if attachment_bytes is not None:
+            msg.add_attachment(attachment_bytes,maintype="application",subtype="pdf",filename=attachment_name)
+        context=ssl.create_default_context()
+        if port==465:
+            with smtplib.SMTP_SSL(host,port,timeout=30,context=context) as smtp:
+                smtp.login(user,password); smtp.send_message(msg)
+        else:
+            with smtplib.SMTP(host,port,timeout=30) as smtp:
+                smtp.ehlo()
+                if smtp.has_extn("starttls"):
+                    smtp.starttls(context=context); smtp.ehlo()
+                smtp.login(user,password); smtp.send_message(msg)
+        return True,"Copia enviada correctamente a: "+", ".join(recipients)
     except Exception as exc:
-        return False,f"No fue posible enviar la copia: {exc}"
+        return False,f"No fue posible enviar la copia. Revisa el servidor y los datos SMTP. Detalle: {exc}"
 
 def export(summary,fnr,mc,picker,roster=None):
     """Genera el Excel de salida sin romper el dashboard si algún dato viene irregular."""
@@ -2143,7 +2156,7 @@ with h:
             else: st.info("Este picker todavía no tiene seguimientos registrados.")
         with st.container(border=True):
             st.markdown("### 📄 Subir seguimiento / acta")
-            st.caption("Registra el documento en este expediente. Adjunta un PDF o selecciona un enlace guardado; puedes administrar los enlaces en la sección de abajo.")
+            st.caption("Adjunta un PDF o elige uno de los enlaces de seguimiento que ya guardaste.")
             recursos=store.get("recursos_formatos",[]) or []
             recurso_lookup={}
             for i,z in enumerate(recursos):
@@ -2151,22 +2164,20 @@ with h:
                     recurso_lookup[f"{i+1}. {z.get('tipo','Recurso')} · {z.get('titulo','Enlace')}"]=z
             recurso_opciones=["Sin enlace guardado"]+list(recurso_lookup)
             with st.container(border=True):
-                st.markdown("**🔗 Reutilizar un enlace de seguimiento**")
-                recurso_seleccionado=st.selectbox("Selecciona un enlace guardado",recurso_opciones,key=f"seguimiento_enlace_guardado_{person_key(seguimiento_picker)}")
+                st.markdown("**🔗 Elegir enlace guardado (opcional)**")
+                recurso_seleccionado=st.selectbox("Enlaces de seguimiento",recurso_opciones,key=f"seguimiento_enlace_guardado_{person_key(seguimiento_picker)}")
                 recurso_actual=recurso_lookup.get(recurso_seleccionado)
                 if recurso_actual:
-                    st.info(f"**Listo para reutilizar:** {recurso_actual.get('tipo','Seguimiento')} · {recurso_actual.get('titulo','Enlace de seguimiento')}")
-                    st.link_button("Vista previa del enlace",str(recurso_actual.get("url","")))
-                else:
-                    st.caption("Elige un enlace guardado para asociarlo a este seguimiento.")
+                    st.info(f"Seleccionado: {recurso_actual.get('tipo','Seguimiento')} · {recurso_actual.get('titulo','Enlace de seguimiento')}")
+                    st.link_button("Abrir enlace para revisar",str(recurso_actual.get("url","")))
+            enviar_copia=st.checkbox("Enviar copia por correo al guardar",value=False,key=f"seguimiento_email_{person_key(seguimiento_picker)}")
+            destinatarios=st.text_input("Correo(s) destinatario(s)",placeholder="persona@correo.com (separa varios con coma)",key=f"seguimiento_destinatarios_{person_key(seguimiento_picker)}") if enviar_copia else ""
             with st.form(f"seguimiento_documento_form_{seguimiento_picker}",clear_on_submit=True):
                 dc1,dc2=st.columns([1,2])
                 with dc1: doc_tipo=st.selectbox("Tipo de documento",["Acta 1","Acta 2","Acta 3","Llamada de atención","Advertencia verbal 1","Advertencia verbal 2","Cero tolerancia","Otro"])
                 with dc2: doc_titulo=st.text_input("Nombre / referencia",placeholder="Ej. Acta por FNR — septiembre 2026")
                 doc_detalle=st.text_area("Detalle / motivo",placeholder="Qué originó el seguimiento y cualquier dato importante…")
                 doc_pdf=st.file_uploader("📎 Adjuntar PDF",type=["pdf"],accept_multiple_files=False,key=f"seguimiento_pdf_{seguimiento_picker}")
-                enviar_copia=st.checkbox("Enviar copia por correo al guardar",value=False)
-                destinatarios=st.text_input("Destinatarios",placeholder="persona1@correo.com, persona2@correo.com") if enviar_copia else ""
                 if st.form_submit_button("💾 Guardar seguimiento / documento",type="primary"):
                     url=str(recurso_actual.get("url","")).strip() if recurso_actual else ""
                     titulo=doc_titulo.strip() or (doc_pdf.name if doc_pdf is not None else (str(recurso_actual.get("titulo",doc_tipo)) if recurso_actual else doc_tipo))
@@ -2178,15 +2189,16 @@ with h:
                             path,_=save_followup_pdf(doc_pdf.getvalue(),seguimiento_picker,doc_pdf.name); registro["path"]=path; registro["archivo"]=_safe_filename(doc_pdf.name); pdf_bytes=doc_pdf.getvalue()
                         rec.setdefault("documentos",[]).append(registro); save_store(store)
                         if enviar_copia:
-                            ok,msg=send_followup_email(f"Seguimiento {doc_tipo} · {seguimiento_picker}",f"Se registró un {doc_tipo} para {seguimiento_picker}.\n\nDetalle: {doc_detalle.strip() or 'Sin detalle.'}",destinatarios,pdf_bytes,registro.get("archivo","seguimiento.pdf"))
+                            email_body=f"Se registró un {doc_tipo} para {seguimiento_picker}.\n\nDetalle: {doc_detalle.strip() or 'Sin detalle.'}"
+                            if url: email_body+=f"\n\nEnlace de seguimiento: {url}"
+                            ok,msg=send_followup_email(f"Seguimiento {doc_tipo} · {seguimiento_picker}",email_body,destinatarios,pdf_bytes,registro.get("archivo") or "seguimiento.pdf")
                             if ok: st.success(msg)
-                            else: st.warning(msg)
+                            else: st.error(msg)
                         else: st.success("Seguimiento / documento guardado.")
-                        st.rerun()
         st.markdown("### 🔗 Enlaces de seguimiento")
-        st.caption("Guarda aquí enlaces reutilizables; podrás seleccionarlos al registrar un documento en cualquier expediente.")
+        st.caption("Aquí puedes consultar y administrar los enlaces guardados.")
         with st.expander(f"Administrar enlaces de seguimiento ({len(recursos)})",expanded=False):
-            st.info("Agrega cada enlace aquí una sola vez. Después podrás reutilizarlo desde el formulario del expediente.")
+            st.info("Los enlaces guardados aparecen aquí para abrirlos o quitarlos.")
             for idx,recurso in enumerate(recursos):
                 with st.container(border=True):
                     rr1,rr2,rr3=st.columns([4,1.3,1])
