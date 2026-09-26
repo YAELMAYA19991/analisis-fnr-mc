@@ -2096,19 +2096,20 @@ with h:
     seguimiento_df=pd.DataFrame(all_rows)
     if seguimiento_df.empty: st.info("No hay pickers disponibles para seguimiento.")
     else:
-        fc1,fc2,fc3,fc4=st.columns(4)
-        search_seg=fc1.text_input("Buscar picker",placeholder="Nombre…",key="seguimiento_global_search")
-        seg_filter=fc2.selectbox("Estado",["Todos","Con actas","Sin actas","Con cero tolerancia","Sin seguimiento"],key="seguimiento_global_estado")
-        seg_sort=fc3.selectbox("Ordenar por",["ACTAS","SEGUIMIENTOS","CERO TOLERANCIA","RETROALIMENTACIONES","TOTAL"],key="seguimiento_global_sort")
-        seg_dir=fc4.selectbox("Orden",["Mayor a menor","Menor a mayor"],key="seguimiento_global_dir")
-        view=seguimiento_df.copy()
-        if search_seg.strip(): view=view[view["PICKER"].map(norm).str.contains(norm(search_seg),regex=False)]
-        if seg_filter=="Con actas": view=view[view["ACTAS"]>0]
-        elif seg_filter=="Sin actas": view=view[view["ACTAS"]==0]
-        elif seg_filter=="Con cero tolerancia": view=view[view["CERO TOLERANCIA"]>0]
-        elif seg_filter=="Sin seguimiento": view=view[view["SEGUIMIENTOS"]==0]
-        view=view.sort_values(seg_sort,ascending=(seg_dir=="Menor a mayor"))
-        st.dataframe(view,use_container_width=True,hide_index=True)
+        with st.container(border=True):
+            fc1,fc2,fc3,fc4=st.columns(4)
+            search_seg=fc1.text_input("Buscar picker",placeholder="Nombre…",key="seguimiento_global_search")
+            seg_filter=fc2.selectbox("Estado",["Todos","Con actas","Sin actas","Con cero tolerancia","Sin seguimiento"],key="seguimiento_global_estado")
+            seg_sort=fc3.selectbox("Ordenar por",["ACTAS","SEGUIMIENTOS","CERO TOLERANCIA","RETROALIMENTACIONES","TOTAL"],key="seguimiento_global_sort")
+            seg_dir=fc4.selectbox("Orden",["Mayor a menor","Menor a mayor"],key="seguimiento_global_dir")
+            view=seguimiento_df.copy()
+            if search_seg.strip(): view=view[view["PICKER"].map(norm).str.contains(norm(search_seg),regex=False)]
+            if seg_filter=="Con actas": view=view[view["ACTAS"]>0]
+            elif seg_filter=="Sin actas": view=view[view["ACTAS"]==0]
+            elif seg_filter=="Con cero tolerancia": view=view[view["CERO TOLERANCIA"]>0]
+            elif seg_filter=="Sin seguimiento": view=view[view["SEGUIMIENTOS"]==0]
+            view=view.sort_values(seg_sort,ascending=(seg_dir=="Menor a mayor"))
+            st.dataframe(view,use_container_width=True,hide_index=True)
         st.caption(f"{len(view):,} pickers visibles.")
 
     st.divider()
@@ -2133,42 +2134,58 @@ with h:
         k2.metric("Seguimientos",f"{len(acciones):,}")
         k3.metric("Actas / tolerancias",f"{sum(1 for z in acciones if 'Acta' in str(z.get('accion','')) or 'Cero tolerancia' in str(z.get('accion',''))):,}")
         k4.metric("Documentos",f"{len(documentos):,}")
-        st.markdown("### 📋 Historial de seguimiento")
-        if acciones:
-            hist=pd.DataFrame(acciones).rename(columns={"fecha":"Fecha","accion":"Tipo","supervisor":"Supervisor","motivo":"Motivo","retroalimentacion":"Retroalimentación"})
-            cols=[c for c in ["Fecha","Tipo","Supervisor","Motivo","Retroalimentación"] if c in hist.columns]
-            st.dataframe(hist.sort_values("Fecha",ascending=False)[cols],use_container_width=True,hide_index=True)
-        else: st.info("Este picker todavía no tiene seguimientos registrados.")
-        st.markdown("### 📄 Subir seguimiento / acta")
-        st.caption("El PDF queda asociado al expediente. Si configuras SMTP en Secrets, puedes enviar automáticamente una copia a varias personas.")
-        with st.form(f"seguimiento_documento_form_{seguimiento_picker}",clear_on_submit=True):
-            dc1,dc2=st.columns([1,2])
-            with dc1: doc_tipo=st.selectbox("Tipo de documento",["Acta 1","Acta 2","Acta 3","Llamada de atención","Advertencia verbal 1","Advertencia verbal 2","Cero tolerancia","Otro"])
-            with dc2: doc_titulo=st.text_input("Nombre / referencia",placeholder="Ej. Acta por FNR — septiembre 2026")
-            doc_detalle=st.text_area("Detalle / motivo",placeholder="Qué originó el seguimiento y cualquier dato importante…")
-            doc_pdf=st.file_uploader("📎 Adjuntar PDF",type=["pdf"],accept_multiple_files=False,key=f"seguimiento_pdf_{seguimiento_picker}")
-            doc_url=st.text_input("🔗 O vincular documento externo",placeholder="https://...")
-            enviar_copia=st.checkbox("Enviar copia por correo al guardar",value=False)
-            destinatarios=st.text_input("Destinatarios",placeholder="persona1@correo.com, persona2@correo.com") if enviar_copia else ""
-            if st.form_submit_button("💾 Guardar seguimiento / documento",type="primary"):
-                titulo=doc_titulo.strip() or (doc_pdf.name if doc_pdf is not None else doc_tipo); url=doc_url.strip()
-                if doc_pdf is None and not url: st.error("Adjunta un PDF o captura un enlace externo.")
-                elif url and not url.startswith(("http://","https://")): st.error("El enlace debe comenzar con http:// o https://")
-                else:
-                    registro={"id":datetime.now().strftime("%Y%m%d%H%M%S%f"),"fecha":datetime.now().strftime("%Y-%m-%d %H:%M"),"tipo":doc_tipo,"titulo":titulo,"detalle":doc_detalle.strip(),"supervisor":str(r.get("SUPERVISOR","")),"url":url,"path":"","archivo":"","destinatarios":destinatarios}
-                    pdf_bytes=None
-                    if doc_pdf is not None:
-                        path,_=save_followup_pdf(doc_pdf.getvalue(),seguimiento_picker,doc_pdf.name); registro["path"]=path; registro["archivo"]=_safe_filename(doc_pdf.name); pdf_bytes=doc_pdf.getvalue()
-                    rec.setdefault("documentos",[]).append(registro); save_store(store)
-                    if enviar_copia:
-                        ok,msg=send_followup_email(f"Seguimiento {doc_tipo} · {seguimiento_picker}",f"Se registró un {doc_tipo} para {seguimiento_picker}.\n\nDetalle: {doc_detalle.strip() or 'Sin detalle.'}",destinatarios,pdf_bytes,registro.get("archivo","seguimiento.pdf"))
-                        if ok: st.success(msg)
-                        else: st.warning(msg)
-                    else: st.success("Seguimiento / documento guardado.")
-                    st.rerun()
-        st.markdown("### 🔗 Enlaces consolidados")
-        recursos=store.get("recursos_formatos",[]) or []
-        with st.expander(f"Administrar formatos y enlaces ({len(recursos)})",expanded=False):
+        with st.container(border=True):
+            st.markdown("### 📋 Historial de seguimiento")
+            if acciones:
+                hist=pd.DataFrame(acciones).rename(columns={"fecha":"Fecha","accion":"Tipo","supervisor":"Supervisor","motivo":"Motivo","retroalimentacion":"Retroalimentación"})
+                cols=[c for c in ["Fecha","Tipo","Supervisor","Motivo","Retroalimentación"] if c in hist.columns]
+                st.dataframe(hist.sort_values("Fecha",ascending=False)[cols],use_container_width=True,hide_index=True)
+            else: st.info("Este picker todavía no tiene seguimientos registrados.")
+        with st.container(border=True):
+            st.markdown("### 📄 Subir seguimiento / acta")
+            st.caption("Registra el documento en este expediente. Puedes adjuntar un PDF, reutilizar un enlace guardado o agregar uno nuevo.")
+            recursos=store.get("recursos_formatos",[]) or []
+            recurso_lookup={}
+            for i,z in enumerate(recursos):
+                if str(z.get("url","")).strip():
+                    recurso_lookup[f"{i+1}. {z.get('tipo','Recurso')} · {z.get('titulo','Enlace')}"]=z
+            recurso_opciones=["Sin enlace guardado"]+list(recurso_lookup)
+            with st.container(border=True):
+                st.markdown("**🔗 Reutilizar un enlace de seguimiento**")
+                recurso_seleccionado=st.selectbox("Enlace guardado",recurso_opciones,key=f"seguimiento_enlace_guardado_{person_key(seguimiento_picker)}")
+                recurso_actual=recurso_lookup.get(recurso_seleccionado)
+                if recurso_actual:
+                    st.link_button(f"Abrir: {recurso_actual.get('titulo','Enlace de seguimiento')}",str(recurso_actual.get("url","")))
+                    st.caption("Si guardas el documento, este enlace quedará asociado al expediente seleccionado.")
+            with st.form(f"seguimiento_documento_form_{seguimiento_picker}",clear_on_submit=True):
+                dc1,dc2=st.columns([1,2])
+                with dc1: doc_tipo=st.selectbox("Tipo de documento",["Acta 1","Acta 2","Acta 3","Llamada de atención","Advertencia verbal 1","Advertencia verbal 2","Cero tolerancia","Otro"])
+                with dc2: doc_titulo=st.text_input("Nombre / referencia",placeholder="Ej. Acta por FNR — septiembre 2026")
+                doc_detalle=st.text_area("Detalle / motivo",placeholder="Qué originó el seguimiento y cualquier dato importante…")
+                doc_pdf=st.file_uploader("📎 Adjuntar PDF",type=["pdf"],accept_multiple_files=False,key=f"seguimiento_pdf_{seguimiento_picker}")
+                doc_url=st.text_input("Enlace adicional (opcional)",placeholder="https://...")
+                enviar_copia=st.checkbox("Enviar copia por correo al guardar",value=False)
+                destinatarios=st.text_input("Destinatarios",placeholder="persona1@correo.com, persona2@correo.com") if enviar_copia else ""
+                if st.form_submit_button("💾 Guardar seguimiento / documento",type="primary"):
+                    url=doc_url.strip() or (str(recurso_actual.get("url","")).strip() if recurso_actual else "")
+                    titulo=doc_titulo.strip() or (doc_pdf.name if doc_pdf is not None else (str(recurso_actual.get("titulo",doc_tipo)) if recurso_actual else doc_tipo))
+                    if doc_pdf is None and not url: st.error("Adjunta un PDF o captura un enlace externo.")
+                    elif url and not url.startswith(("http://","https://")): st.error("El enlace debe comenzar con http:// o https://")
+                    else:
+                        registro={"id":datetime.now().strftime("%Y%m%d%H%M%S%f"),"fecha":datetime.now().strftime("%Y-%m-%d %H:%M"),"tipo":doc_tipo,"titulo":titulo,"detalle":doc_detalle.strip(),"supervisor":str(r.get("SUPERVISOR","")),"url":url,"url_titulo":(str(recurso_actual.get("titulo","")) if recurso_actual and not doc_url.strip() else ""),"path":"","archivo":"","destinatarios":destinatarios}
+                        pdf_bytes=None
+                        if doc_pdf is not None:
+                            path,_=save_followup_pdf(doc_pdf.getvalue(),seguimiento_picker,doc_pdf.name); registro["path"]=path; registro["archivo"]=_safe_filename(doc_pdf.name); pdf_bytes=doc_pdf.getvalue()
+                        rec.setdefault("documentos",[]).append(registro); save_store(store)
+                        if enviar_copia:
+                            ok,msg=send_followup_email(f"Seguimiento {doc_tipo} · {seguimiento_picker}",f"Se registró un {doc_tipo} para {seguimiento_picker}.\n\nDetalle: {doc_detalle.strip() or 'Sin detalle.'}",destinatarios,pdf_bytes,registro.get("archivo","seguimiento.pdf"))
+                            if ok: st.success(msg)
+                            else: st.warning(msg)
+                        else: st.success("Seguimiento / documento guardado.")
+                        st.rerun()
+        st.markdown("### 🔗 Enlaces de seguimiento")
+        st.caption("Guarda aquí enlaces reutilizables; podrás seleccionarlos al registrar un documento en cualquier expediente.")
+        with st.expander(f"Administrar enlaces de seguimiento ({len(recursos)})",expanded=False):
             for idx,recurso in enumerate(recursos):
                 rr1,rr2,rr3=st.columns([1,5,1])
                 rr1.caption(str(recurso.get("tipo","Recurso"))); rr2.markdown(f"**{recurso.get('titulo','Formato')}**")
@@ -2195,7 +2212,7 @@ with h:
                 if doc.get("detalle"): rr2.caption(str(doc.get("detalle")))
                 with rr3:
                     if archivo is not None: st.download_button("Ver PDF",archivo,file_name=str(doc.get("archivo") or "seguimiento.pdf"),mime="application/pdf",key=f"seg_download_{seguimiento_picker}_{doc.get('id',i)}",use_container_width=True)
-                    if doc.get("url"): st.link_button("Abrir enlace",str(doc.get("url")),use_container_width=True)
+                    if doc.get("url"): st.link_button(f"Abrir: {doc.get('url_titulo') or 'enlace'}",str(doc.get("url")),use_container_width=True)
         else: st.info("No hay documentos vinculados a este expediente.")
 
 with f:
