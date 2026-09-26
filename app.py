@@ -528,8 +528,7 @@ def apply_roster(base, roster):
             rr=roster_email.get(ek)
         else:
             rr=None
-        if rr is None:
-            rr=_match_master_row(row.get("_SOURCE_PICKER",row.get("PICKER","")),roster,row.get("CORREO",""))
+        # No asignar por parecido de nombre: solo el correo identifica de forma unívoca.
         matches.append(rr)
 
     out=[]
@@ -653,8 +652,6 @@ def canonicalize_incidents(inc, base):
     for _,row in out.iterrows():
         ek=email_key(row.get("CORREO",""))
         rr=base_email.get(ek) if ek else None
-        if rr is None:
-            rr=_match_master_row(row.get("PICKER",""),base,row.get("CORREO",""))
         if rr is not None:
             result.append(str(rr.get("PICKER", row.get("PICKER",""))).strip())
             canonical_email.append(str(rr.get("CORREO",row.get("CORREO",""))).strip())
@@ -1366,7 +1363,7 @@ base_view=base[base.PICKER.isin(s_view.PICKER)]
 fnr_view=fnr[fnr.PICKER.isin(s_view.PICKER)]
 mc_view=mc[mc.PICKER.isin(s_view.PICKER)]
 
-a,b,c,d,e,x,g,h,f,j=st.tabs(["🏠 Bodega","👤 Picker","🏷️ Artículos","📦 Pedidos","🌙 Turnos / Áreas","🧩 Correos / Cruce","👥 Supervisores","🛡️ Seguimiento","📥 Exportar","📌 Pendientes & Procesos"])
+a,b,e,x,g,h,f,j=st.tabs(["🏠 Bodega","👤 Picker","🌙 Turnos / Áreas","🧩 Correos / Cruce","👥 Supervisores","🛡️ Seguimiento","📥 Exportar","📌 Pendientes & Procesos"])
 
 with a:
     st.subheader(f"Resumen de bodega — {periodo}")
@@ -1428,6 +1425,25 @@ with a:
     k[1].metric("MC / líneas",f"{M/lines*100:.2f}%" if lines else "N/D")
     st.subheader("Detalle por picker")
     st.dataframe(s_bodega,use_container_width=True,hide_index=True)
+
+    st.divider()
+    st.subheader("🏷️ Artículos")
+    st.caption("Artículos con incidencia dentro del mismo turno, supervisor y área seleccionados arriba.")
+    tipo_articulos=st.radio("Tipo de incidencia",["FNR","MC"],horizontal=True,key="articulos_tipo")
+    datos_articulos=fnr_bodega if tipo_articulos=="FNR" else mc_bodega
+    articulos_view=(datos_articulos.groupby(["PRODUCTO","AREA"],as_index=False).INCIDENCIAS.sum()
+                    .rename(columns={"INCIDENCIAS":"CANTIDAD"}).sort_values("CANTIDAD",ascending=False))
+    st.dataframe(articulos_view,use_container_width=True,hide_index=True)
+    st.caption(f"{len(articulos_view):,} artículos con incidencia · {int(articulos_view.CANTIDAD.sum()) if not articulos_view.empty else 0:,} incidencias dentro del contexto seleccionado.")
+
+    st.divider()
+    st.subheader("📦 Pedidos")
+    st.caption("Pedidos con incidencia dentro del mismo turno, supervisor y área seleccionados arriba.")
+    tipo_pedidos=st.radio("Tipo de incidencia",["FNR","MC"],horizontal=True,key="pedidos_tipo")
+    datos_pedidos=fnr_bodega if tipo_pedidos=="FNR" else mc_bodega
+    pedidos_bodega=orders(datos_pedidos)
+    st.dataframe(pedidos_bodega,use_container_width=True,hide_index=True)
+    st.caption("PICKERS indica cuántos pickers aparecen en el mismo pedido.")
 
 with b:
     ctx,_,_,_=global_context(context_identity)
@@ -1582,32 +1598,6 @@ with b:
 
         if not picker_fb and not rec.get("comentarios") and not rec.get("acciones") and not picker_docs:
             st.info("Este picker todavía no tiene retroalimentaciones, seguimientos ni documentos registrados.")
-
-with c:
-    ctx,_,_,_=global_context(context_identity)
-    st.subheader("🏷️ Artículos")
-    st.caption("Esta página respeta el mismo turno, supervisor y área seleccionados en Bodega.")
-    selected=apply_context(s_view,ctx,identity_df=context_identity)
-    render_context_banner(ctx,selected,context_reference(s_view,ctx,identity_df=context_identity),"Contexto heredado")
-    tipo=st.radio("Tipo",["FNR","MC"],horizontal=True,key="articulos_tipo")
-    data=fnr if tipo=="FNR" else mc
-    data=data[data.PICKER.isin(selected.PICKER)]
-    art=data.groupby(["PRODUCTO","AREA"],as_index=False).INCIDENCIAS.sum().rename(columns={"INCIDENCIAS":"CANTIDAD"}).sort_values("CANTIDAD",ascending=False)
-    st.dataframe(art,use_container_width=True,hide_index=True)
-    st.caption(f"{len(art):,} artículos con incidencia · {int(art.CANTIDAD.sum()) if not art.empty else 0:,} incidencias dentro del contexto seleccionado.")
-
-with d:
-    ctx,_,_,_=global_context(context_identity)
-    st.subheader("📦 Pedidos")
-    st.caption("Esta página respeta el mismo turno, supervisor y área seleccionados en Bodega.")
-    selected=apply_context(s_view,ctx,identity_df=context_identity)
-    render_context_banner(ctx,selected,context_reference(s_view,ctx,identity_df=context_identity),"Contexto heredado")
-    tipo=st.radio("Incidencia",["FNR","MC"],horizontal=True,key="pedidos_tipo")
-    data=fnr if tipo=="FNR" else mc
-    data=data[data.PICKER.isin(selected.PICKER)]
-    pedidos_view=orders(data)
-    st.dataframe(pedidos_view,use_container_width=True,hide_index=True)
-    st.caption("PICKERS indica cuántos pickers aparecen en el mismo pedido.")
 
 with e:
     ctx,_,_,_=global_context(context_identity)
