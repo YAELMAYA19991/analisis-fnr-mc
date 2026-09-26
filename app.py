@@ -337,24 +337,7 @@ def parse_base(df):
     x["_EMAIL_TOKENS"]=x["CORREO"].map(email_name_tokens)
     x["_EMAIL_KEY"]=x["CORREO"].map(email_key)
     has_email=x["_EMAIL_KEY"].astype(str).str.strip().ne("")
-    # Una persona puede aparecer en varias filas de la base (por ejemplo, por
-    # turno o corte). Sumar sus volúmenes evita descartar líneas/pedidos.
-    x["_IDENTITY_KEY"]=x["_EMAIL_KEY"].where(has_email,"nombre:"+x["_KEY"].astype(str))
-    def first_value(values, fallback=""):
-        for value in values:
-            value=str(value or "").strip()
-            if value and value.lower() not in {"nan","none","nat"}:
-                return value
-        return fallback
-    out=(x.groupby("_IDENTITY_KEY",as_index=False,sort=False)
-        .agg(PICKER=("PICKER",first_value),LINEAS=("LINEAS","sum"),PEDIDOS=("PEDIDOS","sum"),
-             TURNO=("TURNO",first_value),AREA_BASE=("AREA_BASE",first_value),CORREO=("CORREO",first_value)))
-    out["_KEY"]=out["PICKER"].map(person_key)
-    out["_TOKEN_KEY"]=out["PICKER"].map(token_key)
-    out["_CODE_KEY"]=out["CORREO"].map(extract_code)
-    out["_EMAIL_TOKENS"]=out["CORREO"].map(email_name_tokens)
-    out["_EMAIL_KEY"]=out["CORREO"].map(email_key)
-    return out.drop(columns=["_IDENTITY_KEY"])
+    return pd.concat([x[has_email].sort_values("LINEAS").drop_duplicates("_EMAIL_KEY",keep="last"), x[~has_email].sort_values("LINEAS").drop_duplicates("PICKER",keep="last")],ignore_index=True)
 
 def parse_roster(df, turno_fijo=None):
     """Maestro consolidado: PICKER, TURNO, CODIGO + CORREO, SUPERVISOR y AREA_BASE."""
@@ -784,17 +767,9 @@ def attach(inc,base):
 
 def summary(base,fnr,mc):
     s=base.copy()
-    # Preferir correo como llave para evitar mezclar personas con nombres iguales.
-    def add_summary_key(df):
-        x=df.copy()
-        emails=x.get("CORREO_KEY",x.get("CORREO",pd.Series("",index=x.index))).map(email_key)
-        names=x.get("PICKER",pd.Series("",index=x.index)).map(person_key)
-        x["_SUMMARY_KEY"]=emails.where(emails.ne(""),"nombre:"+names)
-        return x
-    s=add_summary_key(s); fsrc=add_summary_key(fnr); msrc=add_summary_key(mc)
-    f=fsrc.groupby("_SUMMARY_KEY",as_index=False).INCIDENCIAS.sum().rename(columns={"INCIDENCIAS":"FNR"})
-    m=msrc.groupby("_SUMMARY_KEY",as_index=False).INCIDENCIAS.sum().rename(columns={"INCIDENCIAS":"MC"})
-    s=s.merge(f,on="_SUMMARY_KEY",how="left").merge(m,on="_SUMMARY_KEY",how="left").drop(columns=["_SUMMARY_KEY"])
+    f=fnr.groupby("PICKER",as_index=False).INCIDENCIAS.sum().rename(columns={"INCIDENCIAS":"FNR"})
+    m=mc.groupby("PICKER",as_index=False).INCIDENCIAS.sum().rename(columns={"INCIDENCIAS":"MC"})
+    s=s.merge(f,on="PICKER",how="left").merge(m,on="PICKER",how="left")
     s[["FNR","MC"]]=s[["FNR","MC"]].fillna(0)
     # Asegurar columnas numéricas y evitar pd.NA + round() incompatibles con algunas versiones de pandas
     s["LINEAS"]=pd.to_numeric(s["LINEAS"],errors="coerce").fillna(0.0)
@@ -814,18 +789,11 @@ def summary(base,fnr,mc):
 
 def monthly_kpis(base,fnr,mc):
     total_pedidos=pd.to_numeric(base["PEDIDOS"],errors="coerce").fillna(0).sum()
-    def order_count(inc):
-        if inc is None or inc.empty:
-            return 0
-        orders=inc["ORDER_NUMBER"].astype(str).str.strip()
-        valid=orders.ne("") & ~orders.str.lower().isin({"nan","none","nat"})
-        return int(orders[valid].nunique()) if valid.any() else None
-    fnr_pedidos=order_count(fnr)
-    mc_pedidos=order_count(mc)
-    # Si hay incidencias pero faltan sus números de pedido, no mezclar unidades
-    # distintas (incidencias/pedidos) ni mostrar un 0% engañoso.
-    fnr_rate=(fnr_pedidos/total_pedidos*100) if total_pedidos and fnr_pedidos is not None else None
-    mc_rate=(mc_pedidos/total_pedidos*100) if total_pedidos and mc_pedidos is not None else None
+    fnr_pedidos=fnr.loc[fnr["ORDER_NUMBER"].astype(str).str.strip().ne(""),"ORDER_NUMBER"].nunique()
+    mc_pedidos=mc.loc[mc["ORDER_NUMBER"].astype(str).str.strip().ne(""),"ORDER_NUMBER"].nunique()
+    # Si no hay números de pedido en el detalle, usamos incidencias como respaldo y lo indicamos en la UI.
+    fnr_rate=fnr_pedidos/total_pedidos*100 if total_pedidos else None
+    mc_rate=mc_pedidos/total_pedidos*100 if total_pedidos else None
     return total_pedidos,fnr_pedidos,mc_pedidos,fnr_rate,mc_rate
 
 def feedback_export(rows):
@@ -907,9 +875,12 @@ def groups(inc,base,key):
         else:
             x["GRUPO"]=x[area_col].fillna("No especificada").astype(str).str.strip()
             x.loc[x["GRUPO"].eq(""),"GRUPO"]="No especificada"
-        # AREA_BASE identifica el área asignada al picker; no prueba cuántas
-        # líneas trabajó realmente en cada departamento. No usarlo como divisor.
-        den=None
+        den_col="AREA_BASE" if "AREA_BASE" in base.columns else None
+        if den_col and (base[den_col].astype(str).str.strip()!="No especificada").any():
+            den=(base.groupby(den_col,as_index=False)["LINEAS"].sum()
+                 .rename(columns={den_col:"GRUPO"}))
+        else:
+            den=None
 
     g=x.groupby("GRUPO",as_index=False)["INCIDENCIAS"].sum()
     total_inc=float(pd.to_numeric(g["INCIDENCIAS"],errors="coerce").fillna(0).sum())
@@ -1018,8 +989,6 @@ st.caption("Control operativo de pickers, calidad, seguimiento y procesos")
 # Estado persistente: se carga antes de construir los widgets.
 store=load_store()
 store.setdefault("excluded_orders", [])
-store.setdefault("excluded_fnr_orders", list(store.get("excluded_orders", [])))
-store.setdefault("excluded_mc_orders", list(store.get("excluded_orders", [])))
 store.setdefault("feedback_rows", [])
 store.setdefault("master_overrides", {})
 store.setdefault("master_excluded", [])
@@ -1055,18 +1024,12 @@ with st.sidebar:
     st.caption("Los 3 Excel operativos se cruzan con la PLANTILLA CONSOLIDADA usando CORREO como única llave. La plantilla aporta el nombre asociado, turno, supervisor y área. El nombre no se usa para hacer coincidencias entre archivos.")
     st.divider()
     periodo=st.text_input("Periodo",value=str(store.get("periodo",datetime.now().strftime("%Y-%m"))),key="periodo_persistente")
-    saved_fnr_excluded="\n".join(str(x) for x in store.get("excluded_fnr_orders",[]) if str(x).strip())
-    saved_mc_excluded="\n".join(str(x) for x in store.get("excluded_mc_orders",[]) if str(x).strip())
-    ex_fnr=st.text_area("Pedidos a excluir de FNR (uno por línea)",value=saved_fnr_excluded,key="pedidos_fnr_excluidos_persistentes")
-    ex_mc=st.text_area("Pedidos a excluir de MC (uno por línea)",value=saved_mc_excluded,key="pedidos_mc_excluidos_persistentes")
-    excluded_fnr={x.strip() for x in ex_fnr.splitlines() if x.strip()}
-    excluded_mc={x.strip() for x in ex_mc.splitlines() if x.strip()}
+    saved_excluded="\n".join(str(x) for x in store.get("excluded_orders",[]) if str(x).strip())
+    ex=st.text_area("Pedidos operativos a excluir (uno por línea)",value=saved_excluded,key="pedidos_excluidos_persistentes")
+    excluded={x.strip() for x in ex.splitlines() if x.strip()}
     # Guardar automáticamente preferencias y exclusiones.
     store["periodo"]=periodo.strip() or datetime.now().strftime("%Y-%m")
-    store["excluded_fnr_orders"]=sorted(excluded_fnr)
-    store["excluded_mc_orders"]=sorted(excluded_mc)
-    # Mantener el campo anterior como respaldo para versiones previas.
-    store["excluded_orders"]=sorted(excluded_fnr | excluded_mc)
+    store["excluded_orders"]=sorted(excluded)
     save_store(store)
 
 if not (ub and uf and um and up):
@@ -1094,12 +1057,11 @@ try:
 except Exception as e:
     st.error(f"Error en los archivos cargados: {e}"); st.stop()
 
-if excluded_fnr:
-    fnr=fnr[~fnr.ORDER_NUMBER.isin(excluded_fnr)].copy()
-if excluded_mc:
-    mc=mc[~mc.ORDER_NUMBER.isin(excluded_mc)].copy()
+if excluded:
+    fnr=fnr[~fnr.ORDER_NUMBER.isin(excluded)].copy()
+    mc=mc[~mc.ORDER_NUMBER.isin(excluded)].copy()
 # Para FNR/MC, el contexto de turno/área/supervisor viene de la plantilla por correo.
-identity_for_attach=context_identity if 'context_identity' in globals() else _context_identity_view(roster)
+identity_for_attach=roster.rename(columns={"TURNO_MAESTRO":"TURNO","AREA_MAESTRO":"AREA_BASE"}).copy()
 fnr=attach(fnr,identity_for_attach); mc=attach(mc,identity_for_attach)
 fnr["CORREO_KEY"]=fnr.get("CORREO",pd.Series("",index=fnr.index)).map(email_key)
 mc["CORREO_KEY"]=mc.get("CORREO",pd.Series("",index=mc.index)).map(email_key)
@@ -1382,11 +1344,10 @@ with a:
         ("MC mensual",f"{mc_rate:.2f}%" if mc_rate is not None else "N/D","Objetivo < 1.00%","amber"),
         ("Fuera objetivo",f"{int((s_bodega.ESTADO=="🔴 FUERA DE OBJETIVO").sum()):,}",f"de {len(s_bodega):,} pickers","red"),
     ])
-    fnr_kpi_text=(f"{fnr_pedidos:,} pedidos con FNR / {total_pedidos:,} pedidos = {fnr_rate:.2f}%"
-                  if fnr_rate is not None else "FNR mensual: N/D (faltan números de pedido o total de pedidos)")
-    mc_kpi_text=(f"{mc_pedidos:,} pedidos con MC / {total_pedidos:,} pedidos = {mc_rate:.2f}%"
-                 if mc_rate is not None else "MC mensual: N/D (faltan números de pedido o total de pedidos)")
-    st.caption(f"KPI mensual del contexto: {fnr_kpi_text} · {mc_kpi_text}")
+    if fnr_rate is not None and mc_rate is not None:
+        st.caption(f"KPI mensual del contexto: {fnr_pedidos:,} pedidos con FNR / {total_pedidos:,} pedidos = {fnr_rate:.2f}% · {mc_pedidos:,} pedidos con MC / {total_pedidos:,} pedidos = {mc_rate:.2f}%")
+    else:
+        st.caption("No hay suficientes pedidos para calcular el KPI mensual.")
 
     st.subheader("Comparativo del contexto")
     render_turn_comparison(base_bodega,base_reference,fnr_bodega,fnr_reference,mc_bodega,mc_reference)
@@ -1600,7 +1561,7 @@ with e:
     st.dataframe(groups(fsel,bsel,"AREA"),use_container_width=True,hide_index=True)
     st.subheader("MC por área")
     st.dataframe(groups(msel,bsel,"AREA"),use_container_width=True,hide_index=True)
-    st.warning("Por área se muestra la participación de incidencias, no una tasa / líneas: la base actual no aporta líneas realmente trabajadas por departamento. Para calcular esa tasa hace falta cargar líneas por picker y departamento.")
+    st.warning("El % / líneas por área solo aparece si existe un denominador real de líneas por área.")
 
 with x:
     st.subheader("🧩 Cruce por correo y personal no asignado")
