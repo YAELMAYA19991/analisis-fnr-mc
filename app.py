@@ -75,7 +75,7 @@ _CLOUD_BUCKET_CHECKED=False
 def cloud_config():
     """Credenciales de Supabase Storage desde secrets o variables de entorno."""
     url=_secret("SUPABASE_URL").strip().rstrip("/")
-    key=_secret("SUPABASE_SERVICE_ROLE_KEY").strip()
+    key=(_secret("SUPABASE_SECRET_KEY") or _secret("SUPABASE_SERVICE_ROLE_KEY")).strip()
     bucket=_secret("SUPABASE_STORAGE_BUCKET","control-fnr-mc").strip() or "control-fnr-mc"
     return url,key,bucket
 
@@ -89,7 +89,10 @@ def _cloud_request(method,path,data=None,content_type="application/json",missing
         raise RuntimeError("Falta configurar SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY.")
     request=urllib.request.Request(url+path,data=data,method=method)
     request.add_header("apikey",key)
-    request.add_header("Authorization",f"Bearer {key}")
+    # Las claves nuevas sb_secret_ no son JWT: van en apikey y no en Bearer.
+    # Mantener Authorization para la clave legacy service_role (JWT).
+    if not key.startswith("sb_secret_"):
+        request.add_header("Authorization",f"Bearer {key}")
     if content_type: request.add_header("Content-Type",content_type)
     for name,value in (extra_headers or {}).items(): request.add_header(name,value)
     try:
@@ -1310,7 +1313,7 @@ with st.sidebar:
         if cloud_missing:
             st.warning(f"{cloud_missing} archivos antiguos no estaban disponibles en el servidor para migrarlos.")
     else:
-        st.warning("Respaldo en nube pendiente: configura SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY en los secretos del servidor.")
+        st.warning("Respaldo en nube pendiente: configura SUPABASE_URL y SUPABASE_SECRET_KEY en los secretos del servidor.")
         st.caption('Agrega también SUPABASE_STORAGE_BUCKET="control-fnr-mc". El bucket privado se crea automáticamente al conectar.')
     ub_upload=st.file_uploader("① Base de Pickers / Líneas",type=["xlsx","xls"],key="base_picker")
     uf_upload=st.file_uploader("② Detalle FNR",type=["xlsx","xls"],key="detalle_fnr")
