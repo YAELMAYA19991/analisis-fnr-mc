@@ -1584,7 +1584,7 @@ base,fnr,mc=exclude_registered_supervisors(base,fnr,mc,store)
 s=summary(base,fnr,mc)
 # Estado de cruce de TODOS los archivos: Pickers/Líneas + FNR + MC.
 # La llave es CORREO_KEY; cualquier registro sin coincidencia con la plantilla
-# se concentra en la pestaña 🧩 Correos / Cruce para asignación manual.
+# se concentra en la pestaña 🧰 Herramientas para asignación manual.
 def _cross_frame(df, fuente):
     if df is None or df.empty:
         return pd.DataFrame(columns=["FUENTE","CATEGORIA","PICKER","CORREO","CORREO_KEY","TURNO","SUPERVISOR","AREA_BASE","IDENTIFICADO"])
@@ -1849,11 +1849,11 @@ base_view=select_summary_people(base,s_view)
 fnr_view=select_summary_people(fnr,s_view)
 mc_view=select_summary_people(mc,s_view)
 
-_tab_labels=["🏠 Bodega","👤 Picker","🌙 Turnos / Áreas","🧩 Correos / Cruce","👥 Supervisores","🛡️ Seguimiento","📥 Exportar","📌 Pendientes & Procesos"]
+_tab_labels=["🏠 Bodega","👤 Picker","🌙 Turnos / Áreas","🧰 Herramientas","👥 Supervisores","🛡️ Seguimiento","📌 Pendientes & Procesos"]
 try:
-    a,b,e,x,g,h,f,j=st.tabs(_tab_labels,on_change="rerun",key="control_fnr_mc_tabs")
+    a,b,e,x,g,h,j=st.tabs(_tab_labels,on_change="rerun",key="control_fnr_mc_tabs_v2")
 except TypeError:
-    a,b,e,x,g,h,f,j=st.tabs(_tab_labels)
+    a,b,e,x,g,h,j=st.tabs(_tab_labels)
 def _tab_active(tab):
     # Older Streamlit versions return no selected state; render normally there.
     return getattr(tab,"open",None) is not False
@@ -2106,7 +2106,9 @@ if _tab_active(e):
 
 if _tab_active(x):
     with x:
-        st.subheader("🧩 Cruce por correo y personal no asignado")
+        st.subheader("🧰 Herramientas")
+        st.caption("Herramientas de administración fuera del análisis operativo diario.")
+        st.markdown("### ✉️ Cruce de correos")
         st.caption("El cruce intenta primero CORREO y, si falta o no coincide, usa una coincidencia conservadora por nombre. El personal que no aparece en la plantilla se conserva en resultados como Sin registrar.")
         cross=cross_status.copy()
         if not cross.empty:
@@ -2398,11 +2400,19 @@ if _tab_active(h):
                             else: st.error(msg)
             else: st.info("No hay documentos vinculados a este expediente.")
 
-if _tab_active(f):
-    with f:
+if _tab_active(x):
+    with x:
+        st.divider()
+        st.markdown("### 📤 Exportar")
         st.download_button("📥 Descargar Excel completo",export(s,fnr,mc,None if sp=="Todos" else sp,roster),f"Analisis_FNR_MC_{periodo}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         st.info("La app utiliza 3 Excel operativos separados (Pickers, FNR y MC) y un Master consolidado para turno, correo, supervisor y área.")
         st.success(f"Persistencia activa: {len(store.get('excluded_orders',[]))} pedidos excluidos · {len(store.get('master_overrides',{}))} asignaciones manuales · {len(store.get('master_excluded',[]))} exclusiones de personal · {len(store.get('feedback_rows',[]))} retroalimentaciones guardadas.")
+
+        st.divider()
+        st.markdown("### 💾 Respaldo")
+        st.caption("Descarga una copia de asignaciones, seguimientos y procesos para conservarla como respaldo adicional.")
+        backup_json=json.dumps(store,ensure_ascii=False,indent=2).encode("utf-8")
+        st.download_button("Descargar respaldo de configuración",backup_json,f"Respaldo_Control_FNR_{periodo}.json","application/json",key="tools_config_backup")
 
 if _tab_active(j):
     with j:
@@ -2482,8 +2492,3 @@ if _tab_active(j):
                                     st.session_state.pop("confirm_delete_process_id",None)
                                     st.rerun()
 
-        st.divider()
-        st.subheader("💾 Respaldo de configuración")
-        st.caption("Para evitar perder asignaciones, seguimientos y procesos si Streamlit Cloud reinicia el contenedor, puedes descargar un respaldo y conservarlo.")
-        backup_json=json.dumps(store,ensure_ascii=False,indent=2).encode("utf-8")
-        st.download_button("Descargar respaldo de configuración",backup_json,f"Respaldo_Control_FNR_{periodo}.json","application/json")
