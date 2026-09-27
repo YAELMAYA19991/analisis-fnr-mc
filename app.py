@@ -10,7 +10,7 @@ from difflib import SequenceMatcher
 from datetime import datetime
 from email.message import EmailMessage
 import numpy as np
-import pandas as pd
+import pandas as pdE
 import streamlit as st
 
 st.set_page_config(page_title="Control FNR & Mala Calidad", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
@@ -59,6 +59,7 @@ def sheets_from_bytes(data):
         if not df.empty: out[sh]=clean(df)
     return out
 FNR_OBJ, MC_OBJ = 1.50, 1.00
+FOLLOWUP_CATEGORIES = ["1. Seguimiento", "2. Acta", "3. 0 Tolerancia"]
 PERSIST_DIR = "app_data"
 UPLOAD_HISTORY_DIR = os.path.join(PERSIST_DIR, "upload_history")
 MAX_UPLOAD_HISTORY = 20
@@ -487,6 +488,31 @@ def save_store(store):
         write_local(cloud_payload)
     else:
         write_local(payload)
+
+def normalize_followup_category(value):
+    """Reduce los nombres históricos al catálogo operativo de tres categorías."""
+    text=str(value or "").strip().casefold()
+    if "tolerancia" in text or text in {"3", "0"}: return FOLLOWUP_CATEGORIES[2]
+    if "acta" in text or text == "2": return FOLLOWUP_CATEGORIES[1]
+    return FOLLOWUP_CATEGORIES[0]
+
+def normalize_saved_followup_categories(store):
+    """Migra etiquetas anteriores sin cambiar fechas, motivos, PDFs ni enlaces."""
+    changed=False
+    for rec in (store.get("pickers",{}) or {}).values():
+        for item in (rec.get("acciones",[]) or []):
+            old=item.get("accion",""); new=normalize_followup_category(old)
+            if old!=new: item["accion"]=new; changed=True
+        for item in (rec.get("documentos",[]) or []):
+            old=item.get("tipo",""); new=normalize_followup_category(old)
+            if old!=new: item["tipo"]=new; changed=True
+    for item in (store.get("seguimientos_documentos",[]) or []):
+        old=item.get("tipo",""); new=normalize_followup_category(old)
+        if old!=new: item["tipo"]=new; changed=True
+    for item in (store.get("recursos_formatos",[]) or []):
+        old=item.get("tipo",""); new=normalize_followup_category(old)
+        if old!=new: item["tipo"]=new; changed=True
+    return changed
 
 def picker_record(store, picker, aliases=None):
     """Devuelve un único expediente por persona, aunque cambie el orden/formato del nombre.
@@ -1463,6 +1489,8 @@ store.setdefault("recursos_formatos", [])
 store.setdefault("seguimientos_documentos", [])
 store.setdefault("supervisores", [])
 store.setdefault("upload_meta", {})
+if normalize_saved_followup_categories(store):
+    save_store(store)
 
 with st.sidebar:
     st.header("Control operativo")
@@ -1995,7 +2023,7 @@ if _tab_active(b):
             st.subheader("📝 Retroalimentación y seguimiento")
             st.caption("Solo se solicita el tipo de seguimiento. La retroalimentación opcional queda dentro del mismo registro.")
             with st.form(f"accion_picker_form_{sp}", clear_on_submit=True):
-                act_type=st.selectbox("Tipo de seguimiento",["Llamada de atención","Advertencia verbal 1","Advertencia verbal 2","Acta 1","Acta 2","Acta 3","Cero tolerancia"])
+                act_type=st.selectbox("Categoría",FOLLOWUP_CATEGORIES)
                 act_sup=st.text_input("Supervisor",value=str(r.get("SUPERVISOR","")))
                 act_motivo=st.text_area("Motivo / detalle")
                 act_retro=st.text_area("Retroalimentación (opcional)",placeholder="Observación de retroalimentación, si aplica…")
@@ -2160,7 +2188,7 @@ if _tab_active(g):
 if _tab_active(h):
     with h:
         st.subheader("🛡️ Seguimiento")
-        st.caption("Vista consolidada de todos los pickers: retroalimentaciones, seguimientos, actas y tolerancias. Filtra y ordena para ver rápidamente dónde hay más seguimiento.")
+        st.caption("Todos los registros se organizan en tres categorías: 1. Seguimiento, 2. Acta y 3. 0 Tolerancia.")
         ctx,_,_,_=global_context(context_identity)
         selected_context=apply_context(s_view,ctx,identity_df=context_identity)
         selected_context=selected_context[selected_context.get("CATEGORIA",pd.Series("Picker",index=selected_context.index)).astype(str).eq("Picker")].copy()
@@ -2170,26 +2198,39 @@ if _tab_active(h):
         for _,rr in selected_context.iterrows():
             picker=str(rr.get("PICKER","")); rec0=picker_record(store,picker,aliases=[str(rr.get("_SOURCE_PICKER",""))])
             acciones=rec0.get("acciones",[]) or []
+            documentos=rec0.get("documentos",[]) or []
             retro_legacy=[z for z in store.get("feedback_rows",[]) if str(z.get("PICKER",""))==picker]
             retro_new=[z for z in acciones if str(z.get("retroalimentacion","")).strip()]
-            tipos=[str(z.get("accion","")) for z in acciones]
-            actas=sum(1 for t in tipos if "Acta" in t); llamadas=sum(1 for t in tipos if "Llamada" in t or "Advertencia" in t); cero=sum(1 for t in tipos if "Cero tolerancia" in t)
-            all_rows.append({"PICKER":picker,"TURNO":rr.get("TURNO",""),"SUPERVISOR":rr.get("SUPERVISOR",""),"AREA":rr.get("AREA_BASE",""),"RETROALIMENTACIONES":len(retro_legacy)+len(retro_new),"SEGUIMIENTOS":len(acciones),"ACTAS":actas,"LLAMADAS / ADVERTENCIAS":llamadas,"CERO TOLERANCIA":cero,"TOTAL":len(acciones)+len(retro_legacy),"ÚLTIMO SEGUIMIENTO":max([str(z.get("fecha","")) for z in acciones],default="")})
+            categorias=[normalize_followup_category(z.get("accion","")) for z in acciones]
+            categorias += [normalize_followup_category(z.get("tipo","")) for z in documentos]
+            seguimiento_count=sum(c==FOLLOWUP_CATEGORIES[0] for c in categorias)
+            acta_count=sum(c==FOLLOWUP_CATEGORIES[1] for c in categorias)
+            tolerancia_count=sum(c==FOLLOWUP_CATEGORIES[2] for c in categorias)
+            fechas=[str(z.get("fecha","")) for z in acciones+documentos if z.get("fecha")]
+            all_rows.append({"PICKER":picker,"TURNO":rr.get("TURNO",""),"SUPERVISOR":rr.get("SUPERVISOR",""),"AREA":rr.get("AREA_BASE",""),"RETROALIMENTACIONES":len(retro_legacy)+len(retro_new),"1. SEGUIMIENTO":seguimiento_count,"2. ACTA":acta_count,"3. 0 TOLERANCIA":tolerancia_count,"DOCUMENTOS":len(documentos),"TOTAL":len(acciones)+len(documentos)+len(retro_legacy),"ÚLTIMO SEGUIMIENTO":max(fechas,default="")})
         seguimiento_df=pd.DataFrame(all_rows)
         if seguimiento_df.empty: st.info("No hay pickers disponibles para seguimiento.")
         else:
             with st.container(border=True):
                 fc1,fc2,fc3,fc4=st.columns(4)
                 search_seg=fc1.text_input("Buscar picker",placeholder="Nombre…",key="seguimiento_global_search")
-                seg_filter=fc2.selectbox("Estado",["Todos","Con actas","Sin actas","Con cero tolerancia","Sin seguimiento"],key="seguimiento_global_estado")
-                seg_sort=fc3.selectbox("Ordenar por",["ACTAS","SEGUIMIENTOS","CERO TOLERANCIA","RETROALIMENTACIONES","TOTAL"],key="seguimiento_global_sort")
+                old_filter_map={"Con actas":"Con 2. Acta","Sin actas":"Sin 2. Acta","Con cero tolerancia":"Con 3. 0 Tolerancia","Sin seguimiento":"Sin 1. Seguimiento"}
+                if st.session_state.get("seguimiento_global_estado") in old_filter_map:
+                    st.session_state["seguimiento_global_estado"]=old_filter_map[st.session_state["seguimiento_global_estado"]]
+                old_sort_map={"ACTAS":"2. ACTA","SEGUIMIENTOS":"1. SEGUIMIENTO","CERO TOLERANCIA":"3. 0 TOLERANCIA","LLAMADAS / ADVERTENCIAS":"1. SEGUIMIENTO"}
+                if st.session_state.get("seguimiento_global_sort") in old_sort_map:
+                    st.session_state["seguimiento_global_sort"]=old_sort_map[st.session_state["seguimiento_global_sort"]]
+                seg_filter=fc2.selectbox("Estado",["Todos","Con 1. Seguimiento","Sin 1. Seguimiento","Con 2. Acta","Sin 2. Acta","Con 3. 0 Tolerancia","Sin 3. 0 Tolerancia"],key="seguimiento_global_estado")
+                seg_sort=fc3.selectbox("Ordenar por",["1. SEGUIMIENTO","2. ACTA","3. 0 TOLERANCIA","RETROALIMENTACIONES","DOCUMENTOS","TOTAL"],key="seguimiento_global_sort")
                 seg_dir=fc4.selectbox("Orden",["Mayor a menor","Menor a mayor"],key="seguimiento_global_dir")
                 view=seguimiento_df.copy()
                 if search_seg.strip(): view=view[view["PICKER"].map(norm).str.contains(norm(search_seg),regex=False)]
-                if seg_filter=="Con actas": view=view[view["ACTAS"]>0]
-                elif seg_filter=="Sin actas": view=view[view["ACTAS"]==0]
-                elif seg_filter=="Con cero tolerancia": view=view[view["CERO TOLERANCIA"]>0]
-                elif seg_filter=="Sin seguimiento": view=view[view["SEGUIMIENTOS"]==0]
+                if seg_filter=="Con 1. Seguimiento": view=view[view["1. SEGUIMIENTO"]>0]
+                elif seg_filter=="Sin 1. Seguimiento": view=view[view["1. SEGUIMIENTO"]==0]
+                elif seg_filter=="Con 2. Acta": view=view[view["2. ACTA"]>0]
+                elif seg_filter=="Sin 2. Acta": view=view[view["2. ACTA"]==0]
+                elif seg_filter=="Con 3. 0 Tolerancia": view=view[view["3. 0 TOLERANCIA"]>0]
+                elif seg_filter=="Sin 3. 0 Tolerancia": view=view[view["3. 0 TOLERANCIA"]==0]
                 view=view.sort_values(seg_sort,ascending=(seg_dir=="Menor a mayor"))
                 st.dataframe(view,use_container_width=True,hide_index=True)
             st.caption(f"{len(view):,} pickers visibles.")
@@ -2211,11 +2252,14 @@ if _tab_active(h):
             rec=picker_record(store,seguimiento_picker,aliases=[str(r.get("_SOURCE_PICKER",""))])
             acciones=rec.get("acciones",[]) or []; documentos=rec.get("documentos",[]) or []
             st.markdown(f"<div class='justo-card'><div class='justo-kicker'>Expediente</div><div class='justo-title'>{seguimiento_picker}</div><div class='justo-muted'>Turno: {r.TURNO} · Supervisor: {r.SUPERVISOR} · Área: {r.AREA_BASE}</div></div>",unsafe_allow_html=True)
-            k1,k2,k3,k4=st.columns(4)
+            k1,k2,k3,k4,k5=st.columns(5)
+            categorias_picker=[normalize_followup_category(z.get("accion","")) for z in acciones]
+            categorias_picker += [normalize_followup_category(z.get("tipo","")) for z in documentos]
             k1.metric("Retroalimentaciones",f"{sum(1 for z in acciones if str(z.get('retroalimentacion','')).strip()):,}")
-            k2.metric("Seguimientos",f"{len(acciones):,}")
-            k3.metric("Actas / tolerancias",f"{sum(1 for z in acciones if 'Acta' in str(z.get('accion','')) or 'Cero tolerancia' in str(z.get('accion',''))):,}")
-            k4.metric("Documentos",f"{len(documentos):,}")
+            k2.metric("1. Seguimiento",f"{sum(c==FOLLOWUP_CATEGORIES[0] for c in categorias_picker):,}")
+            k3.metric("2. Acta",f"{sum(c==FOLLOWUP_CATEGORIES[1] for c in categorias_picker):,}")
+            k4.metric("3. 0 Tolerancia",f"{sum(c==FOLLOWUP_CATEGORIES[2] for c in categorias_picker):,}")
+            k5.metric("Documentos",f"{len(documentos):,}")
             with st.container(border=True):
                 st.markdown("### 📋 Historial de seguimiento")
                 if acciones:
@@ -2224,8 +2268,8 @@ if _tab_active(h):
                     st.dataframe(hist.sort_values("Fecha",ascending=False)[cols],use_container_width=True,hide_index=True)
                 else: st.info("Este picker todavía no tiene seguimientos registrados.")
             with st.container(border=True):
-                st.markdown("### 📄 Subir seguimiento / acta")
-                st.caption("Adjunta un PDF o elige uno de los enlaces de seguimiento que ya guardaste.")
+                st.markdown("### 📄 Registrar seguimiento")
+                st.caption("Selecciona una categoría: 1. Seguimiento, 2. Acta o 3. 0 Tolerancia. Adjunta un PDF o elige un enlace guardado.")
                 recursos=store.get("recursos_formatos",[]) or []
                 recurso_lookup={}
                 for i,z in enumerate(recursos):
@@ -2243,7 +2287,7 @@ if _tab_active(h):
                 destinatarios=st.text_input("Correo(s) destinatario(s)",placeholder="persona@correo.com (separa varios con coma)",key=f"seguimiento_destinatarios_{person_key(seguimiento_picker)}") if enviar_copia else ""
                 with st.form(f"seguimiento_documento_form_{seguimiento_picker}",clear_on_submit=True):
                     dc1,dc2=st.columns([1,2])
-                    with dc1: doc_tipo=st.selectbox("Tipo de documento",["Acta 1","Acta 2","Acta 3","Llamada de atención","Advertencia verbal 1","Advertencia verbal 2","Cero tolerancia","Otro"])
+                    with dc1: doc_tipo=st.selectbox("Categoría",FOLLOWUP_CATEGORIES)
                     with dc2: doc_titulo=st.text_input("Nombre / referencia",placeholder="Ej. Acta por FNR — septiembre 2026")
                     doc_detalle=st.text_area("Detalle / motivo",placeholder="Qué originó el seguimiento y cualquier dato importante…")
                     doc_pdf=st.file_uploader("📎 Adjuntar PDF",type=["pdf"],accept_multiple_files=False,key=f"seguimiento_pdf_{seguimiento_picker}")
@@ -2303,7 +2347,7 @@ if _tab_active(h):
                                     st.rerun()
                 with st.form("seg_recurso_form",clear_on_submit=True):
                     q1,q2=st.columns([1,2])
-                    with q1: rt=st.selectbox("Tipo",["Retroalimentación","Seguimiento","Llamada de atención","Acta","Otro"])
+                    with q1: rt=st.selectbox("Categoría",FOLLOWUP_CATEGORIES)
                     with q2: rn=st.text_input("Nombre")
                     ru=st.text_input("Enlace",placeholder="https://...")
                     if st.form_submit_button("Guardar enlace reutilizable"):
