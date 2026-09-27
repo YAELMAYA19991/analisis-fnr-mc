@@ -5,7 +5,7 @@
 # ================================================================
 
 
-import io, re, json, os, smtplib, ssl, zipfile, urllib.request, urllib.error, urllib.parse
+import io, re, json, os, smtplib, ssl, zipfile, hashlib, urllib.request, urllib.error, urllib.parse
 from difflib import SequenceMatcher
 from datetime import datetime
 from email.message import EmailMessage
@@ -193,13 +193,50 @@ def persist_upload(upload, key):
             except OSError: pass
     with open(path, "wb") as f:
         f.write(data)
-    if cloud_enabled():
+    if cloud_enabled() and changed:
         cloud_upload(current_key,data,"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     if changed:
-        try: upload_history_zip.clear()
-        except Exception: pass
+        st.session_state.pop("_excel_history_zip_ready",None)
+        for _cached in (upload_history_zip,upload_history_rows,persisted_status,_load_persisted_upload_bytes):
+            try: _cached.clear()
+            except Exception: pass
     return io.BytesIO(data)
 
+def persist_uploaded_once(upload,key):
+    """Evita volver a guardar el mismo archivo tras cada interacción de Streamlit."""
+    if upload is None: return load_persisted_upload(key)
+    file_id=getattr(upload,"file_id",None) or getattr(upload,"id",None)
+    identity=(file_id,str(getattr(upload,"name","")),int(getattr(upload,"size",0) or 0))
+    if not file_id:
+        identity+=(hashlib.sha256(upload.getvalue()).hexdigest(),)
+    seen=st.session_state.setdefault("_processed_excel_uploads",{})
+    if seen.get(key)==identity:
+        return io.BytesIO(upload.getvalue())
+    result=persist_upload(upload,key)
+    seen[key]=identity
+    return result
+
+@st.cache_data(show_spinner=False,max_entries=4,ttl=30)
+def _load_persisted_upload_bytes(key):
+    """Cache corto para que los reruns no vuelvan a descargar los cuatro Excel."""
+    path=PERSIST_FILES[key]
+    if cloud_enabled():
+        data=cloud_download(f"uploads/current/{key}.xlsx",missing_ok=True)
+        if data is not None:
+            ensure_persist_dir()
+            with open(path,"wb") as f: f.write(data)
+            return data
+    if not os.path.exists(path): return None
+    try:
+        with open(path,"rb") as f: data=f.read()
+        if not data: return None
+        if cloud_enabled():
+            cloud_upload(f"uploads/current/{key}.xlsx",data,"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        return data
+    except Exception:
+        return None
+
+@st.cache_data(show_spinner=False,max_entries=1,ttl=60)
 def upload_history_rows():
     rows=[]
     labels={"base_picker":"Base de Pickers / Líneas","detalle_fnr":"Detalle FNR","detalle_mc":"Detalle Mala Calidad","plantilla_personal":"Plantilla consolidada"}
@@ -244,27 +281,11 @@ def upload_history_zip():
     return out.getvalue()
 
 def load_persisted_upload(key):
-    """Recupera el último Excel guardado cuando el uploader está vacío."""
-    path=PERSIST_FILES[key]
-    if cloud_enabled():
-        data=cloud_download(f"uploads/current/{key}.xlsx",missing_ok=True)
-        if data is not None:
-            ensure_persist_dir()
-            with open(path,"wb") as f: f.write(data)
-            return io.BytesIO(data)
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, "rb") as f:
-            data=f.read()
-        if not data:
-            return None
-        if cloud_enabled():
-            cloud_upload(f"uploads/current/{key}.xlsx",data,"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        return io.BytesIO(data)
-    except Exception:
-        return None
+    """Recupera el Excel guardado; los bytes se cachean durante 30 segundos."""
+    data=_load_persisted_upload_bytes(key)
+    return io.BytesIO(data) if data is not None else None
 
+@st.cache_data(show_spinner=False,max_entries=1,ttl=60)
 def persisted_status():
     status={k: os.path.exists(v) and os.path.getsize(v)>0 for k,v in PERSIST_FILES.items()}
     if cloud_enabled():
@@ -310,13 +331,17 @@ def save_process_image(data, process_id, filename):
         return "cloud://"+key
     return path
 
+@st.cache_data(show_spinner=False,max_entries=300,ttl=300)
+def _load_cloud_asset_bytes(key):
+    return cloud_download(key,missing_ok=True)
+
 def load_process_images(process):
     result=[]
     for path in process.get("imagenes",[]):
         if str(path).startswith("cloud://"):
             key=str(path)[len("cloud://"):]
             try:
-                data=cloud_download(key,missing_ok=True)
+                data=_load_cloud_asset_bytes(key)
                 if data is not None: result.append((os.path.basename(key),data))
             except Exception: pass
             continue
@@ -347,7 +372,7 @@ def save_followup_pdf(data, picker, filename):
 def load_followup_pdf(doc):
     path=str(doc.get("path", ""))
     if path.startswith("cloud://"):
-        try: return cloud_download(path[len("cloud://"):],missing_ok=True)
+        try: return _load_cloud_asset_bytes(path[len("cloud://"):])
         except Exception: return None
     if not path or not os.path.exists(path):
         return None
@@ -400,6 +425,9 @@ def load_store():
         data=json.loads(cloud_data.decode("utf-8"))
         if not isinstance(data,dict): raise RuntimeError("El expediente guardado en la nube no contiene un objeto JSON válido.")
         for key,value in {"pickers":{},"feedback_rows":[],"recursos_formatos":[],"procesos":[],"excluded_orders":[],"master_overrides":{},"master_excluded":[],"seguimientos_documentos":[],"supervisores":[],"upload_meta":{}}.items(): data.setdefault(key,value)
+        try:
+            with open(STORE_FILE,"wb") as f: f.write(json.dumps(data,ensure_ascii=False,indent=2).encode("utf-8"))
+        except OSError: pass
         return data
     candidates=[STORE_FILE, LEGACY_STORE_FILE]
     for path in candidates:
@@ -429,10 +457,16 @@ def load_store():
 
 def save_store(store):
     ensure_persist_dir()
-    tmp = STORE_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f: json.dump(store, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, STORE_FILE)
-    if cloud_enabled(): cloud_upload(CLOUD_STORE_KEY,json.dumps(store,ensure_ascii=False,indent=2).encode("utf-8"),"application/json")
+    payload=json.dumps(store,ensure_ascii=False,indent=2).encode("utf-8")
+    try:
+        with open(STORE_FILE,"rb") as f:
+            if f.read()==payload: return
+    except OSError:
+        pass
+    tmp=STORE_FILE+".tmp"
+    with open(tmp,"wb") as f: f.write(payload)
+    os.replace(tmp,STORE_FILE)
+    if cloud_enabled(): cloud_upload(CLOUD_STORE_KEY,payload,"application/json")
 
 def picker_record(store, picker, aliases=None):
     """Devuelve un único expediente por persona, aunque cambie el orden/formato del nombre.
@@ -1093,6 +1127,32 @@ def attach(inc,base):
     y.drop(columns=["_EMAIL_KEY"],errors="ignore",inplace=True)
     return y
 
+@st.cache_data(show_spinner="Procesando los Excel por primera vez…",max_entries=2,ttl=1800)
+def prepare_source_frames(base_data,fnr_data,mc_data,roster_data,personnel_config_json):
+    """Procesa y cruza las fuentes una vez por versión de archivos/configuración."""
+    config=json.loads(personnel_config_json)
+    base=parse_base(choose(sheets_from_bytes(base_data),["picker","lineas","resumen"]))
+    fnr=parse_inc(choose(sheets_from_bytes(fnr_data),["fnr","detalle"]),"FNR")
+    mc=parse_inc(choose(sheets_from_bytes(mc_data),["mc","mala"]),"MC")
+    roster=template_roster_from_upload(roster_data)
+    if roster.empty:
+        raise ValueError("La plantilla consolidada no contiene correos válidos.")
+    base=apply_roster(base,roster)
+    base=apply_manual_personnel(base,config)
+    base_match=(base.get("_MASTER_MATCH",pd.Series(False,index=base.index)).fillna(False).astype(bool)
+                | base.get("_MANUAL_MATCH",pd.Series(False,index=base.index)).fillna(False).astype(bool))
+    base["CATEGORIA"]=np.where(base_match,"Picker","Sin registrar")
+    base=_dedupe_columns(base)
+    roster=effective_roster(roster,config)
+    fnr=canonicalize_incidents(fnr,roster)
+    mc=canonicalize_incidents(mc,roster)
+    identity=roster.rename(columns={"TURNO_MAESTRO":"TURNO","AREA_MAESTRO":"AREA_BASE"}).copy()
+    fnr=attach(fnr,identity); mc=attach(mc,identity)
+    fnr["CORREO_KEY"]=fnr.get("CORREO",pd.Series("",index=fnr.index)).map(email_key)
+    mc["CORREO_KEY"]=mc.get("CORREO",pd.Series("",index=mc.index)).map(email_key)
+    fnr=_dedupe_columns(fnr); mc=_dedupe_columns(mc)
+    return base,fnr,mc,roster
+
 def summary(base,fnr,mc):
     keys=["CATEGORIA","PICKER"]
     b=base.copy()
@@ -1369,8 +1429,11 @@ st.caption("Control operativo de pickers, calidad, seguimiento y procesos")
 
 # Estado persistente: se carga antes de construir los widgets.
 store=load_store()
-cloud_migrated,cloud_missing=migrate_local_assets_to_cloud(store)
-cloud_history_migrated=migrate_local_upload_history_to_cloud()
+if "_startup_migrations_done" not in st.session_state:
+    _migration_result=migrate_local_assets_to_cloud(store)
+    _history_migrated=migrate_local_upload_history_to_cloud()
+    st.session_state["_startup_migrations_done"]=(_migration_result[0],_migration_result[1],_history_migrated)
+cloud_migrated,cloud_missing,cloud_history_migrated=st.session_state["_startup_migrations_done"]
 store.setdefault("excluded_orders", [])
 store.setdefault("feedback_rows", [])
 store.setdefault("master_overrides", {})
@@ -1402,10 +1465,10 @@ with st.sidebar:
 
     # Cada archivo nuevo reemplaza automáticamente al guardado. Si solo se recarga
     # la página, la app recupera la última versión guardada sin pedir volver a subirla.
-    ub=persist_upload(ub_upload,"base_picker") if ub_upload else load_persisted_upload("base_picker")
-    uf=persist_upload(uf_upload,"detalle_fnr") if uf_upload else load_persisted_upload("detalle_fnr")
-    um=persist_upload(um_upload,"detalle_mc") if um_upload else load_persisted_upload("detalle_mc")
-    up=persist_upload(up_upload,"plantilla_personal") if up_upload else load_persisted_upload("plantilla_personal")
+    ub=persist_uploaded_once(ub_upload,"base_picker")
+    uf=persist_uploaded_once(uf_upload,"detalle_fnr")
+    um=persist_uploaded_once(um_upload,"detalle_mc")
+    up=persist_uploaded_once(up_upload,"plantilla_personal")
     for _key,_upload,_label in [("base_picker",ub_upload,"Pickers/Líneas"),("detalle_fnr",uf_upload,"FNR"),("detalle_mc",um_upload,"Mala Calidad"),("plantilla_personal",up_upload,"Plantilla consolidada")]:
         if _upload is not None:
             store.setdefault("upload_meta",{})[_key]={"fecha":datetime.now().strftime("%Y-%m-%d %H:%M:%S"),"archivo":str(getattr(_upload,"name",_label))}
@@ -1420,8 +1483,12 @@ with st.sidebar:
         _history=upload_history_rows()
         if _history:
             st.dataframe(pd.DataFrame(_history),use_container_width=True,hide_index=True)
-            st.download_button("Descargar respaldo del historial (.zip)",upload_history_zip(),"Historial_Excel_FNR_MC.zip","application/zip",key="download_excel_history")
-            st.caption("Se conservan hasta 20 versiones por archivo en el almacenamiento local de la app. Descarga el ZIP para guardar una copia fuera de Streamlit.")
+            if st.button("Preparar ZIP de respaldo",key="prepare_excel_history_zip"):
+                with st.spinner("Preparando el respaldo de archivos…"):
+                    st.session_state["_excel_history_zip_ready"]=upload_history_zip()
+            if st.session_state.get("_excel_history_zip_ready"):
+                st.download_button("Descargar respaldo del historial (.zip)",st.session_state["_excel_history_zip_ready"],"Historial_Excel_FNR_MC.zip","application/zip",key="download_excel_history")
+            st.caption("El ZIP se prepara solo cuando solicitas el respaldo.")
         else:
             st.info("Aún no hay versiones en el historial. Se registra una versión al cargar cada Excel.")
     st.caption("Los 3 Excel operativos se cruzan con la PLANTILLA CONSOLIDADA usando CORREO como única llave. La plantilla aporta el nombre asociado, turno, supervisor y área. El nombre no se usa para hacer coincidencias entre archivos.")
@@ -1441,37 +1508,21 @@ if not (ub and uf and um and up):
     st.stop()
 
 try:
-    base=parse_base(choose(sheets_from_bytes(ub.getvalue()),["picker","lineas","resumen"]))
-    fnr=parse_inc(choose(sheets_from_bytes(uf.getvalue()),["fnr","detalle"]),"FNR")
-    mc=parse_inc(choose(sheets_from_bytes(um.getvalue()),["mc","mala"]),"MC")
-    # LA PLANTILLA CONSOLIDADA es la única fuente de identidad.
-    # No se usa un Excel maestro externo.
-    roster=template_roster_from_upload(up.getvalue())
-    if roster.empty:
-        raise ValueError("La plantilla consolidada no contiene correos válidos.")
-    base=apply_roster(base,roster)
-    base=apply_manual_personnel(base,store)
-    _base_match=(base.get("_MASTER_MATCH",pd.Series(False,index=base.index)).fillna(False).astype(bool)
-                 | base.get("_MANUAL_MATCH",pd.Series(False,index=base.index)).fillna(False).astype(bool))
-    base["CATEGORIA"]=np.where(_base_match,"Picker","Sin registrar")
-    base=_dedupe_columns(base)
-    roster=effective_roster(roster,store)
-    # FNR/MC se identifican directamente contra la PLANTILLA por correo.
-    # NO dependen de que el picker exista primero en la base de líneas.
-    fnr=canonicalize_incidents(fnr,roster)
-    mc=canonicalize_incidents(mc,roster)
+    personnel_config_json=json.dumps({
+        "master_overrides":store.get("master_overrides",{}),
+        "master_excluded":store.get("master_excluded",[]),
+    },ensure_ascii=False,sort_keys=True)
+    base,fnr,mc,roster=prepare_source_frames(
+        ub.getvalue(),uf.getvalue(),um.getvalue(),up.getvalue(),personnel_config_json
+    )
 except Exception as e:
     st.error(f"Error en los archivos cargados: {e}"); st.stop()
 
 if excluded:
     fnr=fnr[~fnr.ORDER_NUMBER.isin(excluded)].copy()
     mc=mc[~mc.ORDER_NUMBER.isin(excluded)].copy()
-# Para FNR/MC, el contexto de turno/área/supervisor viene de la plantilla por correo.
-identity_for_attach=roster.rename(columns={"TURNO_MAESTRO":"TURNO","AREA_MAESTRO":"AREA_BASE"}).copy()
-fnr=attach(fnr,identity_for_attach); mc=attach(mc,identity_for_attach)
-fnr["CORREO_KEY"]=fnr.get("CORREO",pd.Series("",index=fnr.index)).map(email_key)
-mc["CORREO_KEY"]=mc.get("CORREO",pd.Series("",index=mc.index)).map(email_key)
-fnr=_dedupe_columns(fnr); mc=_dedupe_columns(mc); base=_dedupe_columns(base)
+base=_dedupe_columns(base)
+
 base,fnr,mc=exclude_registered_supervisors(base,fnr,mc,store)
 s=summary(base,fnr,mc)
 # Estado de cruce de TODOS los archivos: Pickers/Líneas + FNR + MC.
@@ -1733,7 +1784,7 @@ if len(excluded_mask)==len(s_view):
 context_identity=_context_identity_view(roster,base,fnr,mc)
 
 # Defaults para pestañas que no necesitan filtros globales.
-sp="Todos"
+sp=st.session_state.get("picker_page_picker","Todos")
 stn="Todos"
 ssup="Todos"
 sar="Todos"
@@ -1741,569 +1792,584 @@ base_view=select_summary_people(base,s_view)
 fnr_view=select_summary_people(fnr,s_view)
 mc_view=select_summary_people(mc,s_view)
 
-a,b,e,x,g,h,f,j=st.tabs(["🏠 Bodega","👤 Picker","🌙 Turnos / Áreas","🧩 Correos / Cruce","👥 Supervisores","🛡️ Seguimiento","📥 Exportar","📌 Pendientes & Procesos"])
+_tab_labels=["🏠 Bodega","👤 Picker","🌙 Turnos / Áreas","🧩 Correos / Cruce","👥 Supervisores","🛡️ Seguimiento","📥 Exportar","📌 Pendientes & Procesos"]
+try:
+    a,b,e,x,g,h,f,j=st.tabs(_tab_labels,on_change="rerun",key="control_fnr_mc_tabs")
+except TypeError:
+    a,b,e,x,g,h,f,j=st.tabs(_tab_labels)
+def _tab_active(tab):
+    # Older Streamlit versions return no selected state; render normally there.
+    return getattr(tab,"open",None) is not False
 
-with a:
-    st.subheader(f"Resumen de bodega — {periodo}")
-    st.caption("El contexto elegido aquí se comparte automáticamente con todas las pestañas.")
-    _meta=store.get("upload_meta",{}) or {}
-    _upload_rows=[]
-    for _k,_label in [("base_picker","Pickers / Líneas"),("detalle_fnr","FNR"),("detalle_mc","Mala Calidad"),("plantilla_personal","Plantilla consolidada")]:
-        _m=_meta.get(_k,{}) or {}
-        _upload_rows.append({"Archivo":_label,"Última carga":_m.get("fecha","Sin registro"),"Nombre":_m.get("archivo","")})
-    with st.expander("🕒 Última carga de Excel",expanded=True):
-        st.dataframe(pd.DataFrame(_upload_rows),use_container_width=True,hide_index=True)
-    ctx,turns,sups,areas=global_context(context_identity)
-    with st.container(border=True):
-        st.markdown("**🎯 Contexto global de análisis**")
-        c1,c2,c3=st.columns(3)
-        with c1:
-            st.selectbox("Turno",turns,key="global_turno")
-        with c2:
-            st.selectbox("Supervisor",sups,key="global_supervisor")
-        with c3:
-            st.selectbox("Área",areas,key="global_area")
-    ctx["turno"]=st.session_state.get("global_turno","Todos")
-    ctx["supervisor"]=st.session_state.get("global_supervisor","Todos")
-    ctx["area"]=st.session_state.get("global_area","Todos")
+if _tab_active(a):
+    with a:
+        st.subheader(f"Resumen de bodega — {periodo}")
+        st.caption("El contexto elegido aquí se comparte automáticamente con todas las pestañas.")
+        _meta=store.get("upload_meta",{}) or {}
+        _upload_rows=[]
+        for _k,_label in [("base_picker","Pickers / Líneas"),("detalle_fnr","FNR"),("detalle_mc","Mala Calidad"),("plantilla_personal","Plantilla consolidada")]:
+            _m=_meta.get(_k,{}) or {}
+            _upload_rows.append({"Archivo":_label,"Última carga":_m.get("fecha","Sin registro"),"Nombre":_m.get("archivo","")})
+        with st.expander("🕒 Última carga de Excel",expanded=True):
+            st.dataframe(pd.DataFrame(_upload_rows),use_container_width=True,hide_index=True)
+        ctx,turns,sups,areas=global_context(context_identity)
+        with st.container(border=True):
+            st.markdown("**🎯 Contexto global de análisis**")
+            c1,c2,c3=st.columns(3)
+            with c1:
+                st.selectbox("Turno",turns,key="global_turno")
+            with c2:
+                st.selectbox("Supervisor",sups,key="global_supervisor")
+            with c3:
+                st.selectbox("Área",areas,key="global_area")
+        ctx["turno"]=st.session_state.get("global_turno","Todos")
+        ctx["supervisor"]=st.session_state.get("global_supervisor","Todos")
+        ctx["area"]=st.session_state.get("global_area","Todos")
 
-    # Mantener el flujo de la versión anterior que sí cargaba el contexto:
-    # primero filtra el resumen canónico desde plantilla y después aplica
-    # esos pickers a base, FNR y MC.
-    s_bodega=apply_context(s_view,ctx,identity_df=context_identity)
-    s_reference=context_reference(s_view,ctx,identity_df=context_identity)
-    base_bodega=select_summary_people(base,s_bodega)
-    fnr_bodega=select_summary_people(fnr,s_bodega)
-    mc_bodega=select_summary_people(mc,s_bodega)
-    base_reference=select_summary_people(base,s_reference)
-    fnr_reference=select_summary_people(fnr,s_reference)
-    mc_reference=select_summary_people(mc,s_reference)
-    render_context_banner(ctx,s_bodega,s_reference)
+        # Mantener el flujo de la versión anterior que sí cargaba el contexto:
+        # primero filtra el resumen canónico desde plantilla y después aplica
+        # esos pickers a base, FNR y MC.
+        s_bodega=apply_context(s_view,ctx,identity_df=context_identity)
+        s_reference=context_reference(s_view,ctx,identity_df=context_identity)
+        base_bodega=select_summary_people(base,s_bodega)
+        fnr_bodega=select_summary_people(fnr,s_bodega)
+        mc_bodega=select_summary_people(mc,s_bodega)
+        base_reference=select_summary_people(base,s_reference)
+        fnr_reference=select_summary_people(fnr,s_reference)
+        mc_reference=select_summary_people(mc,s_reference)
+        render_context_banner(ctx,s_bodega,s_reference)
 
-    lines=base_bodega.LINEAS.sum(); F=fnr_bodega.INCIDENCIAS.sum(); M=mc_bodega.INCIDENCIAS.sum()
-    total_pedidos,fnr_pedidos,mc_pedidos,fnr_rate,mc_rate=monthly_kpis(base_bodega,fnr_bodega,mc_bodega)
-    _picker_count=int(s_bodega.get("CATEGORIA",pd.Series("Picker",index=s_bodega.index)).astype(str).eq("Picker").sum())
-    _unregistered_count=int(s_bodega.get("CATEGORIA",pd.Series("Picker",index=s_bodega.index)).astype(str).eq("Sin registrar").sum())
-    _reference_picker_count=int(s_reference.get("CATEGORIA",pd.Series("Picker",index=s_reference.index)).astype(str).eq("Picker").sum())
-    render_soft_kpis([
-        ("Líneas",f"{lines:,.0f}",f"{lines/base_reference.LINEAS.sum()*100:.1f}% del universo" if base_reference.LINEAS.sum() else "Sin referencia","blue"),
-        ("Pedidos",f"{total_pedidos:,.0f}",f"{total_pedidos/base_reference.PEDIDOS.sum()*100:.1f}% del universo" if base_reference.PEDIDOS.sum() else "Sin referencia","green"),
-        ("Pickers",f"{_picker_count:,}",f"{_picker_count/_reference_picker_count*100:.1f}% del universo · {_unregistered_count:,} sin registrar" if _reference_picker_count else f"{_unregistered_count:,} sin registrar","blue"),
-    ])
-    render_soft_kpis([
-        ("FNR mensual",f"{fnr_rate:.2f}%" if fnr_rate is not None else "N/D","Objetivo < 1.50%","red"),
-        ("MC mensual",f"{mc_rate:.2f}%" if mc_rate is not None else "N/D","Objetivo < 1.00%","amber"),
-        ("Fuera objetivo",f"{int(((s_bodega.ESTADO=="🔴 FUERA DE OBJETIVO") & s_bodega.CATEGORIA.eq("Picker")).sum()):,}",f"de {_picker_count:,} pickers · {_unregistered_count:,} sin registrar","red"),
-    ])
-    if fnr_rate is not None and mc_rate is not None:
-        st.caption(f"KPI mensual del contexto: {fnr_pedidos:,} pedidos con FNR / {total_pedidos:,} pedidos = {fnr_rate:.2f}% · {mc_pedidos:,} pedidos con MC / {total_pedidos:,} pedidos = {mc_rate:.2f}%")
-    else:
-        st.caption("No hay suficientes pedidos para calcular el KPI mensual.")
+        lines=base_bodega.LINEAS.sum(); F=fnr_bodega.INCIDENCIAS.sum(); M=mc_bodega.INCIDENCIAS.sum()
+        total_pedidos,fnr_pedidos,mc_pedidos,fnr_rate,mc_rate=monthly_kpis(base_bodega,fnr_bodega,mc_bodega)
+        _picker_count=int(s_bodega.get("CATEGORIA",pd.Series("Picker",index=s_bodega.index)).astype(str).eq("Picker").sum())
+        _unregistered_count=int(s_bodega.get("CATEGORIA",pd.Series("Picker",index=s_bodega.index)).astype(str).eq("Sin registrar").sum())
+        _reference_picker_count=int(s_reference.get("CATEGORIA",pd.Series("Picker",index=s_reference.index)).astype(str).eq("Picker").sum())
+        render_soft_kpis([
+            ("Líneas",f"{lines:,.0f}",f"{lines/base_reference.LINEAS.sum()*100:.1f}% del universo" if base_reference.LINEAS.sum() else "Sin referencia","blue"),
+            ("Pedidos",f"{total_pedidos:,.0f}",f"{total_pedidos/base_reference.PEDIDOS.sum()*100:.1f}% del universo" if base_reference.PEDIDOS.sum() else "Sin referencia","green"),
+            ("Pickers",f"{_picker_count:,}",f"{_picker_count/_reference_picker_count*100:.1f}% del universo · {_unregistered_count:,} sin registrar" if _reference_picker_count else f"{_unregistered_count:,} sin registrar","blue"),
+        ])
+        render_soft_kpis([
+            ("FNR mensual",f"{fnr_rate:.2f}%" if fnr_rate is not None else "N/D","Objetivo < 1.50%","red"),
+            ("MC mensual",f"{mc_rate:.2f}%" if mc_rate is not None else "N/D","Objetivo < 1.00%","amber"),
+            ("Fuera objetivo",f"{int(((s_bodega.ESTADO=="🔴 FUERA DE OBJETIVO") & s_bodega.CATEGORIA.eq("Picker")).sum()):,}",f"de {_picker_count:,} pickers · {_unregistered_count:,} sin registrar","red"),
+        ])
+        if fnr_rate is not None and mc_rate is not None:
+            st.caption(f"KPI mensual del contexto: {fnr_pedidos:,} pedidos con FNR / {total_pedidos:,} pedidos = {fnr_rate:.2f}% · {mc_pedidos:,} pedidos con MC / {total_pedidos:,} pedidos = {mc_rate:.2f}%")
+        else:
+            st.caption("No hay suficientes pedidos para calcular el KPI mensual.")
 
-    st.subheader("Comparativo del contexto")
-    render_turn_comparison(base_bodega,base_reference,fnr_bodega,fnr_reference,mc_bodega,mc_reference)
+        st.subheader("Comparativo del contexto")
+        render_turn_comparison(base_bodega,base_reference,fnr_bodega,fnr_reference,mc_bodega,mc_reference)
 
-    st.subheader("Indicador operativo por líneas")
-    k=st.columns(2)
-    k[0].metric("FNR / líneas",f"{F/lines*100:.2f}%" if lines else "N/D")
-    k[1].metric("MC / líneas",f"{M/lines*100:.2f}%" if lines else "N/D")
-    st.subheader("Detalle por picker")
-    st.dataframe(s_bodega,use_container_width=True,hide_index=True)
+        st.subheader("Indicador operativo por líneas")
+        k=st.columns(2)
+        k[0].metric("FNR / líneas",f"{F/lines*100:.2f}%" if lines else "N/D")
+        k[1].metric("MC / líneas",f"{M/lines*100:.2f}%" if lines else "N/D")
+        st.subheader("Detalle por picker")
+        st.dataframe(s_bodega,use_container_width=True,hide_index=True)
 
-    st.divider()
-    st.subheader("🏷️ Artículos")
-    st.caption("Artículos con incidencia dentro del mismo turno, supervisor y área seleccionados arriba.")
-    tipo_articulos=st.radio("Tipo de incidencia",["FNR","MC"],horizontal=True,key="articulos_tipo")
-    datos_articulos=fnr_bodega if tipo_articulos=="FNR" else mc_bodega
-    articulos_view=(datos_articulos.groupby(["PRODUCTO","AREA"],as_index=False).INCIDENCIAS.sum()
-                    .rename(columns={"INCIDENCIAS":"CANTIDAD"}).sort_values("CANTIDAD",ascending=False))
-    st.dataframe(articulos_view,use_container_width=True,hide_index=True)
-    st.caption(f"{len(articulos_view):,} artículos con incidencia · {int(articulos_view.CANTIDAD.sum()) if not articulos_view.empty else 0:,} incidencias dentro del contexto seleccionado.")
+        st.divider()
+        st.subheader("🏷️ Artículos")
+        st.caption("Artículos con incidencia dentro del mismo turno, supervisor y área seleccionados arriba.")
+        tipo_articulos=st.radio("Tipo de incidencia",["FNR","MC"],horizontal=True,key="articulos_tipo")
+        datos_articulos=fnr_bodega if tipo_articulos=="FNR" else mc_bodega
+        articulos_view=(datos_articulos.groupby(["PRODUCTO","AREA"],as_index=False).INCIDENCIAS.sum()
+                        .rename(columns={"INCIDENCIAS":"CANTIDAD"}).sort_values("CANTIDAD",ascending=False))
+        st.dataframe(articulos_view,use_container_width=True,hide_index=True)
+        st.caption(f"{len(articulos_view):,} artículos con incidencia · {int(articulos_view.CANTIDAD.sum()) if not articulos_view.empty else 0:,} incidencias dentro del contexto seleccionado.")
 
-    st.divider()
-    st.subheader("📦 Pedidos")
-    st.caption("Pedidos con incidencia dentro del mismo turno, supervisor y área seleccionados arriba.")
-    tipo_pedidos=st.radio("Tipo de incidencia",["FNR","MC"],horizontal=True,key="pedidos_tipo")
-    datos_pedidos=fnr_bodega if tipo_pedidos=="FNR" else mc_bodega
-    pedidos_bodega=orders(datos_pedidos)
-    st.dataframe(pedidos_bodega,use_container_width=True,hide_index=True)
-    st.caption("PICKERS indica cuántos pickers aparecen en el mismo pedido.")
+        st.divider()
+        st.subheader("📦 Pedidos")
+        st.caption("Pedidos con incidencia dentro del mismo turno, supervisor y área seleccionados arriba.")
+        tipo_pedidos=st.radio("Tipo de incidencia",["FNR","MC"],horizontal=True,key="pedidos_tipo")
+        datos_pedidos=fnr_bodega if tipo_pedidos=="FNR" else mc_bodega
+        pedidos_bodega=orders(datos_pedidos)
+        st.dataframe(pedidos_bodega,use_container_width=True,hide_index=True)
+        st.caption("PICKERS indica cuántos pickers aparecen en el mismo pedido.")
 
-with b:
-    ctx,_,_,_=global_context(context_identity)
-    selected_context=apply_context(s_view,ctx,identity_df=context_identity)
-    st.subheader("👤 Ficha de picker")
-    st.caption("El turno, supervisor y área se heredan del contexto elegido en Bodega. Aquí solo buscas el picker.")
-    render_context_banner(ctx,selected_context,context_reference(s_view,ctx,identity_df=context_identity),"Contexto heredado")
-    names=person_options(selected_context[selected_context.get("CATEGORIA",pd.Series("Picker",index=selected_context.index)).astype(str).eq("Picker")])
-    with st.container(border=True):
-        search=st.text_input("🔎 Buscar picker",placeholder="Escribe parte del nombre…",key="picker_page_search")
-        filtered_names=names
-        if search.strip():
-            term=norm(search)
-            filtered_names=[n for n in names if term in norm(n)]
-        picker_choice=st.selectbox("Selecciona un picker",["Todos"]+filtered_names,key="picker_page_picker")
-    sp=picker_choice
-    if sp=="Todos":
-        st.info("Escribe parte del nombre o selecciona un picker para consultar su ficha completa.")
-    else:
-        r=s[s.PICKER==sp].iloc[0]
-        st.markdown(f"<div class='justo-card'><div class='justo-kicker'>Ficha de picker</div><div class='justo-title'>{sp}</div><div class='justo-muted'>Turno: {r.TURNO} · Supervisor: {r.SUPERVISOR} · Área: {r.AREA_BASE} · Usuario: {r.CORREO}</div></div>", unsafe_allow_html=True)
-        q=st.columns(4)
-        q[0].metric("Líneas",f"{r.LINEAS:,.0f}")
-        q[1].metric("FNR",f"{r.FNR:,.0f}",f"{r['FNR_%']:.2f}%")
-        q[2].metric("MC",f"{r.MC:,.0f}",f"{r['MC_%']:.2f}%")
-        q[3].metric("Estado",r.ESTADO)
+if _tab_active(b):
+    with b:
+        ctx,_,_,_=global_context(context_identity)
+        selected_context=apply_context(s_view,ctx,identity_df=context_identity)
+        st.subheader("👤 Ficha de picker")
+        st.caption("El turno, supervisor y área se heredan del contexto elegido en Bodega. Aquí solo buscas el picker.")
+        render_context_banner(ctx,selected_context,context_reference(s_view,ctx,identity_df=context_identity),"Contexto heredado")
+        names=person_options(selected_context[selected_context.get("CATEGORIA",pd.Series("Picker",index=selected_context.index)).astype(str).eq("Picker")])
+        with st.container(border=True):
+            search=st.text_input("🔎 Buscar picker",placeholder="Escribe parte del nombre…",key="picker_page_search")
+            filtered_names=names
+            if search.strip():
+                term=norm(search)
+                filtered_names=[n for n in names if term in norm(n)]
+            picker_choice=st.selectbox("Selecciona un picker",["Todos"]+filtered_names,key="picker_page_picker")
+        sp=picker_choice
+        if sp=="Todos":
+            st.info("Escribe parte del nombre o selecciona un picker para consultar su ficha completa.")
+        else:
+            r=s[s.PICKER==sp].iloc[0]
+            st.markdown(f"<div class='justo-card'><div class='justo-kicker'>Ficha de picker</div><div class='justo-title'>{sp}</div><div class='justo-muted'>Turno: {r.TURNO} · Supervisor: {r.SUPERVISOR} · Área: {r.AREA_BASE} · Usuario: {r.CORREO}</div></div>", unsafe_allow_html=True)
+            q=st.columns(4)
+            q[0].metric("Líneas",f"{r.LINEAS:,.0f}")
+            q[1].metric("FNR",f"{r.FNR:,.0f}",f"{r['FNR_%']:.2f}%")
+            q[2].metric("MC",f"{r.MC:,.0f}",f"{r['MC_%']:.2f}%")
+            q[3].metric("Estado",r.ESTADO)
 
-        st.subheader("⚠️ Incidencias del picker")
-        st.caption("Cada incidencia está identificada explícitamente como FNR o Mala Calidad (MC).")
-        inc_fnr = fnr[fnr.PICKER == sp].copy()
-        inc_mc = mc[mc.PICKER == sp].copy()
-        total_fnr_inc = int(pd.to_numeric(inc_fnr["INCIDENCIAS"], errors="coerce").fillna(0).sum()) if not inc_fnr.empty else 0
-        total_mc_inc = int(pd.to_numeric(inc_mc["INCIDENCIAS"], errors="coerce").fillna(0).sum()) if not inc_mc.empty else 0
-        ic1, ic2 = st.columns(2)
-        with ic1:
-            st.markdown("<div class='justo-card' style='border-left:4px solid #d64545'><div class='justo-kicker'>FNR · Faltante no reportado</div><div class='justo-title' style='font-size:1.25rem'>%s incidencias</div></div>" % f"{total_fnr_inc:,}", unsafe_allow_html=True)
-        with ic2:
-            st.markdown("<div class='justo-card' style='border-left:4px solid #d6a72c'><div class='justo-kicker'>MC · Mala Calidad</div><div class='justo-title' style='font-size:1.25rem'>%s incidencias</div></div>" % f"{total_mc_inc:,}", unsafe_allow_html=True)
-        cc=st.columns(2)
-        with cc[0]:
-            st.markdown("**🔴 FNR · Faltantes no reportados**")
-            fprod=products(fnr,sp).head(15).copy()
-            if not fprod.empty:
-                fprod.insert(0,"TIPO","FNR")
-            st.dataframe(fprod,use_container_width=True,hide_index=True)
-        with cc[1]:
-            st.markdown("**🟡 MC · Mala Calidad**")
-            mprod=products(mc,sp).head(15).copy()
-            if not mprod.empty:
-                mprod.insert(0,"TIPO","MC")
-            st.dataframe(mprod,use_container_width=True,hide_index=True)
-        st.subheader("📦 Pedidos con incidencia")
-        st.caption("El tipo de incidencia se muestra para distinguir FNR de MC.")
-        of=orders(fnr,sp).head(25).copy()
-        om=orders(mc,sp).head(25).copy()
-        if not of.empty: of.insert(0,"TIPO","FNR")
-        if not om.empty: om.insert(0,"TIPO","MC")
-        pedidos_incidencias=pd.concat([of,om],ignore_index=True)
-        if not pedidos_incidencias.empty:
-            pedidos_incidencias=pedidos_incidencias.sort_values(["TIPO","INCIDENCIAS"],ascending=[True,False])
-        st.dataframe(pedidos_incidencias,use_container_width=True,hide_index=True)
-        st.subheader("Pedidos FNR")
-        st.warning(
-            "⚠️ **Antes de tomar en cuenta los FNR, revisa si la factura/orden tiene algún reporte o incidencia registrada.** "
-            "Valida primero la orden en Backoffice para confirmar si el faltante corresponde realmente a un FNR."
-        )
-        st.markdown(
-            "🔎 **Revisar factura / orden en Backoffice:** "
-            "[Abrir órdenes en Backoffice](https://orders.backoffice.justo.cloud/es/orders)"
-        )
-        st.dataframe(orders(fnr,sp).head(25),use_container_width=True,hide_index=True)
+            st.subheader("⚠️ Incidencias del picker")
+            st.caption("Cada incidencia está identificada explícitamente como FNR o Mala Calidad (MC).")
+            inc_fnr = fnr[fnr.PICKER == sp].copy()
+            inc_mc = mc[mc.PICKER == sp].copy()
+            total_fnr_inc = int(pd.to_numeric(inc_fnr["INCIDENCIAS"], errors="coerce").fillna(0).sum()) if not inc_fnr.empty else 0
+            total_mc_inc = int(pd.to_numeric(inc_mc["INCIDENCIAS"], errors="coerce").fillna(0).sum()) if not inc_mc.empty else 0
+            ic1, ic2 = st.columns(2)
+            with ic1:
+                st.markdown("<div class='justo-card' style='border-left:4px solid #d64545'><div class='justo-kicker'>FNR · Faltante no reportado</div><div class='justo-title' style='font-size:1.25rem'>%s incidencias</div></div>" % f"{total_fnr_inc:,}", unsafe_allow_html=True)
+            with ic2:
+                st.markdown("<div class='justo-card' style='border-left:4px solid #d6a72c'><div class='justo-kicker'>MC · Mala Calidad</div><div class='justo-title' style='font-size:1.25rem'>%s incidencias</div></div>" % f"{total_mc_inc:,}", unsafe_allow_html=True)
+            cc=st.columns(2)
+            with cc[0]:
+                st.markdown("**🔴 FNR · Faltantes no reportados**")
+                fprod=products(fnr,sp).head(15).copy()
+                if not fprod.empty:
+                    fprod.insert(0,"TIPO","FNR")
+                st.dataframe(fprod,use_container_width=True,hide_index=True)
+            with cc[1]:
+                st.markdown("**🟡 MC · Mala Calidad**")
+                mprod=products(mc,sp).head(15).copy()
+                if not mprod.empty:
+                    mprod.insert(0,"TIPO","MC")
+                st.dataframe(mprod,use_container_width=True,hide_index=True)
+            st.subheader("📦 Pedidos con incidencia")
+            st.caption("El tipo de incidencia se muestra para distinguir FNR de MC.")
+            of=orders(fnr,sp).head(25).copy()
+            om=orders(mc,sp).head(25).copy()
+            if not of.empty: of.insert(0,"TIPO","FNR")
+            if not om.empty: om.insert(0,"TIPO","MC")
+            pedidos_incidencias=pd.concat([of,om],ignore_index=True)
+            if not pedidos_incidencias.empty:
+                pedidos_incidencias=pedidos_incidencias.sort_values(["TIPO","INCIDENCIAS"],ascending=[True,False])
+            st.dataframe(pedidos_incidencias,use_container_width=True,hide_index=True)
+            st.subheader("Pedidos FNR")
+            st.warning(
+                "⚠️ **Antes de tomar en cuenta los FNR, revisa si la factura/orden tiene algún reporte o incidencia registrada.** "
+                "Valida primero la orden en Backoffice para confirmar si el faltante corresponde realmente a un FNR."
+            )
+            st.markdown(
+                "🔎 **Revisar factura / orden en Backoffice:** "
+                "[Abrir órdenes en Backoffice](https://orders.backoffice.justo.cloud/es/orders)"
+            )
+            st.dataframe(orders(fnr,sp).head(25),use_container_width=True,hide_index=True)
 
-        _src_alias=[]
-        try:
-            _src_alias=[str(s[s.PICKER==sp].iloc[0].get("_SOURCE_PICKER","")).strip()] if not s[s.PICKER==sp].empty else []
-        except Exception:
             _src_alias=[]
-        rec=picker_record(store,sp,aliases=_src_alias)
-        st.subheader("📝 Retroalimentación y seguimiento")
-        st.caption("Solo se solicita el tipo de seguimiento. La retroalimentación opcional queda dentro del mismo registro.")
-        with st.form(f"accion_picker_form_{sp}", clear_on_submit=True):
-            act_type=st.selectbox("Tipo de seguimiento",["Llamada de atención","Advertencia verbal 1","Advertencia verbal 2","Acta 1","Acta 2","Acta 3","Cero tolerancia"])
-            act_sup=st.text_input("Supervisor",value=str(r.get("SUPERVISOR","")))
-            act_motivo=st.text_area("Motivo / detalle")
-            act_retro=st.text_area("Retroalimentación (opcional)",placeholder="Observación de retroalimentación, si aplica…")
-            if st.form_submit_button("Guardar seguimiento", type="primary"):
-                rec.setdefault("acciones",[])
-                rec["acciones"].append({"id":datetime.now().strftime("%Y%m%d%H%M%S%f"),"fecha":datetime.now().strftime("%Y-%m-%d %H:%M"),"accion":act_type,"supervisor":act_sup.strip() or "No especificado","motivo":act_motivo.strip(),"retroalimentacion":act_retro.strip()})
-                save_store(store); st.success("Seguimiento guardado."); st.rerun()
+            try:
+                _src_alias=[str(s[s.PICKER==sp].iloc[0].get("_SOURCE_PICKER","")).strip()] if not s[s.PICKER==sp].empty else []
+            except Exception:
+                _src_alias=[]
+            rec=picker_record(store,sp,aliases=_src_alias)
+            st.subheader("📝 Retroalimentación y seguimiento")
+            st.caption("Solo se solicita el tipo de seguimiento. La retroalimentación opcional queda dentro del mismo registro.")
+            with st.form(f"accion_picker_form_{sp}", clear_on_submit=True):
+                act_type=st.selectbox("Tipo de seguimiento",["Llamada de atención","Advertencia verbal 1","Advertencia verbal 2","Acta 1","Acta 2","Acta 3","Cero tolerancia"])
+                act_sup=st.text_input("Supervisor",value=str(r.get("SUPERVISOR","")))
+                act_motivo=st.text_area("Motivo / detalle")
+                act_retro=st.text_area("Retroalimentación (opcional)",placeholder="Observación de retroalimentación, si aplica…")
+                if st.form_submit_button("Guardar seguimiento", type="primary"):
+                    rec.setdefault("acciones",[])
+                    rec["acciones"].append({"id":datetime.now().strftime("%Y%m%d%H%M%S%f"),"fecha":datetime.now().strftime("%Y-%m-%d %H:%M"),"accion":act_type,"supervisor":act_sup.strip() or "No especificado","motivo":act_motivo.strip(),"retroalimentacion":act_retro.strip()})
+                    save_store(store); st.success("Seguimiento guardado."); st.rerun()
 
-        st.markdown("### 🔗 Formatos y recursos")
-        recursos=store.get("recursos_formatos",[])
-        with st.expander(f"Ver formatos y enlaces ({len(recursos)})",expanded=False):
-            if recursos:
-                for idx,recurso in enumerate(recursos):
-                    tipo=str(recurso.get("tipo","Recurso")); titulo=str(recurso.get("titulo","Formato")); url=str(recurso.get("url",""))
-                    rr1,rr2,rr3=st.columns([1,4,1])
-                    rr1.caption(tipo); rr2.markdown(f"**{titulo}**")
-                    with rr3:
-                        if url: st.link_button("Abrir",url,use_container_width=True)
-                    if st.button("Quitar",key=f"delete_recurso_{sp}_{idx}"): store["recursos_formatos"].pop(idx); save_store(store); st.rerun()
-            else: st.info("No hay formatos configurados.")
-            with st.form(f"recurso_form_{sp}", clear_on_submit=True):
-                rr1,rr2=st.columns([1,2])
-                with rr1: recurso_tipo=st.selectbox("Tipo",["Retroalimentación","Seguimiento","Llamada de atención","Acta","Otro"])
-                with rr2: recurso_titulo=st.text_input("Nombre del formato",placeholder="Ej. Formato de seguimiento")
-                recurso_url=st.text_input("Enlace",placeholder="https://...")
-                if st.form_submit_button("➕ Guardar enlace",type="primary"):
-                    url=recurso_url.strip()
-                    if not recurso_titulo.strip() or not url.startswith(("http://","https://")): st.error("Captura un nombre y un enlace válido.")
-                    else:
-                        store.setdefault("recursos_formatos",[]).append({"tipo":recurso_tipo,"titulo":recurso_titulo.strip(),"url":url,"fecha":datetime.now().strftime("%Y-%m-%d %H:%M")}); save_store(store); st.success("Enlace guardado."); st.rerun()
+            st.markdown("### 🔗 Formatos y recursos")
+            recursos=store.get("recursos_formatos",[])
+            with st.expander(f"Ver formatos y enlaces ({len(recursos)})",expanded=False):
+                if recursos:
+                    for idx,recurso in enumerate(recursos):
+                        tipo=str(recurso.get("tipo","Recurso")); titulo=str(recurso.get("titulo","Formato")); url=str(recurso.get("url",""))
+                        rr1,rr2,rr3=st.columns([1,4,1])
+                        rr1.caption(tipo); rr2.markdown(f"**{titulo}**")
+                        with rr3:
+                            if url: st.link_button("Abrir",url,use_container_width=True)
+                        if st.button("Quitar",key=f"delete_recurso_{sp}_{idx}"): store["recursos_formatos"].pop(idx); save_store(store); st.rerun()
+                else: st.info("No hay formatos configurados.")
+                with st.form(f"recurso_form_{sp}", clear_on_submit=True):
+                    rr1,rr2=st.columns([1,2])
+                    with rr1: recurso_tipo=st.selectbox("Tipo",["Retroalimentación","Seguimiento","Llamada de atención","Acta","Otro"])
+                    with rr2: recurso_titulo=st.text_input("Nombre del formato",placeholder="Ej. Formato de seguimiento")
+                    recurso_url=st.text_input("Enlace",placeholder="https://...")
+                    if st.form_submit_button("➕ Guardar enlace",type="primary"):
+                        url=recurso_url.strip()
+                        if not recurso_titulo.strip() or not url.startswith(("http://","https://")): st.error("Captura un nombre y un enlace válido.")
+                        else:
+                            store.setdefault("recursos_formatos",[]).append({"tipo":recurso_tipo,"titulo":recurso_titulo.strip(),"url":url,"fecha":datetime.now().strftime("%Y-%m-%d %H:%M")}); save_store(store); st.success("Enlace guardado."); st.rerun()
 
-        picker_fb=[x for x in store.get("feedback_rows",[]) if str(x.get("PICKER",""))==sp]
-        if picker_fb:
-            st.markdown("**Historial de retroalimentaciones**")
-            st.dataframe(pd.DataFrame(picker_fb).sort_values("FECHA",ascending=False),use_container_width=True,hide_index=True)
-        if rec.get("comentarios"):
-            st.markdown("**Comentarios**")
-            st.dataframe(pd.DataFrame(rec["comentarios"]).sort_values("fecha",ascending=False),use_container_width=True,hide_index=True)
-        if rec.get("acciones"):
-            st.markdown("**Seguimientos / actas**")
-            _ah=pd.DataFrame(rec["acciones"]).sort_values("fecha",ascending=False).rename(columns={"fecha":"Fecha","accion":"Tipo","supervisor":"Supervisor","motivo":"Motivo","retroalimentacion":"Retroalimentación"})
-            _cols=[c for c in ["Fecha","Tipo","Supervisor","Motivo","Retroalimentación"] if c in _ah.columns]
-            st.dataframe(_ah[_cols],use_container_width=True,hide_index=True)
+            picker_fb=[x for x in store.get("feedback_rows",[]) if str(x.get("PICKER",""))==sp]
+            if picker_fb:
+                st.markdown("**Historial de retroalimentaciones**")
+                st.dataframe(pd.DataFrame(picker_fb).sort_values("FECHA",ascending=False),use_container_width=True,hide_index=True)
+            if rec.get("comentarios"):
+                st.markdown("**Comentarios**")
+                st.dataframe(pd.DataFrame(rec["comentarios"]).sort_values("fecha",ascending=False),use_container_width=True,hide_index=True)
+            if rec.get("acciones"):
+                st.markdown("**Seguimientos / actas**")
+                _ah=pd.DataFrame(rec["acciones"]).sort_values("fecha",ascending=False).rename(columns={"fecha":"Fecha","accion":"Tipo","supervisor":"Supervisor","motivo":"Motivo","retroalimentacion":"Retroalimentación"})
+                _cols=[c for c in ["Fecha","Tipo","Supervisor","Motivo","Retroalimentación"] if c in _ah.columns]
+                st.dataframe(_ah[_cols],use_container_width=True,hide_index=True)
 
-        # El expediente documental es el mismo que usa la pestaña Seguimiento.
-        # Así, los PDFs/enlaces cargados en Seguimiento también quedan visibles en Picker.
-        picker_docs=sorted(rec.get("documentos",[]) or [], key=lambda x:str(x.get("fecha","")), reverse=True)
-        st.markdown("### 📄 Actas y documentos vinculados")
-        if picker_docs:
-            for i,doc in enumerate(picker_docs):
-                tipo=str(doc.get("tipo","Documento")); titulo=str(doc.get("titulo",doc.get("archivo",tipo)))
-                fecha=str(doc.get("fecha","")); supervisor=str(doc.get("supervisor",r.get("SUPERVISOR","")))
-                archivo=load_followup_pdf(doc)
-                with st.container(border=True):
-                    d1,d2,d3=st.columns([1.1,3.1,1.4])
-                    with d1:
-                        st.markdown(f"**{tipo}**")
-                        st.caption(fecha)
-                    with d2:
-                        st.markdown(f"**{titulo}**")
-                        if doc.get("detalle"): st.caption(doc.get("detalle"))
-                        st.caption(f"Registró: {supervisor}")
-                    with d3:
-                        if archivo is not None:
-                            st.download_button("📥 Ver PDF",archivo,file_name=str(doc.get("archivo") or f"{tipo}.pdf"),mime="application/pdf",key=f"picker_doc_download_{sp}_{doc.get('id',i)}",use_container_width=True)
-                        if doc.get("url"):
-                            st.link_button("🔗 Abrir enlace",str(doc.get("url")),use_container_width=True)
+            # El expediente documental es el mismo que usa la pestaña Seguimiento.
+            # Así, los PDFs/enlaces cargados en Seguimiento también quedan visibles en Picker.
+            picker_docs=sorted(rec.get("documentos",[]) or [], key=lambda x:str(x.get("fecha","")), reverse=True)
+            st.markdown("### 📄 Actas y documentos vinculados")
+            if picker_docs:
+                for i,doc in enumerate(picker_docs):
+                    tipo=str(doc.get("tipo","Documento")); titulo=str(doc.get("titulo",doc.get("archivo",tipo)))
+                    fecha=str(doc.get("fecha","")); supervisor=str(doc.get("supervisor",r.get("SUPERVISOR","")))
+                    archivo=load_followup_pdf(doc)
+                    with st.container(border=True):
+                        d1,d2,d3=st.columns([1.1,3.1,1.4])
+                        with d1:
+                            st.markdown(f"**{tipo}**")
+                            st.caption(fecha)
+                        with d2:
+                            st.markdown(f"**{titulo}**")
+                            if doc.get("detalle"): st.caption(doc.get("detalle"))
+                            st.caption(f"Registró: {supervisor}")
+                        with d3:
+                            if archivo is not None:
+                                st.download_button("📥 Ver PDF",archivo,file_name=str(doc.get("archivo") or f"{tipo}.pdf"),mime="application/pdf",key=f"picker_doc_download_{sp}_{doc.get('id',i)}",use_container_width=True)
+                            if doc.get("url"):
+                                st.link_button("🔗 Abrir enlace",str(doc.get("url")),use_container_width=True)
+            else:
+                st.info("No hay actas o documentos vinculados. Puedes agregarlos desde la pestaña 🛡️ Seguimiento; quedarán visibles aquí automáticamente.")
+
+            if not picker_fb and not rec.get("comentarios") and not rec.get("acciones") and not picker_docs:
+                st.info("Este picker todavía no tiene retroalimentaciones, seguimientos ni documentos registrados.")
+
+if _tab_active(e):
+    with e:
+        ctx,_,_,_=global_context(context_identity)
+        st.subheader("🌙 Turnos / Áreas")
+        st.caption("El contexto seleccionado se mantiene, pero el comparativo conserva todos los turnos para no perder proporciones.")
+        selected=apply_context(s_view,ctx,identity_df=context_identity)
+        reference=context_reference(s_view,ctx,identity_df=context_identity)
+        render_context_banner(ctx,selected,reference,"Contexto heredado")
+        bsel=select_summary_people(base,selected)
+        fsel=select_summary_people(fnr,selected)
+        msel=select_summary_people(mc,selected)
+        bref=select_summary_people(base,reference)
+        fref=select_summary_people(fnr,reference)
+        mref=select_summary_people(mc,reference)
+        render_turn_comparison(bsel,bref,fsel,fref,msel,mref)
+        st.subheader("FNR por turno")
+        st.dataframe(groups(fsel,bsel,"TURNO"),use_container_width=True,hide_index=True)
+        st.subheader("MC por turno")
+        st.dataframe(groups(msel,bsel,"TURNO"),use_container_width=True,hide_index=True)
+        st.subheader("FNR por área")
+        st.dataframe(groups(fsel,bsel,"AREA"),use_container_width=True,hide_index=True)
+        st.subheader("MC por área")
+        st.dataframe(groups(msel,bsel,"AREA"),use_container_width=True,hide_index=True)
+        st.warning("El % / líneas por área solo aparece si existe un denominador real de líneas por área.")
+
+if _tab_active(x):
+    with x:
+        st.subheader("🧩 Cruce por correo y personal no asignado")
+        st.caption("El cruce intenta primero CORREO y, si falta o no coincide, usa una coincidencia conservadora por nombre. El personal que no aparece en la plantilla se conserva en resultados como Sin registrar.")
+        cross=cross_status.copy()
+        if not cross.empty:
+            cross["MANUAL"]=cross["CORREO_KEY"].map(lambda z: bool(store.get("master_overrides",{}).get(str(z))))
+            cross["ID_PERSONA"]=cross.apply(lambda r: str(r.get("CORREO_KEY","")).strip() or ("nombre:"+person_key(r.get("PICKER",""))),axis=1)
+        unmatched_cross=cross[~cross["IDENTIFICADO"]].copy() if not cross.empty else pd.DataFrame()
+        k1,k2,k3=st.columns(3)
+        k1.metric("Personas en los 3 archivos",f"{cross['ID_PERSONA'].nunique():,}" if not cross.empty else "0")
+        k2.metric("Registros sin empatar",f"{len(unmatched_cross):,}" if not unmatched_cross.empty else "0")
+        k3.metric("Asignaciones manuales",f"{len(store.get('master_overrides',{})):,}")
+        if unmatched_cross.empty:
+            st.success("✅ Todos los registros de Pickers, FNR y Mala Calidad están asociados a la plantilla.")
         else:
-            st.info("No hay actas o documentos vinculados. Puedes agregarlos desde la pestaña 🛡️ Seguimiento; quedarán visibles aquí automáticamente.")
+            view_cols=[c for c in ["FUENTE","PICKER","CORREO","TURNO","SUPERVISOR","AREA_BASE"] if c in unmatched_cross.columns]
+            st.dataframe(unmatched_cross[view_cols].drop_duplicates(["FUENTE","CORREO"]),use_container_width=True,hide_index=True)
+            emails=sorted([str(v) for v in unmatched_cross["CORREO_KEY"].dropna().unique() if str(v).strip()])
+            if emails:
+              with st.expander("➕ Asignar correo manualmente",expanded=True):
+                with st.form("manual_email_assignment_form",clear_on_submit=True):
+                    correo_sel=st.selectbox("Correo sin asignar",emails)
+                    row_opts=unmatched_cross[unmatched_cross["CORREO_KEY"]==correo_sel]
+                    suggested_name=str(row_opts.iloc[0].get("PICKER","")) if not row_opts.empty else ""
+                    picker_manual=st.text_input("Nombre canónico del picker",value=suggested_name)
+                    mc1,mc2,mc3=st.columns(3)
+                    with mc1: turno_manual=st.selectbox("Turno",["Matutino","Intermedio","Tarde","Nocturno","Turno de avance","Otro"])
+                    with mc2:
+                        sup_options=[str(v) for v in sorted(s_view["SUPERVISOR"].dropna().unique()) if str(v).strip() and str(v)!="No asignado"]
+                        sup_manual=st.selectbox("Supervisor",["No asignado"]+sup_options)
+                    with mc3:
+                        area_options=[str(v) for v in sorted(s_view["AREA_BASE"].dropna().unique()) if str(v).strip() and str(v)!="No especificada"]
+                        area_manual=st.selectbox("Área",["No especificada"]+area_options)
+                    if st.form_submit_button("💾 Guardar asignación",type="primary"):
+                        if not correo_sel or not picker_manual.strip(): st.error("Correo y nombre son obligatorios.")
+                        else:
+                            store.setdefault("master_overrides",{})[correo_sel]={"PICKER":picker_manual.strip(),"CORREO":correo_sel,"TURNO":turno_manual,"SUPERVISOR":sup_manual,"AREA_BASE":area_manual,"FECHA":datetime.now().strftime("%Y-%m-%d %H:%M"),"ORIGEN":"Manual por correo"}
+                            save_store(store); st.success("Asignación guardada por correo. El cruce la utilizará en la siguiente carga."); st.rerun()
+            else:
+                st.info("Estos registros no traen correo. Revisa que sus nombres coincidan con la plantilla; el cruce automático por nombre ya se intentó.")
+        with st.expander("📋 Asignaciones manuales guardadas",expanded=False):
+            manual_rows=[]
+            for ek,ov in store.get("master_overrides",{}).items(): manual_rows.append({"CORREO":ov.get("CORREO",ek),"PICKER":ov.get("PICKER",""),"TURNO":ov.get("TURNO",""),"SUPERVISOR":ov.get("SUPERVISOR",""),"AREA":ov.get("AREA_BASE",""),"FECHA":ov.get("FECHA","")})
+            if manual_rows: st.dataframe(pd.DataFrame(manual_rows),use_container_width=True,hide_index=True)
+            else: st.info("Todavía no hay asignaciones manuales.")
 
-        if not picker_fb and not rec.get("comentarios") and not rec.get("acciones") and not picker_docs:
-            st.info("Este picker todavía no tiene retroalimentaciones, seguimientos ni documentos registrados.")
-
-with e:
-    ctx,_,_,_=global_context(context_identity)
-    st.subheader("🌙 Turnos / Áreas")
-    st.caption("El contexto seleccionado se mantiene, pero el comparativo conserva todos los turnos para no perder proporciones.")
-    selected=apply_context(s_view,ctx,identity_df=context_identity)
-    reference=context_reference(s_view,ctx,identity_df=context_identity)
-    render_context_banner(ctx,selected,reference,"Contexto heredado")
-    bsel=select_summary_people(base,selected)
-    fsel=select_summary_people(fnr,selected)
-    msel=select_summary_people(mc,selected)
-    bref=select_summary_people(base,reference)
-    fref=select_summary_people(fnr,reference)
-    mref=select_summary_people(mc,reference)
-    render_turn_comparison(bsel,bref,fsel,fref,msel,mref)
-    st.subheader("FNR por turno")
-    st.dataframe(groups(fsel,bsel,"TURNO"),use_container_width=True,hide_index=True)
-    st.subheader("MC por turno")
-    st.dataframe(groups(msel,bsel,"TURNO"),use_container_width=True,hide_index=True)
-    st.subheader("FNR por área")
-    st.dataframe(groups(fsel,bsel,"AREA"),use_container_width=True,hide_index=True)
-    st.subheader("MC por área")
-    st.dataframe(groups(msel,bsel,"AREA"),use_container_width=True,hide_index=True)
-    st.warning("El % / líneas por área solo aparece si existe un denominador real de líneas por área.")
-
-with x:
-    st.subheader("🧩 Cruce por correo y personal no asignado")
-    st.caption("El cruce intenta primero CORREO y, si falta o no coincide, usa una coincidencia conservadora por nombre. El personal que no aparece en la plantilla se conserva en resultados como Sin registrar.")
-    cross=cross_status.copy()
-    if not cross.empty:
-        cross["MANUAL"]=cross["CORREO_KEY"].map(lambda z: bool(store.get("master_overrides",{}).get(str(z))))
-        cross["ID_PERSONA"]=cross.apply(lambda r: str(r.get("CORREO_KEY","")).strip() or ("nombre:"+person_key(r.get("PICKER",""))),axis=1)
-    unmatched_cross=cross[~cross["IDENTIFICADO"]].copy() if not cross.empty else pd.DataFrame()
-    k1,k2,k3=st.columns(3)
-    k1.metric("Personas en los 3 archivos",f"{cross['ID_PERSONA'].nunique():,}" if not cross.empty else "0")
-    k2.metric("Registros sin empatar",f"{len(unmatched_cross):,}" if not unmatched_cross.empty else "0")
-    k3.metric("Asignaciones manuales",f"{len(store.get('master_overrides',{})):,}")
-    if unmatched_cross.empty:
-        st.success("✅ Todos los registros de Pickers, FNR y Mala Calidad están asociados a la plantilla.")
-    else:
-        view_cols=[c for c in ["FUENTE","PICKER","CORREO","TURNO","SUPERVISOR","AREA_BASE"] if c in unmatched_cross.columns]
-        st.dataframe(unmatched_cross[view_cols].drop_duplicates(["FUENTE","CORREO"]),use_container_width=True,hide_index=True)
-        emails=sorted([str(v) for v in unmatched_cross["CORREO_KEY"].dropna().unique() if str(v).strip()])
-        if emails:
-          with st.expander("➕ Asignar correo manualmente",expanded=True):
-            with st.form("manual_email_assignment_form",clear_on_submit=True):
-                correo_sel=st.selectbox("Correo sin asignar",emails)
-                row_opts=unmatched_cross[unmatched_cross["CORREO_KEY"]==correo_sel]
-                suggested_name=str(row_opts.iloc[0].get("PICKER","")) if not row_opts.empty else ""
-                picker_manual=st.text_input("Nombre canónico del picker",value=suggested_name)
-                mc1,mc2,mc3=st.columns(3)
-                with mc1: turno_manual=st.selectbox("Turno",["Matutino","Intermedio","Tarde","Nocturno","Turno de avance","Otro"])
-                with mc2:
-                    sup_options=[str(v) for v in sorted(s_view["SUPERVISOR"].dropna().unique()) if str(v).strip() and str(v)!="No asignado"]
-                    sup_manual=st.selectbox("Supervisor",["No asignado"]+sup_options)
-                with mc3:
-                    area_options=[str(v) for v in sorted(s_view["AREA_BASE"].dropna().unique()) if str(v).strip() and str(v)!="No especificada"]
-                    area_manual=st.selectbox("Área",["No especificada"]+area_options)
-                if st.form_submit_button("💾 Guardar asignación",type="primary"):
-                    if not correo_sel or not picker_manual.strip(): st.error("Correo y nombre son obligatorios.")
+if _tab_active(g):
+    with g:
+        ctx,_,_,_=global_context(context_identity)
+        st.subheader("👥 Supervisores")
+        st.caption("Vista operativa bajo el mismo contexto global. Los supervisores registrados por correo se excluyen automáticamente de incidencias y filtros de pickers.")
+        with st.expander("➕ Dar de alta supervisor",expanded=False):
+            with st.form("alta_supervisor_form",clear_on_submit=True):
+                sc1,sc2=st.columns(2)
+                with sc1: sup_nombre_nuevo=st.text_input("Nombre del supervisor")
+                with sc2: sup_correo_nuevo=st.text_input("Correo del supervisor")
+                sup_activo=st.checkbox("Excluirlo de incidencias y filtros",value=True)
+                if st.form_submit_button("💾 Guardar supervisor",type="primary"):
+                    ek=email_key(sup_correo_nuevo)
+                    if not sup_nombre_nuevo.strip() or not ek: st.error("Captura nombre y un correo válido.")
                     else:
-                        store.setdefault("master_overrides",{})[correo_sel]={"PICKER":picker_manual.strip(),"CORREO":correo_sel,"TURNO":turno_manual,"SUPERVISOR":sup_manual,"AREA_BASE":area_manual,"FECHA":datetime.now().strftime("%Y-%m-%d %H:%M"),"ORIGEN":"Manual por correo"}
-                        save_store(store); st.success("Asignación guardada por correo. El cruce la utilizará en la siguiente carga."); st.rerun()
+                        current=[z for z in store.get("supervisores",[]) if email_key(z.get("correo",""))!=ek]
+                        current.append({"nombre":sup_nombre_nuevo.strip(),"correo":ek,"activo":sup_activo,"fecha":datetime.now().strftime("%Y-%m-%d %H:%M")})
+                        store["supervisores"]=current; save_store(store); st.success("Supervisor guardado."); st.rerun()
+        _supreg=store.get("supervisores",[]) or []
+        if _supreg:
+            st.dataframe(pd.DataFrame([{"Supervisor":z.get("nombre",""),"Correo":z.get("correo",""),"Excluido":"Sí" if z.get("activo",True) else "No","Alta":z.get("fecha","")} for z in _supreg]),use_container_width=True,hide_index=True)
+        sup_data=apply_context(s_view,ctx,identity_df=context_identity)
+        reference=context_reference(s_view,ctx,identity_df=context_identity)
+        render_context_banner(ctx,sup_data,reference,"Contexto heredado")
+        if not sup_data.empty:
+            sup_summary=(sup_data.groupby("SUPERVISOR",as_index=False)
+                .agg(PICKERS=("PICKER","nunique"),LINEAS=("LINEAS","sum"),FNR=("FNR","sum"),MC=("MC","sum"))
+                .sort_values("FNR",ascending=False))
+            sup_summary["FNR %"]=safe_pct(sup_summary["FNR"],sup_summary["LINEAS"])
+            sup_summary["MC %"]=safe_pct(sup_summary["MC"],sup_summary["LINEAS"])
+            st.dataframe(sup_summary,use_container_width=True,hide_index=True)
+            sup_focus=st.selectbox("Supervisor",["Todos"]+sorted([str(x) for x in sup_summary["SUPERVISOR"] if str(x).strip()]))
+            if sup_focus!="Todos":
+                st.dataframe(sup_data[sup_data["SUPERVISOR"]==sup_focus],use_container_width=True,hide_index=True)
         else:
-            st.info("Estos registros no traen correo. Revisa que sus nombres coincidan con la plantilla; el cruce automático por nombre ya se intentó.")
-    with st.expander("📋 Asignaciones manuales guardadas",expanded=False):
-        manual_rows=[]
-        for ek,ov in store.get("master_overrides",{}).items(): manual_rows.append({"CORREO":ov.get("CORREO",ek),"PICKER":ov.get("PICKER",""),"TURNO":ov.get("TURNO",""),"SUPERVISOR":ov.get("SUPERVISOR",""),"AREA":ov.get("AREA_BASE",""),"FECHA":ov.get("FECHA","")})
-        if manual_rows: st.dataframe(pd.DataFrame(manual_rows),use_container_width=True,hide_index=True)
-        else: st.info("Todavía no hay asignaciones manuales.")
+            st.info("No hay datos para el contexto actual.")
 
-with g:
-    ctx,_,_,_=global_context(context_identity)
-    st.subheader("👥 Supervisores")
-    st.caption("Vista operativa bajo el mismo contexto global. Los supervisores registrados por correo se excluyen automáticamente de incidencias y filtros de pickers.")
-    with st.expander("➕ Dar de alta supervisor",expanded=False):
-        with st.form("alta_supervisor_form",clear_on_submit=True):
-            sc1,sc2=st.columns(2)
-            with sc1: sup_nombre_nuevo=st.text_input("Nombre del supervisor")
-            with sc2: sup_correo_nuevo=st.text_input("Correo del supervisor")
-            sup_activo=st.checkbox("Excluirlo de incidencias y filtros",value=True)
-            if st.form_submit_button("💾 Guardar supervisor",type="primary"):
-                ek=email_key(sup_correo_nuevo)
-                if not sup_nombre_nuevo.strip() or not ek: st.error("Captura nombre y un correo válido.")
-                else:
-                    current=[z for z in store.get("supervisores",[]) if email_key(z.get("correo",""))!=ek]
-                    current.append({"nombre":sup_nombre_nuevo.strip(),"correo":ek,"activo":sup_activo,"fecha":datetime.now().strftime("%Y-%m-%d %H:%M")})
-                    store["supervisores"]=current; save_store(store); st.success("Supervisor guardado."); st.rerun()
-    _supreg=store.get("supervisores",[]) or []
-    if _supreg:
-        st.dataframe(pd.DataFrame([{"Supervisor":z.get("nombre",""),"Correo":z.get("correo",""),"Excluido":"Sí" if z.get("activo",True) else "No","Alta":z.get("fecha","")} for z in _supreg]),use_container_width=True,hide_index=True)
-    sup_data=apply_context(s_view,ctx,identity_df=context_identity)
-    reference=context_reference(s_view,ctx,identity_df=context_identity)
-    render_context_banner(ctx,sup_data,reference,"Contexto heredado")
-    if not sup_data.empty:
-        sup_summary=(sup_data.groupby("SUPERVISOR",as_index=False)
-            .agg(PICKERS=("PICKER","nunique"),LINEAS=("LINEAS","sum"),FNR=("FNR","sum"),MC=("MC","sum"))
-            .sort_values("FNR",ascending=False))
-        sup_summary["FNR %"]=safe_pct(sup_summary["FNR"],sup_summary["LINEAS"])
-        sup_summary["MC %"]=safe_pct(sup_summary["MC"],sup_summary["LINEAS"])
-        st.dataframe(sup_summary,use_container_width=True,hide_index=True)
-        sup_focus=st.selectbox("Supervisor",["Todos"]+sorted([str(x) for x in sup_summary["SUPERVISOR"] if str(x).strip()]))
-        if sup_focus!="Todos":
-            st.dataframe(sup_data[sup_data["SUPERVISOR"]==sup_focus],use_container_width=True,hide_index=True)
-    else:
-        st.info("No hay datos para el contexto actual.")
+if _tab_active(h):
+    with h:
+        st.subheader("🛡️ Seguimiento")
+        st.caption("Vista consolidada de todos los pickers: retroalimentaciones, seguimientos, actas y tolerancias. Filtra y ordena para ver rápidamente dónde hay más seguimiento.")
+        ctx,_,_,_=global_context(context_identity)
+        selected_context=apply_context(s_view,ctx,identity_df=context_identity)
+        selected_context=selected_context[selected_context.get("CATEGORIA",pd.Series("Picker",index=selected_context.index)).astype(str).eq("Picker")].copy()
+        render_context_banner(ctx,selected_context,context_reference(s_view,ctx,identity_df=context_identity),"Contexto heredado")
 
-with h:
-    st.subheader("🛡️ Seguimiento")
-    st.caption("Vista consolidada de todos los pickers: retroalimentaciones, seguimientos, actas y tolerancias. Filtra y ordena para ver rápidamente dónde hay más seguimiento.")
-    ctx,_,_,_=global_context(context_identity)
-    selected_context=apply_context(s_view,ctx,identity_df=context_identity)
-    selected_context=selected_context[selected_context.get("CATEGORIA",pd.Series("Picker",index=selected_context.index)).astype(str).eq("Picker")].copy()
-    render_context_banner(ctx,selected_context,context_reference(s_view,ctx,identity_df=context_identity),"Contexto heredado")
-
-    all_rows=[]
-    for _,rr in selected_context.iterrows():
-        picker=str(rr.get("PICKER","")); rec0=picker_record(store,picker,aliases=[str(rr.get("_SOURCE_PICKER",""))])
-        acciones=rec0.get("acciones",[]) or []
-        retro_legacy=[z for z in store.get("feedback_rows",[]) if str(z.get("PICKER",""))==picker]
-        retro_new=[z for z in acciones if str(z.get("retroalimentacion","")).strip()]
-        tipos=[str(z.get("accion","")) for z in acciones]
-        actas=sum(1 for t in tipos if "Acta" in t); llamadas=sum(1 for t in tipos if "Llamada" in t or "Advertencia" in t); cero=sum(1 for t in tipos if "Cero tolerancia" in t)
-        all_rows.append({"PICKER":picker,"TURNO":rr.get("TURNO",""),"SUPERVISOR":rr.get("SUPERVISOR",""),"AREA":rr.get("AREA_BASE",""),"RETROALIMENTACIONES":len(retro_legacy)+len(retro_new),"SEGUIMIENTOS":len(acciones),"ACTAS":actas,"LLAMADAS / ADVERTENCIAS":llamadas,"CERO TOLERANCIA":cero,"TOTAL":len(acciones)+len(retro_legacy),"ÚLTIMO SEGUIMIENTO":max([str(z.get("fecha","")) for z in acciones],default="")})
-    seguimiento_df=pd.DataFrame(all_rows)
-    if seguimiento_df.empty: st.info("No hay pickers disponibles para seguimiento.")
-    else:
-        with st.container(border=True):
-            fc1,fc2,fc3,fc4=st.columns(4)
-            search_seg=fc1.text_input("Buscar picker",placeholder="Nombre…",key="seguimiento_global_search")
-            seg_filter=fc2.selectbox("Estado",["Todos","Con actas","Sin actas","Con cero tolerancia","Sin seguimiento"],key="seguimiento_global_estado")
-            seg_sort=fc3.selectbox("Ordenar por",["ACTAS","SEGUIMIENTOS","CERO TOLERANCIA","RETROALIMENTACIONES","TOTAL"],key="seguimiento_global_sort")
-            seg_dir=fc4.selectbox("Orden",["Mayor a menor","Menor a mayor"],key="seguimiento_global_dir")
-            view=seguimiento_df.copy()
-            if search_seg.strip(): view=view[view["PICKER"].map(norm).str.contains(norm(search_seg),regex=False)]
-            if seg_filter=="Con actas": view=view[view["ACTAS"]>0]
-            elif seg_filter=="Sin actas": view=view[view["ACTAS"]==0]
-            elif seg_filter=="Con cero tolerancia": view=view[view["CERO TOLERANCIA"]>0]
-            elif seg_filter=="Sin seguimiento": view=view[view["SEGUIMIENTOS"]==0]
-            view=view.sort_values(seg_sort,ascending=(seg_dir=="Menor a mayor"))
-            st.dataframe(view,use_container_width=True,hide_index=True)
-        st.caption(f"{len(view):,} pickers visibles.")
-
-    st.divider()
-    nombres=person_options(selected_context)
-    with st.container(border=True):
-        st.markdown("**🔎 Abrir expediente individual**")
-        buscar=st.text_input("Nombre del picker",placeholder="Escribe parte del nombre…",key="seguimiento_picker_search")
-        opciones=nombres
-        if buscar.strip():
-            term=norm(buscar); opciones=[n for n in nombres if term in norm(n)]
-        seguimiento_picker=st.selectbox("Picker",["Selecciona un picker"]+opciones,key="seguimiento_picker_select")
-
-    if seguimiento_picker == "Selecciona un picker":
-        st.info("Selecciona un picker para consultar y documentar su expediente.")
-    else:
-        r=s[s.PICKER==seguimiento_picker].iloc[0]
-        rec=picker_record(store,seguimiento_picker,aliases=[str(r.get("_SOURCE_PICKER",""))])
-        acciones=rec.get("acciones",[]) or []; documentos=rec.get("documentos",[]) or []
-        st.markdown(f"<div class='justo-card'><div class='justo-kicker'>Expediente</div><div class='justo-title'>{seguimiento_picker}</div><div class='justo-muted'>Turno: {r.TURNO} · Supervisor: {r.SUPERVISOR} · Área: {r.AREA_BASE}</div></div>",unsafe_allow_html=True)
-        k1,k2,k3,k4=st.columns(4)
-        k1.metric("Retroalimentaciones",f"{sum(1 for z in acciones if str(z.get('retroalimentacion','')).strip()):,}")
-        k2.metric("Seguimientos",f"{len(acciones):,}")
-        k3.metric("Actas / tolerancias",f"{sum(1 for z in acciones if 'Acta' in str(z.get('accion','')) or 'Cero tolerancia' in str(z.get('accion',''))):,}")
-        k4.metric("Documentos",f"{len(documentos):,}")
-        with st.container(border=True):
-            st.markdown("### 📋 Historial de seguimiento")
-            if acciones:
-                hist=pd.DataFrame(acciones).rename(columns={"fecha":"Fecha","accion":"Tipo","supervisor":"Supervisor","motivo":"Motivo","retroalimentacion":"Retroalimentación"})
-                cols=[c for c in ["Fecha","Tipo","Supervisor","Motivo","Retroalimentación"] if c in hist.columns]
-                st.dataframe(hist.sort_values("Fecha",ascending=False)[cols],use_container_width=True,hide_index=True)
-            else: st.info("Este picker todavía no tiene seguimientos registrados.")
-        with st.container(border=True):
-            st.markdown("### 📄 Subir seguimiento / acta")
-            st.caption("Adjunta un PDF o elige uno de los enlaces de seguimiento que ya guardaste.")
-            recursos=store.get("recursos_formatos",[]) or []
-            recurso_lookup={}
-            for i,z in enumerate(recursos):
-                if str(z.get("url","")).strip():
-                    recurso_lookup[f"{i+1}. {z.get('tipo','Recurso')} · {z.get('titulo','Enlace')}"]=z
-            recurso_opciones=["Sin enlace guardado"]+list(recurso_lookup)
+        all_rows=[]
+        for _,rr in selected_context.iterrows():
+            picker=str(rr.get("PICKER","")); rec0=picker_record(store,picker,aliases=[str(rr.get("_SOURCE_PICKER",""))])
+            acciones=rec0.get("acciones",[]) or []
+            retro_legacy=[z for z in store.get("feedback_rows",[]) if str(z.get("PICKER",""))==picker]
+            retro_new=[z for z in acciones if str(z.get("retroalimentacion","")).strip()]
+            tipos=[str(z.get("accion","")) for z in acciones]
+            actas=sum(1 for t in tipos if "Acta" in t); llamadas=sum(1 for t in tipos if "Llamada" in t or "Advertencia" in t); cero=sum(1 for t in tipos if "Cero tolerancia" in t)
+            all_rows.append({"PICKER":picker,"TURNO":rr.get("TURNO",""),"SUPERVISOR":rr.get("SUPERVISOR",""),"AREA":rr.get("AREA_BASE",""),"RETROALIMENTACIONES":len(retro_legacy)+len(retro_new),"SEGUIMIENTOS":len(acciones),"ACTAS":actas,"LLAMADAS / ADVERTENCIAS":llamadas,"CERO TOLERANCIA":cero,"TOTAL":len(acciones)+len(retro_legacy),"ÚLTIMO SEGUIMIENTO":max([str(z.get("fecha","")) for z in acciones],default="")})
+        seguimiento_df=pd.DataFrame(all_rows)
+        if seguimiento_df.empty: st.info("No hay pickers disponibles para seguimiento.")
+        else:
             with st.container(border=True):
-                st.markdown("**🔗 Elegir enlace guardado (opcional)**")
-                recurso_seleccionado=st.selectbox("Enlaces de seguimiento",recurso_opciones,key=f"seguimiento_enlace_guardado_{person_key(seguimiento_picker)}")
-                recurso_actual=recurso_lookup.get(recurso_seleccionado)
-                if recurso_actual:
-                    st.info(f"Seleccionado: {recurso_actual.get('tipo','Seguimiento')} · {recurso_actual.get('titulo','Enlace de seguimiento')}")
-                    st.link_button("Abrir enlace para revisar",str(recurso_actual.get("url","")))
-            enviar_copia=st.checkbox("Enviar copia por correo al guardar",value=False,key=f"seguimiento_email_{person_key(seguimiento_picker)}")
-            destinatarios=st.text_input("Correo(s) destinatario(s)",placeholder="persona@correo.com (separa varios con coma)",key=f"seguimiento_destinatarios_{person_key(seguimiento_picker)}") if enviar_copia else ""
-            with st.form(f"seguimiento_documento_form_{seguimiento_picker}",clear_on_submit=True):
-                dc1,dc2=st.columns([1,2])
-                with dc1: doc_tipo=st.selectbox("Tipo de documento",["Acta 1","Acta 2","Acta 3","Llamada de atención","Advertencia verbal 1","Advertencia verbal 2","Cero tolerancia","Otro"])
-                with dc2: doc_titulo=st.text_input("Nombre / referencia",placeholder="Ej. Acta por FNR — septiembre 2026")
-                doc_detalle=st.text_area("Detalle / motivo",placeholder="Qué originó el seguimiento y cualquier dato importante…")
-                doc_pdf=st.file_uploader("📎 Adjuntar PDF",type=["pdf"],accept_multiple_files=False,key=f"seguimiento_pdf_{seguimiento_picker}")
-                if st.form_submit_button("💾 Guardar seguimiento / documento",type="primary"):
-                    url=str(recurso_actual.get("url","")).strip() if recurso_actual else ""
-                    titulo=doc_titulo.strip() or (doc_pdf.name if doc_pdf is not None else (str(recurso_actual.get("titulo",doc_tipo)) if recurso_actual else doc_tipo))
-                    if doc_pdf is None and not url: st.error("Adjunta un PDF o selecciona un enlace guardado.")
-                    else:
-                        registro={"id":datetime.now().strftime("%Y%m%d%H%M%S%f"),"fecha":datetime.now().strftime("%Y-%m-%d %H:%M"),"tipo":doc_tipo,"titulo":titulo,"detalle":doc_detalle.strip(),"supervisor":str(r.get("SUPERVISOR","")),"url":url,"url_titulo":(str(recurso_actual.get("titulo","")) if recurso_actual else ""),"path":"","archivo":"","destinatarios":destinatarios}
-                        pdf_bytes=None
-                        if doc_pdf is not None:
-                            path,_=save_followup_pdf(doc_pdf.getvalue(),seguimiento_picker,doc_pdf.name); registro["path"]=path; registro["archivo"]=_safe_filename(doc_pdf.name); pdf_bytes=doc_pdf.getvalue()
-                        rec.setdefault("documentos",[]).append(registro); save_store(store)
-                        if enviar_copia:
-                            email_body=f"Se registró un {doc_tipo} para {seguimiento_picker}.\n\nDetalle: {doc_detalle.strip() or 'Sin detalle.'}"
-                            if url: email_body+=f"\n\nEnlace de seguimiento: {url}"
-                            ok,msg=send_followup_email(f"Seguimiento {doc_tipo} · {seguimiento_picker}",email_body,destinatarios,pdf_bytes,registro.get("archivo") or "seguimiento.pdf")
-                            if ok: st.success(msg)
-                            else: st.error(msg)
-                        else: st.success("Seguimiento / documento guardado.")
-        st.markdown("### 🔗 Enlaces de seguimiento")
-        st.caption("Aquí puedes consultar y administrar los enlaces guardados.")
-        with st.expander(f"Administrar enlaces de seguimiento ({len(recursos)})",expanded=False):
-            st.info("Los enlaces guardados aparecen aquí para abrirlos o quitarlos.")
-            for idx,recurso in enumerate(recursos):
+                fc1,fc2,fc3,fc4=st.columns(4)
+                search_seg=fc1.text_input("Buscar picker",placeholder="Nombre…",key="seguimiento_global_search")
+                seg_filter=fc2.selectbox("Estado",["Todos","Con actas","Sin actas","Con cero tolerancia","Sin seguimiento"],key="seguimiento_global_estado")
+                seg_sort=fc3.selectbox("Ordenar por",["ACTAS","SEGUIMIENTOS","CERO TOLERANCIA","RETROALIMENTACIONES","TOTAL"],key="seguimiento_global_sort")
+                seg_dir=fc4.selectbox("Orden",["Mayor a menor","Menor a mayor"],key="seguimiento_global_dir")
+                view=seguimiento_df.copy()
+                if search_seg.strip(): view=view[view["PICKER"].map(norm).str.contains(norm(search_seg),regex=False)]
+                if seg_filter=="Con actas": view=view[view["ACTAS"]>0]
+                elif seg_filter=="Sin actas": view=view[view["ACTAS"]==0]
+                elif seg_filter=="Con cero tolerancia": view=view[view["CERO TOLERANCIA"]>0]
+                elif seg_filter=="Sin seguimiento": view=view[view["SEGUIMIENTOS"]==0]
+                view=view.sort_values(seg_sort,ascending=(seg_dir=="Menor a mayor"))
+                st.dataframe(view,use_container_width=True,hide_index=True)
+            st.caption(f"{len(view):,} pickers visibles.")
+
+        st.divider()
+        nombres=person_options(selected_context)
+        with st.container(border=True):
+            st.markdown("**🔎 Abrir expediente individual**")
+            buscar=st.text_input("Nombre del picker",placeholder="Escribe parte del nombre…",key="seguimiento_picker_search")
+            opciones=nombres
+            if buscar.strip():
+                term=norm(buscar); opciones=[n for n in nombres if term in norm(n)]
+            seguimiento_picker=st.selectbox("Picker",["Selecciona un picker"]+opciones,key="seguimiento_picker_select")
+
+        if seguimiento_picker == "Selecciona un picker":
+            st.info("Selecciona un picker para consultar y documentar su expediente.")
+        else:
+            r=s[s.PICKER==seguimiento_picker].iloc[0]
+            rec=picker_record(store,seguimiento_picker,aliases=[str(r.get("_SOURCE_PICKER",""))])
+            acciones=rec.get("acciones",[]) or []; documentos=rec.get("documentos",[]) or []
+            st.markdown(f"<div class='justo-card'><div class='justo-kicker'>Expediente</div><div class='justo-title'>{seguimiento_picker}</div><div class='justo-muted'>Turno: {r.TURNO} · Supervisor: {r.SUPERVISOR} · Área: {r.AREA_BASE}</div></div>",unsafe_allow_html=True)
+            k1,k2,k3,k4=st.columns(4)
+            k1.metric("Retroalimentaciones",f"{sum(1 for z in acciones if str(z.get('retroalimentacion','')).strip()):,}")
+            k2.metric("Seguimientos",f"{len(acciones):,}")
+            k3.metric("Actas / tolerancias",f"{sum(1 for z in acciones if 'Acta' in str(z.get('accion','')) or 'Cero tolerancia' in str(z.get('accion',''))):,}")
+            k4.metric("Documentos",f"{len(documentos):,}")
+            with st.container(border=True):
+                st.markdown("### 📋 Historial de seguimiento")
+                if acciones:
+                    hist=pd.DataFrame(acciones).rename(columns={"fecha":"Fecha","accion":"Tipo","supervisor":"Supervisor","motivo":"Motivo","retroalimentacion":"Retroalimentación"})
+                    cols=[c for c in ["Fecha","Tipo","Supervisor","Motivo","Retroalimentación"] if c in hist.columns]
+                    st.dataframe(hist.sort_values("Fecha",ascending=False)[cols],use_container_width=True,hide_index=True)
+                else: st.info("Este picker todavía no tiene seguimientos registrados.")
+            with st.container(border=True):
+                st.markdown("### 📄 Subir seguimiento / acta")
+                st.caption("Adjunta un PDF o elige uno de los enlaces de seguimiento que ya guardaste.")
+                recursos=store.get("recursos_formatos",[]) or []
+                recurso_lookup={}
+                for i,z in enumerate(recursos):
+                    if str(z.get("url","")).strip():
+                        recurso_lookup[f"{i+1}. {z.get('tipo','Recurso')} · {z.get('titulo','Enlace')}"]=z
+                recurso_opciones=["Sin enlace guardado"]+list(recurso_lookup)
                 with st.container(border=True):
-                    rr1,rr2,rr3=st.columns([4,1.3,1])
-                    with rr1:
-                        st.markdown(f"**🔗 {recurso.get('titulo','Formato')}**")
-                        st.caption(f"🟦 {recurso.get('tipo','Recurso')} · Agregado {recurso.get('fecha','')}")
-                    with rr2:
-                        if recurso.get("url"): st.link_button("Abrir enlace",str(recurso.get("url")),use_container_width=True)
+                    st.markdown("**🔗 Elegir enlace guardado (opcional)**")
+                    recurso_seleccionado=st.selectbox("Enlaces de seguimiento",recurso_opciones,key=f"seguimiento_enlace_guardado_{person_key(seguimiento_picker)}")
+                    recurso_actual=recurso_lookup.get(recurso_seleccionado)
+                    if recurso_actual:
+                        st.info(f"Seleccionado: {recurso_actual.get('tipo','Seguimiento')} · {recurso_actual.get('titulo','Enlace de seguimiento')}")
+                        st.link_button("Abrir enlace para revisar",str(recurso_actual.get("url","")))
+                enviar_copia=st.checkbox("Enviar copia por correo al guardar",value=False,key=f"seguimiento_email_{person_key(seguimiento_picker)}")
+                destinatarios=st.text_input("Correo(s) destinatario(s)",placeholder="persona@correo.com (separa varios con coma)",key=f"seguimiento_destinatarios_{person_key(seguimiento_picker)}") if enviar_copia else ""
+                with st.form(f"seguimiento_documento_form_{seguimiento_picker}",clear_on_submit=True):
+                    dc1,dc2=st.columns([1,2])
+                    with dc1: doc_tipo=st.selectbox("Tipo de documento",["Acta 1","Acta 2","Acta 3","Llamada de atención","Advertencia verbal 1","Advertencia verbal 2","Cero tolerancia","Otro"])
+                    with dc2: doc_titulo=st.text_input("Nombre / referencia",placeholder="Ej. Acta por FNR — septiembre 2026")
+                    doc_detalle=st.text_area("Detalle / motivo",placeholder="Qué originó el seguimiento y cualquier dato importante…")
+                    doc_pdf=st.file_uploader("📎 Adjuntar PDF",type=["pdf"],accept_multiple_files=False,key=f"seguimiento_pdf_{seguimiento_picker}")
+                    if st.form_submit_button("💾 Guardar seguimiento / documento",type="primary"):
+                        url=str(recurso_actual.get("url","")).strip() if recurso_actual else ""
+                        titulo=doc_titulo.strip() or (doc_pdf.name if doc_pdf is not None else (str(recurso_actual.get("titulo",doc_tipo)) if recurso_actual else doc_tipo))
+                        if doc_pdf is None and not url: st.error("Adjunta un PDF o selecciona un enlace guardado.")
+                        else:
+                            registro={"id":datetime.now().strftime("%Y%m%d%H%M%S%f"),"fecha":datetime.now().strftime("%Y-%m-%d %H:%M"),"tipo":doc_tipo,"titulo":titulo,"detalle":doc_detalle.strip(),"supervisor":str(r.get("SUPERVISOR","")),"url":url,"url_titulo":(str(recurso_actual.get("titulo","")) if recurso_actual else ""),"path":"","archivo":"","destinatarios":destinatarios}
+                            pdf_bytes=None
+                            if doc_pdf is not None:
+                                path,_=save_followup_pdf(doc_pdf.getvalue(),seguimiento_picker,doc_pdf.name); registro["path"]=path; registro["archivo"]=_safe_filename(doc_pdf.name); pdf_bytes=doc_pdf.getvalue()
+                            rec.setdefault("documentos",[]).append(registro); save_store(store)
+                            if enviar_copia:
+                                email_body=f"Se registró un {doc_tipo} para {seguimiento_picker}.\n\nDetalle: {doc_detalle.strip() or 'Sin detalle.'}"
+                                if url: email_body+=f"\n\nEnlace de seguimiento: {url}"
+                                ok,msg=send_followup_email(f"Seguimiento {doc_tipo} · {seguimiento_picker}",email_body,destinatarios,pdf_bytes,registro.get("archivo") or "seguimiento.pdf")
+                                if ok: st.success(msg)
+                                else: st.error(msg)
+                            else: st.success("Seguimiento / documento guardado.")
+            st.markdown("### 🔗 Enlaces de seguimiento")
+            st.caption("Aquí puedes consultar y administrar los enlaces guardados.")
+            with st.expander(f"Administrar enlaces de seguimiento ({len(recursos)})",expanded=False):
+                st.info("Los enlaces guardados aparecen aquí para abrirlos o quitarlos.")
+                for idx,recurso in enumerate(recursos):
+                    with st.container(border=True):
+                        rr1,rr2,rr3=st.columns([4,1.3,1])
+                        with rr1:
+                            st.markdown(f"**🔗 {recurso.get('titulo','Formato')}**")
+                            st.caption(f"🟦 {recurso.get('tipo','Recurso')} · Agregado {recurso.get('fecha','')}")
+                        with rr2:
+                            if recurso.get("url"): st.link_button("Abrir enlace",str(recurso.get("url")),use_container_width=True)
+                        with rr3:
+                            if st.button("Quitar",key=f"seg_recurso_del_{idx}",use_container_width=True): store["recursos_formatos"].pop(idx); save_store(store); st.rerun()
+                with st.form("seg_recurso_form",clear_on_submit=True):
+                    q1,q2=st.columns([1,2])
+                    with q1: rt=st.selectbox("Tipo",["Retroalimentación","Seguimiento","Llamada de atención","Acta","Otro"])
+                    with q2: rn=st.text_input("Nombre")
+                    ru=st.text_input("Enlace",placeholder="https://...")
+                    if st.form_submit_button("Guardar enlace reutilizable"):
+                        if rn.strip() and ru.startswith(("http://","https://")):
+                            store.setdefault("recursos_formatos",[]).append({"tipo":rt,"titulo":rn.strip(),"url":ru.strip(),"fecha":datetime.now().strftime("%Y-%m-%d %H:%M")}); save_store(store); st.rerun()
+                        else: st.error("Nombre y enlace válido son obligatorios.")
+            documentos=sorted(rec.get("documentos",[]) or [],key=lambda z:str(z.get("fecha","")),reverse=True)
+            st.markdown("### 📎 Documentos del expediente")
+            if documentos:
+                for i,doc in enumerate(documentos):
+                    archivo=load_followup_pdf(doc)
+                    rr1,rr2,rr3=st.columns([1.2,5,1.4])
+                    rr1.markdown(f"**{doc.get('tipo','Documento')}**"); rr1.caption(str(doc.get('fecha','')))
+                    rr2.markdown(f"**{doc.get('titulo',doc.get('archivo','Documento'))}**")
+                    if doc.get("detalle"): rr2.caption(str(doc.get("detalle")))
                     with rr3:
-                        if st.button("Quitar",key=f"seg_recurso_del_{idx}",use_container_width=True): store["recursos_formatos"].pop(idx); save_store(store); st.rerun()
-            with st.form("seg_recurso_form",clear_on_submit=True):
-                q1,q2=st.columns([1,2])
-                with q1: rt=st.selectbox("Tipo",["Retroalimentación","Seguimiento","Llamada de atención","Acta","Otro"])
-                with q2: rn=st.text_input("Nombre")
-                ru=st.text_input("Enlace",placeholder="https://...")
-                if st.form_submit_button("Guardar enlace reutilizable"):
-                    if rn.strip() and ru.startswith(("http://","https://")):
-                        store.setdefault("recursos_formatos",[]).append({"tipo":rt,"titulo":rn.strip(),"url":ru.strip(),"fecha":datetime.now().strftime("%Y-%m-%d %H:%M")}); save_store(store); st.rerun()
-                    else: st.error("Nombre y enlace válido son obligatorios.")
-        documentos=sorted(rec.get("documentos",[]) or [],key=lambda z:str(z.get("fecha","")),reverse=True)
-        st.markdown("### 📎 Documentos del expediente")
-        if documentos:
-            for i,doc in enumerate(documentos):
-                archivo=load_followup_pdf(doc)
-                rr1,rr2,rr3=st.columns([1.2,5,1.4])
-                rr1.markdown(f"**{doc.get('tipo','Documento')}**"); rr1.caption(str(doc.get('fecha','')))
-                rr2.markdown(f"**{doc.get('titulo',doc.get('archivo','Documento'))}**")
-                if doc.get("detalle"): rr2.caption(str(doc.get("detalle")))
-                with rr3:
-                    if archivo is not None: st.download_button("Ver PDF",archivo,file_name=str(doc.get("archivo") or "seguimiento.pdf"),mime="application/pdf",key=f"seg_download_{seguimiento_picker}_{doc.get('id',i)}",use_container_width=True)
-                    if doc.get("url"): st.link_button(f"Abrir: {doc.get('url_titulo') or 'enlace'}",str(doc.get("url")),use_container_width=True)
-        else: st.info("No hay documentos vinculados a este expediente.")
+                        if archivo is not None: st.download_button("Ver PDF",archivo,file_name=str(doc.get("archivo") or "seguimiento.pdf"),mime="application/pdf",key=f"seg_download_{seguimiento_picker}_{doc.get('id',i)}",use_container_width=True)
+                        if doc.get("url"): st.link_button(f"Abrir: {doc.get('url_titulo') or 'enlace'}",str(doc.get("url")),use_container_width=True)
+            else: st.info("No hay documentos vinculados a este expediente.")
 
-with f:
-    st.download_button("📥 Descargar Excel completo",export(s,fnr,mc,None if sp=="Todos" else sp,roster),f"Analisis_FNR_MC_{periodo}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    st.info("La app utiliza 3 Excel operativos separados (Pickers, FNR y MC) y un Master consolidado para turno, correo, supervisor y área.")
-    st.success(f"Persistencia activa: {len(store.get('excluded_orders',[]))} pedidos excluidos · {len(store.get('master_overrides',{}))} asignaciones manuales · {len(store.get('master_excluded',[]))} exclusiones de personal · {len(store.get('feedback_rows',[]))} retroalimentaciones guardadas.")
+if _tab_active(f):
+    with f:
+        st.download_button("📥 Descargar Excel completo",export(s,fnr,mc,None if sp=="Todos" else sp,roster),f"Analisis_FNR_MC_{periodo}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.info("La app utiliza 3 Excel operativos separados (Pickers, FNR y MC) y un Master consolidado para turno, correo, supervisor y área.")
+        st.success(f"Persistencia activa: {len(store.get('excluded_orders',[]))} pedidos excluidos · {len(store.get('master_overrides',{}))} asignaciones manuales · {len(store.get('master_excluded',[]))} exclusiones de personal · {len(store.get('feedback_rows',[]))} retroalimentaciones guardadas.")
 
-with j:
-    st.subheader("📌 Tablero de pendientes y procesos")
-    st.caption("Aquí el responsable puede publicar procesos nuevos, pendientes operativos y material visual de referencia. Todo queda guardado.")
+if _tab_active(j):
+    with j:
+        st.subheader("📌 Tablero de pendientes y procesos")
+        st.caption("Aquí el responsable puede publicar procesos nuevos, pendientes operativos y material visual de referencia. Todo queda guardado.")
 
-    with st.expander("➕ Crear nuevo proceso / pendiente", expanded=False):
-        with st.form("nuevo_proceso_form", clear_on_submit=True):
-            p1,p2=st.columns([2,1])
-            with p1:
-                proc_titulo=st.text_input("Nombre del proceso / pendiente",placeholder="Ej. Validación de pedidos 07:00–12:00")
-                proc_obj=st.text_area("Objetivo / qué se debe hacer",height=90)
-                proc_pasos=st.text_area("Pasos o instrucciones",height=130,placeholder="1. ...\n2. ...\n3. ...")
-            with p2:
-                proc_resp=st.text_input("Responsable")
-                proc_prior=st.selectbox("Prioridad",["Alta","Media","Baja"])
-                proc_status=st.selectbox("Estado",["Pendiente","En proceso","Completado"])
-                proc_fecha=st.date_input("Fecha objetivo",value=datetime.now().date())
-                proc_imgs=st.file_uploader("Imágenes referenciales",type=["png","jpg","jpeg","webp"],accept_multiple_files=True,key="proc_imgs_new")
-            if st.form_submit_button("Guardar proceso",type="primary"):
-                if not proc_titulo.strip():
-                    st.warning("Escribe un nombre para el proceso.")
-                else:
-                    pid=new_process_id()
-                    paths=[]
-                    for img in proc_imgs or []:
-                        paths.append(save_process_image(img.getvalue(),pid,img.name))
-                    store.setdefault("procesos",[]).append({
-                        "id":pid,"titulo":proc_titulo.strip(),"objetivo":proc_obj.strip(),"pasos":proc_pasos.strip(),
-                        "responsable":proc_resp.strip(),"prioridad":proc_prior,"estado":proc_status,
-                        "fecha_objetivo":str(proc_fecha),"creado":datetime.now().strftime("%Y-%m-%d %H:%M"),"imagenes":paths})
-                    save_store(store); st.success("Proceso guardado."); st.rerun()
+        with st.expander("➕ Crear nuevo proceso / pendiente", expanded=False):
+            with st.form("nuevo_proceso_form", clear_on_submit=True):
+                p1,p2=st.columns([2,1])
+                with p1:
+                    proc_titulo=st.text_input("Nombre del proceso / pendiente",placeholder="Ej. Validación de pedidos 07:00–12:00")
+                    proc_obj=st.text_area("Objetivo / qué se debe hacer",height=90)
+                    proc_pasos=st.text_area("Pasos o instrucciones",height=130,placeholder="1. ...\n2. ...\n3. ...")
+                with p2:
+                    proc_resp=st.text_input("Responsable")
+                    proc_prior=st.selectbox("Prioridad",["Alta","Media","Baja"])
+                    proc_status=st.selectbox("Estado",["Pendiente","En proceso","Completado"])
+                    proc_fecha=st.date_input("Fecha objetivo",value=datetime.now().date())
+                    proc_imgs=st.file_uploader("Imágenes referenciales",type=["png","jpg","jpeg","webp"],accept_multiple_files=True,key="proc_imgs_new")
+                if st.form_submit_button("Guardar proceso",type="primary"):
+                    if not proc_titulo.strip():
+                        st.warning("Escribe un nombre para el proceso.")
+                    else:
+                        pid=new_process_id()
+                        paths=[]
+                        for img in proc_imgs or []:
+                            paths.append(save_process_image(img.getvalue(),pid,img.name))
+                        store.setdefault("procesos",[]).append({
+                            "id":pid,"titulo":proc_titulo.strip(),"objetivo":proc_obj.strip(),"pasos":proc_pasos.strip(),
+                            "responsable":proc_resp.strip(),"prioridad":proc_prior,"estado":proc_status,
+                            "fecha_objetivo":str(proc_fecha),"creado":datetime.now().strftime("%Y-%m-%d %H:%M"),"imagenes":paths})
+                        save_store(store); st.success("Proceso guardado."); st.rerun()
 
-    procesos=store.get("procesos",[])
-    if not procesos:
-        st.info("Todavía no hay procesos o pendientes publicados.")
-    else:
-        status_order=["Pendiente","En proceso","Completado"]
-        for status_name in status_order:
-            items=[p for p in procesos if p.get("estado")==status_name]
-            st.markdown(f"### {status_name} · {len(items)}")
-            cols=st.columns(3)
-            if not items:
-                st.caption("Sin elementos en esta columna.")
-            for idx,proc in enumerate(items):
-                with cols[idx%3]:
-                    priority=proc.get("prioridad","Media")
-                    st.markdown(f"<div class='justo-card'><div class='justo-kicker'>{priority}</div><div class='justo-title'>{proc.get('titulo','Sin título')}</div><div class='justo-muted'>Responsable: {proc.get('responsable') or 'Sin asignar'} · Fecha: {proc.get('fecha_objetivo') or 'Sin fecha'}</div></div>",unsafe_allow_html=True)
-                    if proc.get("objetivo"): st.write(proc["objetivo"])
-                    if proc.get("pasos"):
-                        with st.expander("Ver instrucciones"):
-                            st.write(proc["pasos"])
-                    imgs=load_process_images(proc)
-                    if imgs:
-                        st.image([data for _,data in imgs],caption=[os.path.basename(path) for path,_ in imgs],use_container_width=True)
-                    new_status=st.selectbox("Cambiar estado",status_order,index=status_order.index(proc.get("estado","Pendiente")) if proc.get("estado") in status_order else 0,key=f"proc_status_{proc['id']}")
-                    ec1,ec2=st.columns(2)
-                    with ec1:
-                        if st.button("Guardar estado",key=f"proc_save_{proc['id']}"):
-                            for pp in store["procesos"]:
-                                if pp.get("id")==proc.get("id"): pp["estado"]=new_status
-                            save_store(store); st.rerun()
-                    with ec2:
-                        if st.button("Eliminar",key=f"proc_del_{proc['id']}"):
-                            store["procesos"]=[pp for pp in store["procesos"] if pp.get("id")!=proc.get("id")]
-                            save_store(store); st.rerun()
+        procesos=store.get("procesos",[])
+        if not procesos:
+            st.info("Todavía no hay procesos o pendientes publicados.")
+        else:
+            status_order=["Pendiente","En proceso","Completado"]
+            for status_name in status_order:
+                items=[p for p in procesos if p.get("estado")==status_name]
+                st.markdown(f"### {status_name} · {len(items)}")
+                cols=st.columns(3)
+                if not items:
+                    st.caption("Sin elementos en esta columna.")
+                for idx,proc in enumerate(items):
+                    with cols[idx%3]:
+                        priority=proc.get("prioridad","Media")
+                        st.markdown(f"<div class='justo-card'><div class='justo-kicker'>{priority}</div><div class='justo-title'>{proc.get('titulo','Sin título')}</div><div class='justo-muted'>Responsable: {proc.get('responsable') or 'Sin asignar'} · Fecha: {proc.get('fecha_objetivo') or 'Sin fecha'}</div></div>",unsafe_allow_html=True)
+                        if proc.get("objetivo"): st.write(proc["objetivo"])
+                        if proc.get("pasos"):
+                            with st.expander("Ver instrucciones"):
+                                st.write(proc["pasos"])
+                        imgs=load_process_images(proc)
+                        if imgs:
+                            st.image([data for _,data in imgs],caption=[os.path.basename(path) for path,_ in imgs],use_container_width=True)
+                        new_status=st.selectbox("Cambiar estado",status_order,index=status_order.index(proc.get("estado","Pendiente")) if proc.get("estado") in status_order else 0,key=f"proc_status_{proc['id']}")
+                        ec1,ec2=st.columns(2)
+                        with ec1:
+                            if st.button("Guardar estado",key=f"proc_save_{proc['id']}"):
+                                for pp in store["procesos"]:
+                                    if pp.get("id")==proc.get("id"): pp["estado"]=new_status
+                                save_store(store); st.rerun()
+                        with ec2:
+                            if st.button("Eliminar",key=f"proc_del_{proc['id']}"):
+                                store["procesos"]=[pp for pp in store["procesos"] if pp.get("id")!=proc.get("id")]
+                                save_store(store); st.rerun()
 
-    st.divider()
-    st.subheader("💾 Respaldo de configuración")
-    st.caption("Para evitar perder asignaciones, seguimientos y procesos si Streamlit Cloud reinicia el contenedor, puedes descargar un respaldo y conservarlo.")
-    backup_json=json.dumps(store,ensure_ascii=False,indent=2).encode("utf-8")
-    st.download_button("Descargar respaldo de configuración",backup_json,f"Respaldo_Control_FNR_{periodo}.json","application/json")
+        st.divider()
+        st.subheader("💾 Respaldo de configuración")
+        st.caption("Para evitar perder asignaciones, seguimientos y procesos si Streamlit Cloud reinicia el contenedor, puedes descargar un respaldo y conservarlo.")
+        backup_json=json.dumps(store,ensure_ascii=False,indent=2).encode("utf-8")
+        st.download_button("Descargar respaldo de configuración",backup_json,f"Respaldo_Control_FNR_{periodo}.json","application/json")
