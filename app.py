@@ -1,7 +1,7 @@
 # ================================================================
 # PROPIEDAD / FIRMA DEL DESARROLLO
-# Desarrollado por: Yael Maya RuÃ­z
-# Control FNR & Mala Calidad Â· OperaciÃ³n CoyoacÃ¡n
+# Desarrollado por: Yael Maya Ruíz
+# Control FNR & Mala Calidad · Operación Coyoacán
 # ================================================================
 
 
@@ -13,9 +13,9 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="Control FNR & Mala Calidad", page_icon="ðŸ“Š", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Control FNR & Mala Calidad", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
 
-# Estilo visual inspirado en la interfaz limpia de JÃ¼sto: blanco, rojo de marca y tarjetas suaves.
+# Estilo visual inspirado en la interfaz limpia de Jüsto: blanco, rojo de marca y tarjetas suaves.
 st.markdown("""
 <style>
 :root { --justo-red:#BD2426; --ink:#272936; --muted:#6f7480; --soft:#f7f7f5; --line:#e7e7e3; --success:#15803d; }
@@ -116,7 +116,7 @@ def _cloud_request(method,path,data=None,content_type="application/json",missing
             except Exception:
                 pass
         if missing_ok and missing_resource: return None
-        raise RuntimeError(f"Almacenamiento en nube respondiÃ³ HTTP {exc.code}: {detail}") from exc
+        raise RuntimeError(f"Almacenamiento en nube respondió HTTP {exc.code}: {detail}") from exc
     except Exception as exc:
         raise RuntimeError(f"No se pudo conectar con el almacenamiento en nube: {exc}") from exc
 
@@ -154,7 +154,7 @@ def cloud_list(prefix,limit=1000):
     body=json.dumps({"prefix":str(prefix).strip("/"),"limit":int(limit),"offset":0,"sortBy":{"column":"name","order":"desc"}}).encode("utf-8")
     raw=_cloud_request("POST",f"/storage/v1/object/list/{urllib.parse.quote(bucket,safe='')}",body)
     try: return json.loads(raw.decode("utf-8"))
-    except Exception as exc: raise RuntimeError("La nube devolviÃ³ una respuesta de historial invÃ¡lida.") from exc
+    except Exception as exc: raise RuntimeError("La nube devolvió una respuesta de historial inválida.") from exc
 
 def ensure_persist_dir():
     os.makedirs(PERSIST_DIR, exist_ok=True)
@@ -203,7 +203,7 @@ def persist_upload(upload, key):
     return io.BytesIO(data)
 
 def persist_uploaded_once(upload,key):
-    """Evita volver a guardar el mismo archivo tras cada interacciÃ³n de Streamlit."""
+    """Evita volver a guardar el mismo archivo tras cada interacción de Streamlit."""
     if upload is None: return load_persisted_upload(key)
     file_id=getattr(upload,"file_id",None) or getattr(upload,"id",None)
     identity=(file_id,str(getattr(upload,"name","")),int(getattr(upload,"size",0) or 0))
@@ -239,14 +239,14 @@ def _load_persisted_upload_bytes(key):
 @st.cache_data(show_spinner=False,max_entries=1,ttl=60)
 def upload_history_rows():
     rows=[]
-    labels={"base_picker":"Base de Pickers / LÃ­neas","detalle_fnr":"Detalle FNR","detalle_mc":"Detalle Mala Calidad","plantilla_personal":"Plantilla consolidada"}
+    labels={"base_picker":"Base de Pickers / Líneas","detalle_fnr":"Detalle FNR","detalle_mc":"Detalle Mala Calidad","plantilla_personal":"Plantilla consolidada"}
     if cloud_enabled():
         for key,label in labels.items():
             for item in cloud_list(f"upload_history/{key}",MAX_UPLOAD_HISTORY+5):
                 name=str(item.get("name","")).strip()
                 if not name or item.get("id") is None: continue
                 meta=item.get("metadata") or {}
-                rows.append({"Archivo":label,"VersiÃ³n":name,"Fecha de carga":str(item.get("updated_at") or item.get("created_at") or ""),"TamaÃ±o (MB)":round(float(meta.get("size",0) or 0)/1048576,2)})
+                rows.append({"Archivo":label,"Versión":name,"Fecha de carga":str(item.get("updated_at") or item.get("created_at") or ""),"Tamaño (MB)":round(float(meta.get("size",0) or 0)/1048576,2)})
         return rows
     if not os.path.isdir(UPLOAD_HISTORY_DIR): return rows
     for key,label in labels.items():
@@ -256,7 +256,7 @@ def upload_history_rows():
             path=os.path.join(folder,name)
             if not os.path.isfile(path): continue
             try:
-                rows.append({"Archivo":label,"VersiÃ³n":name,"Fecha de carga":datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d %H:%M:%S"),"TamaÃ±o (MB)":round(os.path.getsize(path)/1048576,2)})
+                rows.append({"Archivo":label,"Versión":name,"Fecha de carga":datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d %H:%M:%S"),"Tamaño (MB)":round(os.path.getsize(path)/1048576,2)})
             except OSError: pass
     return rows
 
@@ -382,7 +382,7 @@ def load_followup_pdf(doc):
         return None
 
 def migrate_local_assets_to_cloud(store):
-    """Migra PDFs e imÃ¡genes existentes al bucket y actualiza sus referencias."""
+    """Migra PDFs e imágenes existentes al bucket y actualiza sus referencias."""
     if not cloud_enabled(): return 0,0
     moved=0; missing=0; changed=False
     def migrate(path,kind):
@@ -423,7 +423,7 @@ def load_store():
     cloud_data=cloud_download(CLOUD_STORE_KEY,missing_ok=True) if cloud_enabled() else None
     if cloud_data is not None:
         data=json.loads(cloud_data.decode("utf-8"))
-        if not isinstance(data,dict): raise RuntimeError("El expediente guardado en la nube no contiene un objeto JSON vÃ¡lido.")
+        if not isinstance(data,dict): raise RuntimeError("El expediente guardado en la nube no contiene un objeto JSON válido.")
         for key,value in {"pickers":{},"feedback_rows":[],"recursos_formatos":[],"procesos":[],"excluded_orders":[],"master_overrides":{},"master_excluded":[],"seguimientos_documentos":[],"supervisores":[],"upload_meta":{}}.items(): data.setdefault(key,value)
         try:
             with open(STORE_FILE,"wb") as f: f.write(json.dumps(data,ensure_ascii=False,indent=2).encode("utf-8"))
@@ -456,7 +456,7 @@ def load_store():
     return data
 
 def save_store(store):
-    """Guarda el estado y registra cuÃ¡ndo se confirmÃ³ el Ãºltimo respaldo en nube."""
+    """Guarda el estado y registra cuándo se confirmó el último respaldo en nube."""
     ensure_persist_dir()
     payload=json.dumps(store,ensure_ascii=False,indent=2).encode("utf-8")
     try:
@@ -489,10 +489,10 @@ def save_store(store):
         write_local(payload)
 
 def picker_record(store, picker, aliases=None):
-    """Devuelve un Ãºnico expediente por persona, aunque cambie el orden/formato del nombre.
+    """Devuelve un único expediente por persona, aunque cambie el orden/formato del nombre.
 
-    TambiÃ©n migra automÃ¡ticamente expedientes antiguos guardados con el nombre
-    del Excel operativo hacia el nombre canÃ³nico del Maestro.
+    También migra automáticamente expedientes antiguos guardados con el nombre
+    del Excel operativo hacia el nombre canónico del Maestro.
     """
     store.setdefault("pickers", {})
     target=str(picker or "").strip()
@@ -520,7 +520,7 @@ def picker_record(store, picker, aliases=None):
         return rec
     rec=store["pickers"].pop(found_key)
     rec.setdefault("estado","ACTIVO"); rec.setdefault("comentarios",[]); rec.setdefault("acciones",[]); rec.setdefault("documentos",[])
-    # Si ya existÃ­a un registro con el nombre canÃ³nico, fusionar sin perder historial.
+    # Si ya existía un registro con el nombre canónico, fusionar sin perder historial.
     if target in store["pickers"] and target != found_key:
         current=store["pickers"][target]
         current.setdefault("comentarios",[]); current.setdefault("acciones",[]); current.setdefault("documentos",[])
@@ -535,7 +535,7 @@ def active_picker_names(store):
     return {p for p,r in store.get("pickers",{}).items() if r.get("estado", "ACTIVO") == "ACTIVO"}
 
 def norm(x):
-    x = str(x).strip().lower().translate(str.maketrans("Ã¡Ã©Ã­Ã³ÃºÃ¼Ã±","aeiouun"))
+    x = str(x).strip().lower().translate(str.maketrans("áéíóúüñ","aeiouun"))
     return re.sub(r"[^a-z0-9]+","_",x).strip("_")
 
 def person_key(x):
@@ -550,21 +550,21 @@ def token_key(x):
     return "_".join(sorted(name_tokens(x)))
 
 def extract_code(value):
-    """Extrae el cÃ³digo del formato 1188502.nombre@justo.mx o JT1180680.nombre@..."""
+    """Extrae el código del formato 1188502.nombre@justo.mx o JT1180680.nombre@..."""
     s=str(value or "").strip().lower()
     if not s or s in {"nan", "none"}: return ""
     m=re.match(r"^(jt)?(\d+)(?:\.|\s|$)", s)
     return (m.group(2) if m else "")
 
 def email_name_tokens(value):
-    """Obtiene los nombres del correo ignorando el cÃ³digo inicial."""
+    """Obtiene los nombres del correo ignorando el código inicial."""
     s=str(value or "").strip().lower()
     if "@" in s: s=s.split("@",1)[0]
     s=re.sub(r"^(?:jt)?\d+[._-]*", "", s)
     return name_tokens(s.replace(".", "_"))
 
 def identity_name_tokens(value):
-    """Quita cÃ³digos del identificador y devuelve los tokens del nombre."""
+    """Quita códigos del identificador y devuelve los tokens del nombre."""
     s=str(value or "").strip()
     if not s or s.lower() in {"nan","none","nat"}: return set()
     if "@" in s: return email_name_tokens(s)
@@ -619,7 +619,7 @@ def sheets(upload):
     return out
 
 def choose(ss,words):
-    """Elige una hoja por nombre, ignorando mayÃºsculas, espacios y guiones."""
+    """Elige una hoja por nombre, ignorando mayúsculas, espacios y guiones."""
     if not ss:
         raise ValueError("El Excel no contiene hojas con datos.")
     for name,df in ss.items():
@@ -631,9 +631,9 @@ def choose(ss,words):
 def parse_base(df):
     """Lee la base operativa aunque NO traiga correo.
 
-    El correo se incorpora despuÃ©s desde Maestro_Personal/plantilla.
-    AsÃ­ la plantilla sÃ­ funciona como fuente de identidad y los Excel
-    operativos no estÃ¡n obligados a repetir el correo en cada archivo.
+    El correo se incorpora después desde Maestro_Personal/plantilla.
+    Así la plantilla sí funciona como fuente de identidad y los Excel
+    operativos no están obligados a repetir el correo en cada archivo.
     """
     p=col(df,["picker","picker_nombre","nombre","email_picker","persona"])
     l=col(df,["total_lineas","lineas_totales","lineas","total_lineas_pickeadas","lineas_totales_pickeadas"])
@@ -641,9 +641,9 @@ def parse_base(df):
     sh=col(df,["turno","shift"]); ar=col(df,["area","departamento","department"])
     em=col(df,["codigo_correo","codigo + correo","correo","email","usuario"])
     if not l:
-        raise ValueError("La base necesita una columna de Total lÃ­neas / LÃ­neas totales.")
+        raise ValueError("La base necesita una columna de Total líneas / Líneas totales.")
     # Conservar lo que viene en PICKER como descriptor/origen. En algunas
-    # bases operativas esta columna trae cÃ³digo + correo, aunque CORREO no exista.
+    # bases operativas esta columna trae código + correo, aunque CORREO no exista.
     if p:
         picker_values=df[p].fillna("").astype(str).str.strip()
     elif em:
@@ -671,15 +671,15 @@ def parse_base(df):
     x["_CODE_KEY"]=x["CORREO"].map(extract_code)
     x["_EMAIL_TOKENS"]=x["CORREO"].map(email_name_tokens)
     x["_EMAIL_KEY"]=x["CORREO"].map(email_key)
-    # Sumar todas las filas de una persona: conservar solo la de mÃ¡s lÃ­neas
-    # descartaba producciÃ³n cuando el Excel separaba turnos o Ã¡reas.
+    # Sumar todas las filas de una persona: conservar solo la de más líneas
+    # descartaba producción cuando el Excel separaba turnos o áreas.
     x["_IDENTITY_KEY"]=x.apply(lambda r: ("email:"+r["_EMAIL_KEY"]) if str(r["_EMAIL_KEY"]).strip() else (("name:"+r["_KEY"]) if str(r["_KEY"]).strip() else ("row:"+str(r.name))),axis=1)
     rows=[]
     for _,g in x.groupby("_IDENTITY_KEY",sort=False):
         row=g.iloc[g["LINEAS"].astype(float).argmax()].copy()
         row["LINEAS"]=pd.to_numeric(g["LINEAS"],errors="coerce").fillna(0).sum()
         row["PEDIDOS"]=pd.to_numeric(g["PEDIDOS"],errors="coerce").fillna(0).sum()
-        for field,plural in [("TURNO","Varios turnos"),("AREA_BASE","Varias Ã¡reas")]:
+        for field,plural in [("TURNO","Varios turnos"),("AREA_BASE","Varias áreas")]:
             vals=[str(v).strip() for v in g[field].tolist() if str(v).strip() and str(v).strip().lower() not in {"nan","none"}]
             unique=list(dict.fromkeys(vals))
             row[field]=unique[0] if len(unique)==1 else (plural if unique else ("No especificado" if field=="TURNO" else "No especificada"))
@@ -720,13 +720,13 @@ def _match_master_row(value, roster, code_value=""):
     Prioridad de identidad:
     1) nombre exacto normalizado;
     2) mismas palabras aunque cambie el orden;
-    3) cÃ³digo de empleado;
+    3) código de empleado;
     4) nombre parcial/subconjunto (ej. "AMARO PAULINA ANDREA" contra
        "AMARO OROPEZA PAULINA ANDREA");
     5) nombre del correo;
     6) similitud conservadora.
 
-    Nunca asigna por una sola palabra genÃ©rica.
+    Nunca asigna por una sola palabra genérica.
     """
     if roster is None or roster.empty: return None
     value=str(value or "").strip()
@@ -744,13 +744,13 @@ def _match_master_row(value, roster, code_value=""):
         hits=roster[roster["_TOKEN_KEY"].astype(str)=="_".join(sorted(toks))]
         if len(hits)==1: return hits.iloc[0]
 
-    # 3. CÃ³digo Ãºnico
+    # 3. Código único
     if code:
         hits=roster[roster["_CODE_KEY"].astype(str)==code]
         if len(hits)==1: return hits.iloc[0]
 
     # 4/5. Puntaje por identidad: favorece que TODOS los tokens del nombre
-    # corto estÃ©n contenidos en el nombre del Master, o que el correo aporte
+    # corto estén contenidos en el nombre del Master, o que el correo aporte
     # nombre+apellido.
     candidates=[]
     for _,rr in roster.iterrows():
@@ -766,7 +766,7 @@ def _match_master_row(value, roster, code_value=""):
         etoks=rr.get("_EMAIL_TOKENS",set())
         email_overlap=len(email_toks & etoks) if email_toks else 0
         email_cov=email_overlap/(len(email_toks) or 1) if email_toks else 0
-        # CÃ³digo ya fue evaluado; aquÃ­ el correo ayuda cuando el Excel
+        # Código ya fue evaluado; aquí el correo ayuda cuando el Excel
         # operativo trae nombre y el Master tiene nombre+correo.
         score=(0.50*cov_in)+(0.18*j)+(0.17*seq)+(0.15*email_cov)
         candidates.append((score,cov_in,j,seq,email_cov,rr))
@@ -776,16 +776,16 @@ def _match_master_row(value, roster, code_value=""):
     best=candidates[0]; second=candidates[1][0] if len(candidates)>1 else 0
     score,cov_in,j,seq,email_cov,rr=best
 
-    # Caso fuerte: al menos 2 palabras del nombre de entrada estÃ¡n en el Master
-    # y todas las palabras de entrada estÃ¡n cubiertas por ese Master.
+    # Caso fuerte: al menos 2 palabras del nombre de entrada están en el Master
+    # y todas las palabras de entrada están cubiertas por ese Master.
     if len(toks)>=2 and cov_in>=1.0 and len(toks & name_tokens(rr["PICKER"]))>=2:
         if score>=0.60 and (score-second>=0.05 or score>=0.82): return rr
-    # Si el correo identifica al menos dos tokens, es una seÃ±al fuerte.
+    # Si el correo identifica al menos dos tokens, es una señal fuerte.
     if len(email_toks)>=2 and email_cov>=1.0 and len(email_toks & name_tokens(rr["PICKER"]))>=2:
         if score>=0.58 and (score-second>=0.04 or score>=0.82): return rr
     # Coincidencia muy cercana para errores de escritura.
     if score>=0.90 and (score-second>=0.04 or score>=0.96): return rr
-    # Fallback controlado para nombres con segundo apellido, iniciales o pequeÃ±as
+    # Fallback controlado para nombres con segundo apellido, iniciales o pequeñas
     # diferencias: exige al menos 2 tokens distintivos y que no haya empate cercano.
     distinctive={t for t in toks if len(t)>=4}
     best_dist={t for t in name_tokens(rr.get("PICKER","")) if len(t)>=4}
@@ -797,15 +797,15 @@ def _match_master_row(value, roster, code_value=""):
 def apply_roster(base, roster):
     """Asocia los 3 Excel operativos con la PLANTILLA CONSOLIDADA.
 
-    La Ãºnica llave de identidad entre archivos es CORREO.
-    El nombre canÃ³nico, turno, supervisor y Ã¡rea se toman de la plantilla.
+    La única llave de identidad entre archivos es CORREO.
+    El nombre canónico, turno, supervisor y área se toman de la plantilla.
     Si un registro operativo no trae correo o el correo no existe en la
     plantilla, queda como NO ASIGNADO; no se hace cruce aproximado por nombre.
     """
     if roster is None or roster.empty: return base
     roster=roster.copy()
-    # template_roster_from_upload debe exponer esta llave, pero calcularla aquÃ­
-    # tambiÃ©n protege el cruce si el maestro llega desde otra ruta.
+    # template_roster_from_upload debe exponer esta llave, pero calcularla aquí
+    # también protege el cruce si el maestro llega desde otra ruta.
     if "_EMAIL_KEY" not in roster.columns:
         roster["_EMAIL_KEY"]=roster.get("CORREO",pd.Series("",index=roster.index)).map(email_key)
     x=base.copy()
@@ -822,8 +822,8 @@ def apply_roster(base, roster):
             rr=roster_email.get(ek)
         else:
             rr=None
-        # Recuperar la ruta que funcionaba en la versiÃ³n anterior: el correo
-        # tiene prioridad; si falta, usar la resoluciÃ³n conservadora por cÃ³digo/nombre.
+        # Recuperar la ruta que funcionaba en la versión anterior: el correo
+        # tiene prioridad; si falta, usar la resolución conservadora por código/nombre.
         if rr is None:
             rr=_match_master_row(row.get("_SOURCE_PICKER",row.get("PICKER","")),roster,row.get("CORREO",""))
         matches.append(rr)
@@ -853,15 +853,15 @@ def apply_roster(base, roster):
     x.loc[ok,"CORREO"]=x.loc[ok,"_MASTER_CORREO"]
     x.loc[ok,"SUPERVISOR"]=x.loc[ok,"_MASTER_SUPERVISOR"]
     x.loc[ok,"AREA_BASE"]=x.loc[ok,"_MASTER_AREA"]
-    # Contextos explÃ­citos para FNR/MC y segmentaciones posteriores.
+    # Contextos explícitos para FNR/MC y segmentaciones posteriores.
     x["TURNO"]=x["TURNO"].fillna("").astype(str).str.strip()
     x["AREA_BASE"]=x["AREA_BASE"].fillna("").astype(str).str.strip()
     x.loc[x["TURNO"].eq(""),"TURNO"]="No especificado"
     x.loc[x["AREA_BASE"].eq(""),"AREA_BASE"]="No especificada"
     # CORREO_KEY queda visible para que TODOS los cruces posteriores usen la misma llave.
     x["CORREO_KEY"]=x["CORREO"].map(email_key)
-    # Un mismo picker puede venir en varias filas con correo/cÃ³digo/nombre en
-    # formatos distintos. Agrupar despuÃ©s de resolverlo evita repetir FNR/MC
+    # Un mismo picker puede venir en varias filas con correo/código/nombre en
+    # formatos distintos. Agrupar después de resolverlo evita repetir FNR/MC
     # en el resumen final.
     x["_IDENTITY_KEY"]=x.apply(
         lambda r: ("email:"+str(r.get("CORREO_KEY",""))) if str(r.get("CORREO_KEY"," ")).strip()
@@ -886,9 +886,9 @@ def apply_manual_personnel(base, store):
     """Aplica asignaciones/exclusiones capturadas desde la interfaz.
 
     Las asignaciones se guardan por una clave normalizada del picker original,
-    de modo que no es necesario editar el Excel operativo. Una exclusiÃ³n solo
+    de modo que no es necesario editar el Excel operativo. Una exclusión solo
     retira a la persona de los filtros/segmentaciones de personal; no borra
-    sus lÃ­neas ni sus incidencias del cÃ¡lculo global.
+    sus líneas ni sus incidencias del cálculo global.
     """
     x=base.copy()
     overrides=store.get("master_overrides",{}) if isinstance(store,dict) else {}
@@ -950,7 +950,7 @@ def effective_roster(roster, store):
     return r
 
 def canonicalize_incidents(inc, base):
-    """Asocia FNR/MC a la persona canÃ³nica usando exclusivamente CORREO.
+    """Asocia FNR/MC a la persona canónica usando exclusivamente CORREO.
 
     El nombre que viene en el archivo operativo es descriptivo; el nombre
     definitivo se toma de la plantilla consolidada mediante el correo.
@@ -987,10 +987,10 @@ def canonicalize_incidents(inc, base):
 def template_roster_from_upload(data):
     """Construye la identidad desde la PLANTILLA CONSOLIDADA.
 
-    CORREO_KEY es la llave Ãºnica. La plantilla puede tener informaciÃ³n
+    CORREO_KEY es la llave única. La plantilla puede tener información
     repartida entre Maestro_Personal y Base_Pickers (por ejemplo, un sheet
-    tiene correo/nombre y otro tiene turno/supervisor/Ã¡rea). Por eso NO se
-    elige una sola fila por correo: se consolidan los campos no vacÃ­os de
+    tiene correo/nombre y otro tiene turno/supervisor/área). Por eso NO se
+    elige una sola fila por correo: se consolidan los campos no vacíos de
     todas las hojas de la plantilla para que el turno nunca se pierda.
     """
     ss=sheets_from_bytes(data) if isinstance(data,(bytes,bytearray)) else sheets(data)
@@ -1031,26 +1031,26 @@ def template_roster_from_upload(data):
         return z not in {"", "nan", "None", "NaT", "No asignado", "No especificada", "__EXCLUIDO__"}
 
     # Consolidar campo por campo por correo. Esto permite que una hoja aporte
-    # el turno y otra aporte supervisor/Ã¡rea sin perder ninguno.
+    # el turno y otra aporte supervisor/área sin perder ninguno.
     rows=[]
     for ek,g in raw.groupby("_EMAIL_KEY",sort=False):
         row={"_EMAIL_KEY":ek}
         for field in ["PICKER","TURNO_MAESTRO","CORREO","SUPERVISOR","AREA_MAESTRO","ESTADO_PLANTILLA"]:
             vals=[v for v in g[field].tolist() if useful(v)]
             row[field]=str(vals[0]).strip() if vals else ""
-        # Preferir el valor que aparezca mÃ¡s veces cuando existan varias fuentes.
+        # Preferir el valor que aparezca más veces cuando existan varias fuentes.
         for field in ["PICKER","TURNO_MAESTRO","SUPERVISOR","AREA_MAESTRO","ESTADO_PLANTILLA"]:
             vals=[str(v).strip() for v in g[field].tolist() if useful(v)]
             if vals:
                 counts=pd.Series(vals).value_counts()
                 row[field]=str(counts.index[0]).strip()
-        # El correo canÃ³nico siempre sale del valor con @.
+        # El correo canónico siempre sale del valor con @.
         emails=[str(v).strip() for v in g["CORREO"].tolist() if extract_email_address(v)]
         row["CORREO"]=emails[0] if emails else str(g["CORREO"].iloc[0]).strip()
         rows.append(row)
 
     r=pd.DataFrame(rows)
-    # Si la plantilla tiene nombre vacÃ­o, usar el nombre del correo solo como
+    # Si la plantilla tiene nombre vacío, usar el nombre del correo solo como
     # descriptor; no se usa para cruzar identidad.
     empty_name=r["PICKER"].astype(str).str.strip().eq("")
     if empty_name.any():
@@ -1075,11 +1075,11 @@ def roster_from_uploads(uploads):
 def parse_inc(df,tipo):
     """Lee FNR/MC con o sin correo.
 
-    Si el detalle no trae correo, se cruza despuÃ©s contra la base/plantilla
-    por el nombre y, una vez resuelto, se conserva el correo canÃ³nico del Master.
+    Si el detalle no trae correo, se cruza después contra la base/plantilla
+    por el nombre y, una vez resuelto, se conserva el correo canónico del Master.
     """
     p=col(df,["picker","picker_nombre","email_picker","nombre","persona"])
-    prod=col(df,["product","producto","item","articulo","artÃ­culo"])
+    prod=col(df,["product","producto","item","articulo","artículo"])
     order=col(df,["order_number","order","pedido","numero_pedido","order_id"])
     ar=col(df,["department","departamento","area","depto"])
     sh=col(df,["turno","shift"]); fe=col(df,["date","fecha","created_at"])
@@ -1104,7 +1104,7 @@ def parse_inc(df,tipo):
 def attach(inc,base):
     """Adjunta contexto operativo ya resuelto por CORREO.
 
-    El turno y el Ã¡rea que llegan a FNR/MC se copian desde la base, la cual
+    El turno y el área que llegan a FNR/MC se copian desde la base, la cual
     previamente fue asociada a la plantilla por correo.
     """
     if inc is None or inc.empty:
@@ -1147,16 +1147,16 @@ def attach(inc,base):
     y.drop(columns=["_EMAIL_KEY"],errors="ignore",inplace=True)
     return y
 
-@st.cache_data(show_spinner="Procesando los Excel por primera vezâ€¦",max_entries=2,ttl=1800)
+@st.cache_data(show_spinner="Procesando los Excel por primera vez…",max_entries=2,ttl=1800)
 def prepare_source_frames(base_data,fnr_data,mc_data,roster_data,personnel_config_json):
-    """Procesa y cruza las fuentes una vez por versiÃ³n de archivos/configuraciÃ³n."""
+    """Procesa y cruza las fuentes una vez por versión de archivos/configuración."""
     config=json.loads(personnel_config_json)
     base=parse_base(choose(sheets_from_bytes(base_data),["picker","lineas","resumen"]))
     fnr=parse_inc(choose(sheets_from_bytes(fnr_data),["fnr","detalle"]),"FNR")
     mc=parse_inc(choose(sheets_from_bytes(mc_data),["mc","mala"]),"MC")
     roster=template_roster_from_upload(roster_data)
     if roster.empty:
-        raise ValueError("La plantilla consolidada no contiene correos vÃ¡lidos.")
+        raise ValueError("La plantilla consolidada no contiene correos válidos.")
     base=apply_roster(base,roster)
     base=apply_manual_personnel(base,config)
     base_match=(base.get("_MASTER_MATCH",pd.Series(False,index=base.index)).fillna(False).astype(bool)
@@ -1186,7 +1186,7 @@ def summary(base,fnr,mc):
         if field not in b: b[field]=0
 
     # Incluye personal que aparece en FNR/MC aunque no tenga registro en la base
-    # de lÃ­neas. Su tasa queda N/D cuando no existe denominador real.
+    # de líneas. Su tasa queda N/D cuando no existe denominador real.
     meta=[b]
     for inc in [fnr,mc]:
         if inc is None or inc.empty: continue
@@ -1219,7 +1219,7 @@ def summary(base,fnr,mc):
        if mc is not None and not mc.empty else pd.DataFrame(columns=keys+["MC"]))
     s=s.merge(f,on=keys,how="outer").merge(m,on=keys,how="outer")
     s[["FNR","MC"]]=s[["FNR","MC"]].fillna(0)
-    # Asegurar columnas numÃ©ricas y evitar pd.NA + round() incompatibles con algunas versiones de pandas
+    # Asegurar columnas numéricas y evitar pd.NA + round() incompatibles con algunas versiones de pandas
     s["LINEAS"]=pd.to_numeric(s["LINEAS"],errors="coerce").fillna(0.0)
     s["FNR"]=pd.to_numeric(s["FNR"],errors="coerce").fillna(0.0)
     s["MC"]=pd.to_numeric(s["MC"],errors="coerce").fillna(0.0)
@@ -1228,10 +1228,10 @@ def summary(base,fnr,mc):
     s["MC_%"]=pd.to_numeric(s["MC"].div(den)*100,errors="coerce").round(2)
     def sem(r):
         if (pd.notna(r["FNR_%"]) and r["FNR_%"]>=FNR_OBJ) or (pd.notna(r["MC_%"]) and r["MC_%"]>=MC_OBJ):
-            return "ðŸ”´ FUERA DE OBJETIVO"
+            return "🔴 FUERA DE OBJETIVO"
         if (pd.notna(r["FNR_%"]) and r["FNR_%"]>=1.20) or (pd.notna(r["MC_%"]) and r["MC_%"]>=0.80):
-            return "ðŸŸ¡ PREVENTIVO"
-        return "ðŸŸ¢ EN OBJETIVO"
+            return "🟡 PREVENTIVO"
+        return "🟢 EN OBJETIVO"
     s["ESTADO"]=s.apply(sem,axis=1)
     return s
 
@@ -1239,7 +1239,7 @@ def monthly_kpis(base,fnr,mc):
     total_pedidos=pd.to_numeric(base["PEDIDOS"],errors="coerce").fillna(0).sum()
     fnr_pedidos=fnr.loc[fnr["ORDER_NUMBER"].astype(str).str.strip().ne(""),"ORDER_NUMBER"].nunique()
     mc_pedidos=mc.loc[mc["ORDER_NUMBER"].astype(str).str.strip().ne(""),"ORDER_NUMBER"].nunique()
-    # Si no hay nÃºmeros de pedido en el detalle, usamos incidencias como respaldo y lo indicamos en la UI.
+    # Si no hay números de pedido en el detalle, usamos incidencias como respaldo y lo indicamos en la UI.
     fnr_rate=fnr_pedidos/total_pedidos*100 if total_pedidos else None
     mc_rate=mc_pedidos/total_pedidos*100 if total_pedidos else None
     return total_pedidos,fnr_pedidos,mc_pedidos,fnr_rate,mc_rate
@@ -1261,7 +1261,7 @@ def orders(inc,picker=None):
 
 
 def _dedupe_columns(df):
-    """Elimina columnas duplicadas conservando la primera apariciÃ³n.
+    """Elimina columnas duplicadas conservando la primera aparición.
     Evita que pandas convierta df["columna"] en DataFrame y rompa filtros/booleanos.
     """
     if df is None:
@@ -1291,9 +1291,9 @@ def safe_pct(num, den, decimals=2):
     return out.astype("float64").round(decimals)
 
 def groups(inc,base,key):
-    """Agrupa FNR/MC por turno o Ã¡rea usando el contexto ya cruzado por correo.
+    """Agrupa FNR/MC por turno o área usando el contexto ya cruzado por correo.
     Acepta TURNO_REF/TURNO y AREA_REF/AREA para evitar que una diferencia de
-    nombre interno deje vacÃ­a la segmentaciÃ³n.
+    nombre interno deje vacía la segmentación.
     """
     x=_dedupe_columns(inc)
     base=_dedupe_columns(base)
@@ -1342,7 +1342,7 @@ def groups(inc,base,key):
     return g.sort_values("INCIDENCIAS",ascending=False)
 
 def _excel_safe_df(df):
-    """Prepara DataFrames para exportaciÃ³n robusta a Excel/OpenPyXL."""
+    """Prepara DataFrames para exportación robusta a Excel/OpenPyXL."""
     if df is None:
         return pd.DataFrame()
     x=df.copy()
@@ -1363,7 +1363,7 @@ def _excel_safe_df(df):
 
 def _write_sheet(writer, df, sheet_name):
     x=_excel_safe_df(df)
-    # Mantener nombres de hoja vÃ¡lidos para Excel.
+    # Mantener nombres de hoja válidos para Excel.
     name=re.sub(r"[\\/*?:\[\]]", "_", str(sheet_name))[:31] or "Hoja"
     x.to_excel(writer, sheet_name=name, index=False)
 
@@ -1421,7 +1421,7 @@ def send_followup_email(subject, body, recipients, attachment_bytes=None, attach
         return False,f"No fue posible enviar la copia. Revisa el servidor y los datos SMTP. Detalle: {exc}"
 
 def export(summary,fnr,mc,picker,roster=None):
-    """Genera el Excel de salida sin romper el dashboard si algÃºn dato viene irregular."""
+    """Genera el Excel de salida sin romper el dashboard si algún dato viene irregular."""
     b=io.BytesIO()
     writer=pd.ExcelWriter(b,engine="openpyxl")
     try:
@@ -1443,8 +1443,8 @@ def export(summary,fnr,mc,picker,roster=None):
         raise
     return b.getvalue()
 
-st.markdown('<div class="justo-kicker">OperaciÃ³n Â· CoyoacÃ¡n</div>', unsafe_allow_html=True)
-st.title("ðŸ“Š Control FNR & Mala Calidad")
+st.markdown('<div class="justo-kicker">Operación · Coyoacán</div>', unsafe_allow_html=True)
+st.title("📊 Control FNR & Mala Calidad")
 st.caption("Control operativo de pickers, calidad, seguimiento y procesos")
 
 # Estado persistente: se carga antes de construir los widgets.
@@ -1468,69 +1468,69 @@ with st.sidebar:
     st.header("Control operativo")
     if cloud_enabled():
         _,_,cloud_bucket=cloud_config()
-        st.success(f"â˜ï¸ Respaldo en nube activo Â· {cloud_bucket}")
+        st.success(f"☁️ Respaldo en nube activo · {cloud_bucket}")
         if cloud_migrated:
-            st.caption(f"Se migraron {cloud_migrated} documentos e imÃ¡genes al almacenamiento privado.")
+            st.caption(f"Se migraron {cloud_migrated} documentos e imágenes al almacenamiento privado.")
         if cloud_history_migrated:
             st.caption(f"Se migraron {cloud_history_migrated} versiones previas de Excel al historial en nube.")
         if cloud_missing:
             st.warning(f"{cloud_missing} archivos antiguos no estaban disponibles en el servidor para migrarlos.")
     else:
         st.warning("Respaldo en nube pendiente: configura SUPABASE_URL y SUPABASE_SECRET_KEY en los secretos del servidor.")
-        st.caption('Agrega tambiÃ©n SUPABASE_STORAGE_BUCKET="control-fnr-mc". El bucket privado se crea automÃ¡ticamente al conectar.')
-    ub_upload=st.file_uploader("â‘  Base de Pickers / LÃ­neas",type=["xlsx","xls"],key="base_picker")
-    uf_upload=st.file_uploader("â‘¡ Detalle FNR",type=["xlsx","xls"],key="detalle_fnr")
-    um_upload=st.file_uploader("â‘¢ Detalle Mala Calidad",type=["xlsx","xls"],key="detalle_mc")
-    up_upload=st.file_uploader("â‘£ Plantilla consolidada",type=["xlsx","xls"],key="plantilla_personal")
+        st.caption('Agrega también SUPABASE_STORAGE_BUCKET="control-fnr-mc". El bucket privado se crea automáticamente al conectar.')
+    ub_upload=st.file_uploader("① Base de Pickers / Líneas",type=["xlsx","xls"],key="base_picker")
+    uf_upload=st.file_uploader("② Detalle FNR",type=["xlsx","xls"],key="detalle_fnr")
+    um_upload=st.file_uploader("③ Detalle Mala Calidad",type=["xlsx","xls"],key="detalle_mc")
+    up_upload=st.file_uploader("④ Plantilla consolidada",type=["xlsx","xls"],key="plantilla_personal")
 
-    # Cada archivo nuevo reemplaza automÃ¡ticamente al guardado. Si solo se recarga
-    # la pÃ¡gina, la app recupera la Ãºltima versiÃ³n guardada sin pedir volver a subirla.
+    # Cada archivo nuevo reemplaza automáticamente al guardado. Si solo se recarga
+    # la página, la app recupera la última versión guardada sin pedir volver a subirla.
     ub=persist_uploaded_once(ub_upload,"base_picker")
     uf=persist_uploaded_once(uf_upload,"detalle_fnr")
     um=persist_uploaded_once(um_upload,"detalle_mc")
     up=persist_uploaded_once(up_upload,"plantilla_personal")
-    for _key,_upload,_label in [("base_picker",ub_upload,"Pickers/LÃ­neas"),("detalle_fnr",uf_upload,"FNR"),("detalle_mc",um_upload,"Mala Calidad"),("plantilla_personal",up_upload,"Plantilla consolidada")]:
+    for _key,_upload,_label in [("base_picker",ub_upload,"Pickers/Líneas"),("detalle_fnr",uf_upload,"FNR"),("detalle_mc",um_upload,"Mala Calidad"),("plantilla_personal",up_upload,"Plantilla consolidada")]:
         if _upload is not None:
             store.setdefault("upload_meta",{})[_key]={"fecha":datetime.now().strftime("%Y-%m-%d %H:%M:%S"),"archivo":str(getattr(_upload,"name",_label))}
     save_store(store)
     if cloud_enabled():
         _backup_at=str(store.get("cloud_backup_at","")).strip()
         if _backup_at:
-            st.caption(f"Ãšltimo respaldo confirmado: {_backup_at}")
+            st.caption(f"Último respaldo confirmado: {_backup_at}")
         else:
-            st.caption("El respaldo se confirmarÃ¡ al guardar el primer cambio.")
+            st.caption("El respaldo se confirmará al guardar el primer cambio.")
 
     status=persisted_status()
-    labels={"base_picker":"Pickers/LÃ­neas","detalle_fnr":"FNR","detalle_mc":"Mala Calidad","plantilla_personal":"Master Pickers"}
+    labels={"base_picker":"Pickers/Líneas","detalle_fnr":"FNR","detalle_mc":"Mala Calidad","plantilla_personal":"Master Pickers"}
     guardados=[labels[k] for k,v in status.items() if v]
     if guardados:
         st.success("Archivos guardados: " + ", ".join(guardados))
-    with st.expander("ðŸ—‚ï¸ Historial de archivos Excel",expanded=False):
+    with st.expander("🗂️ Historial de archivos Excel",expanded=False):
         _history=upload_history_rows()
         if _history:
             st.dataframe(pd.DataFrame(_history),use_container_width=True,hide_index=True)
             if st.button("Preparar ZIP de respaldo",key="prepare_excel_history_zip"):
-                with st.spinner("Preparando el respaldo de archivosâ€¦"):
+                with st.spinner("Preparando el respaldo de archivos…"):
                     st.session_state["_excel_history_zip_ready"]=upload_history_zip()
             if st.session_state.get("_excel_history_zip_ready"):
                 st.download_button("Descargar respaldo del historial (.zip)",st.session_state["_excel_history_zip_ready"],"Historial_Excel_FNR_MC.zip","application/zip",key="download_excel_history")
             st.caption("El ZIP se prepara solo cuando solicitas el respaldo.")
         else:
-            st.info("AÃºn no hay versiones en el historial. Se registra una versiÃ³n al cargar cada Excel.")
-    st.caption("Los 3 Excel operativos se cruzan con la PLANTILLA CONSOLIDADA usando CORREO como Ãºnica llave. La plantilla aporta el nombre asociado, turno, supervisor y Ã¡rea. El nombre no se usa para hacer coincidencias entre archivos.")
+            st.info("Aún no hay versiones en el historial. Se registra una versión al cargar cada Excel.")
+    st.caption("Los 3 Excel operativos se cruzan con la PLANTILLA CONSOLIDADA usando CORREO como única llave. La plantilla aporta el nombre asociado, turno, supervisor y área. El nombre no se usa para hacer coincidencias entre archivos.")
     st.divider()
     periodo=st.text_input("Periodo",value=str(store.get("periodo",datetime.now().strftime("%Y-%m"))),key="periodo_persistente")
     saved_excluded="\n".join(str(x) for x in store.get("excluded_orders",[]) if str(x).strip())
-    ex=st.text_area("Pedidos operativos a excluir (uno por lÃ­nea)",value=saved_excluded,key="pedidos_excluidos_persistentes")
+    ex=st.text_area("Pedidos operativos a excluir (uno por línea)",value=saved_excluded,key="pedidos_excluidos_persistentes")
     excluded={x.strip() for x in ex.splitlines() if x.strip()}
-    # Guardar automÃ¡ticamente preferencias y exclusiones.
+    # Guardar automáticamente preferencias y exclusiones.
     store["periodo"]=periodo.strip() or datetime.now().strftime("%Y-%m")
     store["excluded_orders"]=sorted(excluded)
     save_store(store)
 
 if not (ub and uf and um and up):
     st.info("Carga los 3 Excel operativos y la plantilla consolidada para comenzar. Para que el cruce sea por correo, los registros que deban asociarse deben traer CORREO / CODIGO + CORREO.")
-    st.markdown("**Fuentes:** â‘  Pickers/LÃ­neas Â· â‘¡ FNR Â· â‘¢ Mala Calidad Â· â‘£ Plantilla consolidada (correo â†’ nombre asociado, turno, supervisor y Ã¡rea).")
+    st.markdown("**Fuentes:** ① Pickers/Líneas · ② FNR · ③ Mala Calidad · ④ Plantilla consolidada (correo → nombre asociado, turno, supervisor y área).")
     st.stop()
 
 try:
@@ -1551,15 +1551,15 @@ base=_dedupe_columns(base)
 
 base,fnr,mc=exclude_registered_supervisors(base,fnr,mc,store)
 s=summary(base,fnr,mc)
-# Estado de cruce de TODOS los archivos: Pickers/LÃ­neas + FNR + MC.
+# Estado de cruce de TODOS los archivos: Pickers/Líneas + FNR + MC.
 # La llave es CORREO_KEY; cualquier registro sin coincidencia con la plantilla
-# se concentra en la pestaÃ±a ðŸ§© Correos / Cruce para asignaciÃ³n manual.
+# se concentra en la pestaña 🧩 Correos / Cruce para asignación manual.
 def _cross_frame(df, fuente):
     if df is None or df.empty:
         return pd.DataFrame(columns=["FUENTE","CATEGORIA","PICKER","CORREO","CORREO_KEY","TURNO","SUPERVISOR","AREA_BASE","IDENTIFICADO"])
     y=df.copy()
     y["CORREO_KEY"]=y.get("CORREO",pd.Series("",index=y.index)).map(email_key)
-    if fuente=="Pickers / LÃ­neas":
+    if fuente=="Pickers / Líneas":
         ident=y.get("_MASTER_MATCH",False)
         area=y.get("AREA_BASE",pd.Series("",index=y.index))
     else:
@@ -1579,14 +1579,14 @@ def _cross_frame(df, fuente):
     return out
 
 cross_status=pd.concat([
-    _cross_frame(base,"Pickers / LÃ­neas"),
+    _cross_frame(base,"Pickers / Líneas"),
     _cross_frame(fnr,"FNR"),
     _cross_frame(mc,"Mala Calidad"),
 ],ignore_index=True)
 master_match=base.get("_MASTER_MATCH",pd.Series(False,index=base.index)).copy()
 base_display=base.drop(columns=["_MASTER_MATCH"],errors="ignore")
 s=s.drop(columns=["_MASTER_MATCH"],errors="ignore")
-# Registrar automÃ¡ticamente pickers vistos en la operaciÃ³n, sin alterar su estado histÃ³rico.
+# Registrar automáticamente pickers vistos en la operación, sin alterar su estado histórico.
 for _idx,_row in base.iterrows():
     _p=str(_row.get("PICKER","")).strip()
     _src=str(_row.get("_SOURCE_PICKER","")).strip()
@@ -1601,20 +1601,20 @@ if roster is not None:
     matched_turn=int((match_series & ~excluded_series & base["TURNO"].astype(str).str.strip().ne("") & base["TURNO"].astype(str).str.strip().ne("No especificado") & base["TURNO"].astype(str).str.strip().ne("__EXCLUIDO__")).sum())
     with st.sidebar:
         st.success(f"Personal identificado: {matched}/{total}")
-        st.caption(f"Turnos asignados: {matched_turn}/{total} Â· Excluidos: {int(excluded_series.sum())}")
+        st.caption(f"Turnos asignados: {matched_turn}/{total} · Excluidos: {int(excluded_series.sum())}")
         if unmatched:
-            st.caption(f"{unmatched} registro(s) en la categorÃ­a Sin registrar.")
+            st.caption(f"{unmatched} registro(s) en la categoría Sin registrar.")
         email_match=int(base.get("_MASTER_MATCH",pd.Series(False,index=base.index)).fillna(False).astype(bool).sum())
-        st.caption(f"ðŸ”‘ Cruce de identidad: CORREO primero Â· {email_match} registros identificados")
+        st.caption(f"🔑 Cruce de identidad: CORREO primero · {email_match} registros identificados")
 
-# Retira columnas tÃ©cnicas antes de mostrar/exportar.
+# Retira columnas técnicas antes de mostrar/exportar.
 base=base.drop(columns=["_MASTER_MATCH"],errors="ignore")
 
 def person_options(df):
     return sorted({str(x).strip() for x in df["PICKER"].tolist() if str(x).strip()}, key=lambda z:z.upper())
 
 def render_person_filters(df, key_prefix, include_picker=True, include_area=True):
-    """Filtros locales de cada pÃ¡gina; evita depender de un filtro global en el sidebar."""
+    """Filtros locales de cada página; evita depender de un filtro global en el sidebar."""
     turns=["Todos"]+sorted({str(x).strip() for x in df["TURNO"].tolist() if str(x).strip() and str(x)!="__EXCLUIDO__"}, key=lambda z:z.upper())
     sups=["Todos"]+sorted({str(x).strip() for x in df["SUPERVISOR"].tolist() if str(x).strip() and str(x)!="No asignado"}, key=lambda z:z.upper())
     areas=["Todos"]+sorted({str(x).strip() for x in df["AREA_BASE"].tolist() if str(x).strip() and str(x)!="No especificada"}, key=lambda z:z.upper())
@@ -1624,7 +1624,7 @@ def render_person_filters(df, key_prefix, include_picker=True, include_area=True
     picker_sel="Todos"
     if include_picker:
         with c[pos]:
-            search=st.text_input("Buscar picker", placeholder="Escribe un nombreâ€¦", key=f"{key_prefix}_search")
+            search=st.text_input("Buscar picker", placeholder="Escribe un nombre…", key=f"{key_prefix}_search")
             names=person_options(df)
             if search.strip():
                 term=norm(search)
@@ -1640,7 +1640,7 @@ def render_person_filters(df, key_prefix, include_picker=True, include_area=True
     area_sel="Todos"
     if include_area:
         with c[pos]:
-            area_sel=st.selectbox("Ãrea",areas,key=f"{key_prefix}_area")
+            area_sel=st.selectbox("Área",areas,key=f"{key_prefix}_area")
     return picker_sel,turn_sel,sup_sel,area_sel
 
 def apply_person_filters(df, picker_sel="Todos", turn_sel="Todos", sup_sel="Todos", area_sel="Todos"):
@@ -1652,14 +1652,14 @@ def apply_person_filters(df, picker_sel="Todos", turn_sel="Todos", sup_sel="Todo
     return out
 
 def context_values(df):
-    """Opciones del contexto global; se comparten entre todas las pestaÃ±as."""
+    """Opciones del contexto global; se comparten entre todas las pestañas."""
     turns=["Todos"]+sorted({str(x).strip() for x in df["TURNO"].tolist() if str(x).strip() and str(x)!="__EXCLUIDO__"}, key=lambda z:z.upper())
     sups=["Todos"]+sorted({str(x).strip() for x in df["SUPERVISOR"].tolist() if str(x).strip() and str(x)!="No asignado"}, key=lambda z:z.upper())
     areas=["Todos"]+sorted({str(x).strip() for x in df["AREA_BASE"].tolist() if str(x).strip() and str(x)!="No especificada"}, key=lambda z:z.upper())
     return turns,sups,areas
 
 def global_context(df):
-    """Lee el contexto elegido en Bodega. Las demÃ¡s pÃ¡ginas lo heredan automÃ¡ticamente."""
+    """Lee el contexto elegido en Bodega. Las demás páginas lo heredan automáticamente."""
     turns,sups,areas=context_values(df)
     ctx=st.session_state.setdefault("global_context", {"turno":"Todos","supervisor":"Todos","area":"Todos"})
     if ctx.get("turno") not in turns: ctx["turno"]="Todos"
@@ -1668,10 +1668,10 @@ def global_context(df):
     return ctx,turns,sups,areas
 
 def _context_identity_view(roster,base=None,fnr=None,mc=None):
-    """Universo de contexto: plantilla consolidada mÃ¡s personal Sin registrar.
+    """Universo de contexto: plantilla consolidada más personal Sin registrar.
 
     El correo identifica al personal registrado; el nombre normalizado identifica
-    por separado a quienes no estÃ¡n en la plantilla.
+    por separado a quienes no están en la plantilla.
     """
     if roster is None or roster.empty:
         r=pd.DataFrame(columns=["PICKER","TURNO","SUPERVISOR","AREA_BASE","CORREO","CORREO_KEY","_CONTEXT_KEY","CATEGORIA"])
@@ -1737,7 +1737,7 @@ def apply_context(df, ctx, include_turn=True, identity_df=None):
         ctx.get("supervisor","Todos"),ctx.get("area","Todos"))
 
 def select_summary_people(df,summary_df):
-    """Filtra por categorÃ­a y nombre para conservar aparte Sin registrar."""
+    """Filtra por categoría y nombre para conservar aparte Sin registrar."""
     if df is None or df.empty or summary_df is None or summary_df.empty:
         return df.iloc[0:0].copy() if isinstance(df,pd.DataFrame) else pd.DataFrame()
     if "CATEGORIA" not in df.columns or "CATEGORIA" not in summary_df.columns:
@@ -1747,25 +1747,25 @@ def select_summary_people(df,summary_df):
     return df.loc[mask].copy()
 
 def context_reference(df, ctx, identity_df=None):
-    """Base de comparaciÃ³n: supervisor/Ã¡rea de la plantilla, todos los turnos."""
+    """Base de comparación: supervisor/área de la plantilla, todos los turnos."""
     if identity_df is not None:
         return _records_for_context(df,ctx,identity_df,False)
     return apply_person_filters(df,"Todos","Todos",ctx.get("supervisor","Todos"),ctx.get("area","Todos"))
 
-def render_context_banner(ctx, selected_df, reference_df, label="Contexto de anÃ¡lisis"):
+def render_context_banner(ctx, selected_df, reference_df, label="Contexto de análisis"):
     parts=[]
-    for k,lab in [("turno","Turno"),("supervisor","Supervisor"),("area","Ãrea")]:
+    for k,lab in [("turno","Turno"),("supervisor","Supervisor"),("area","Área")]:
         v=ctx.get(k,"Todos")
         if v!="Todos": parts.append(f"{lab}: {v}")
-    scope=" Â· ".join(parts) if parts else "Todos los turnos"
+    scope=" · ".join(parts) if parts else "Todos los turnos"
     sel_p=int(selected_df.get("CATEGORIA",pd.Series("Picker",index=selected_df.index)).astype(str).eq("Picker").sum())
     sel_u=int(selected_df.get("CATEGORIA",pd.Series("Picker",index=selected_df.index)).astype(str).eq("Sin registrar").sum())
     ref_p=int(reference_df.get("CATEGORIA",pd.Series("Picker",index=reference_df.index)).astype(str).eq("Picker").sum())
     pct=(sel_p/ref_p*100) if ref_p else 0
-    count_text=f"{sel_p:,} pickers Â· {sel_u:,} sin registrar" if sel_u else f"{sel_p:,} pickers"
+    count_text=f"{sel_p:,} pickers · {sel_u:,} sin registrar" if sel_u else f"{sel_p:,} pickers"
     st.markdown(
-        f"<div class='context-banner'><div class='context-title'>ðŸŽ¯ {label}: {scope}</div>"
-        f"<div class='context-detail'>{count_text} Â· {pct:.1f}% del universo de comparaciÃ³n Â· Las demÃ¡s pestaÃ±as utilizan este mismo contexto.</div></div>",
+        f"<div class='context-banner'><div class='context-title'>🎯 {label}: {scope}</div>"
+        f"<div class='context-detail'>{count_text} · {pct:.1f}% del universo de comparación · Las demás pestañas utilizan este mismo contexto.</div></div>",
         unsafe_allow_html=True)
 
 def render_soft_kpis(cards):
@@ -1780,7 +1780,7 @@ def render_soft_kpis(cards):
                 unsafe_allow_html=True)
 
 def render_turn_comparison(selected_base, reference_base, selected_fnr, reference_fnr, selected_mc, reference_mc):
-    """Muestra cantidad y porcentaje del contexto contra el universo de comparaciÃ³n."""
+    """Muestra cantidad y porcentaje del contexto contra el universo de comparación."""
     def pct(v,d): return (v/d*100) if d else 0
     sl=selected_base.LINEAS.sum(); rl=reference_base.LINEAS.sum()
     sp=selected_base.PEDIDOS.sum(); rp=reference_base.PEDIDOS.sum()
@@ -1789,7 +1789,7 @@ def render_turn_comparison(selected_base, reference_base, selected_fnr, referenc
     sfp,_,_,sfr,s_mr=monthly_kpis(selected_base,selected_fnr,selected_mc)
     _,_,_,rfr,r_mr=monthly_kpis(reference_base,reference_fnr,reference_mc)
     cards=[
-        ("LÃ­neas",sl, pct(sl,rl), "del universo"),
+        ("Líneas",sl, pct(sl,rl), "del universo"),
         ("Pedidos",sp, pct(sp,rp), "del universo"),
         ("FNR",sf, pct(sf,rf), "de incidencias"),
         ("MC",sm, pct(sm,rm), "de incidencias"),
@@ -1806,10 +1806,10 @@ if len(excluded_mask)==len(s_view):
     s_view=s_view.loc[~excluded_mask].copy()
 
 # El CONTEXTO GLOBAL sale de la PLANTILLA CONSOLIDADA, no del nombre del Excel operativo.
-# Cada pestaÃ±a despuÃ©s filtra sus propios registros por CORREO_KEY.
+# Cada pestaña después filtra sus propios registros por CORREO_KEY.
 context_identity=_context_identity_view(roster,base,fnr,mc)
 
-# Defaults para pestaÃ±as que no necesitan filtros globales.
+# Defaults para pestañas que no necesitan filtros globales.
 sp=st.session_state.get("picker_page_picker","Todos")
 stn="Todos"
 ssup="Todos"
@@ -1818,7 +1818,7 @@ base_view=select_summary_people(base,s_view)
 fnr_view=select_summary_people(fnr,s_view)
 mc_view=select_summary_people(mc,s_view)
 
-_tab_labels=["ðŸ  Bodega","ðŸ‘¤ Picker","ðŸŒ™ Turnos / Ãreas","ðŸ§© Correos / Cruce","ðŸ‘¥ Supervisores","ðŸ›¡ï¸ Seguimiento","ðŸ“¥ Exportar","ðŸ“Œ Pendientes & Procesos"]
+_tab_labels=["🏠 Bodega","👤 Picker","🌙 Turnos / Áreas","🧩 Correos / Cruce","👥 Supervisores","🛡️ Seguimiento","📥 Exportar","📌 Pendientes & Procesos"]
 try:
     a,b,e,x,g,h,f,j=st.tabs(_tab_labels,on_change="rerun",key="control_fnr_mc_tabs")
 except TypeError:
@@ -1829,31 +1829,31 @@ def _tab_active(tab):
 
 if _tab_active(a):
     with a:
-        st.subheader(f"Resumen de bodega â€” {periodo}")
-        st.caption("El contexto elegido aquÃ­ se comparte automÃ¡ticamente con todas las pestaÃ±as.")
+        st.subheader(f"Resumen de bodega — {periodo}")
+        st.caption("El contexto elegido aquí se comparte automáticamente con todas las pestañas.")
         _meta=store.get("upload_meta",{}) or {}
         _upload_rows=[]
-        for _k,_label in [("base_picker","Pickers / LÃ­neas"),("detalle_fnr","FNR"),("detalle_mc","Mala Calidad"),("plantilla_personal","Plantilla consolidada")]:
+        for _k,_label in [("base_picker","Pickers / Líneas"),("detalle_fnr","FNR"),("detalle_mc","Mala Calidad"),("plantilla_personal","Plantilla consolidada")]:
             _m=_meta.get(_k,{}) or {}
-            _upload_rows.append({"Archivo":_label,"Ãšltima carga":_m.get("fecha","Sin registro"),"Nombre":_m.get("archivo","")})
-        with st.expander("ðŸ•’ Ãšltima carga de Excel",expanded=True):
+            _upload_rows.append({"Archivo":_label,"Última carga":_m.get("fecha","Sin registro"),"Nombre":_m.get("archivo","")})
+        with st.expander("🕒 Última carga de Excel",expanded=True):
             st.dataframe(pd.DataFrame(_upload_rows),use_container_width=True,hide_index=True)
         ctx,turns,sups,areas=global_context(context_identity)
         with st.container(border=True):
-            st.markdown("**ðŸŽ¯ Contexto global de anÃ¡lisis**")
+            st.markdown("**🎯 Contexto global de análisis**")
             c1,c2,c3=st.columns(3)
             with c1:
                 st.selectbox("Turno",turns,key="global_turno")
             with c2:
                 st.selectbox("Supervisor",sups,key="global_supervisor")
             with c3:
-                st.selectbox("Ãrea",areas,key="global_area")
+                st.selectbox("Área",areas,key="global_area")
         ctx["turno"]=st.session_state.get("global_turno","Todos")
         ctx["supervisor"]=st.session_state.get("global_supervisor","Todos")
         ctx["area"]=st.session_state.get("global_area","Todos")
 
-        # Mantener el flujo de la versiÃ³n anterior que sÃ­ cargaba el contexto:
-        # primero filtra el resumen canÃ³nico desde plantilla y despuÃ©s aplica
+        # Mantener el flujo de la versión anterior que sí cargaba el contexto:
+        # primero filtra el resumen canónico desde plantilla y después aplica
         # esos pickers a base, FNR y MC.
         s_bodega=apply_context(s_view,ctx,identity_df=context_identity)
         s_reference=context_reference(s_view,ctx,identity_df=context_identity)
@@ -1871,59 +1871,59 @@ if _tab_active(a):
         _unregistered_count=int(s_bodega.get("CATEGORIA",pd.Series("Picker",index=s_bodega.index)).astype(str).eq("Sin registrar").sum())
         _reference_picker_count=int(s_reference.get("CATEGORIA",pd.Series("Picker",index=s_reference.index)).astype(str).eq("Picker").sum())
         render_soft_kpis([
-            ("LÃ­neas",f"{lines:,.0f}",f"{lines/base_reference.LINEAS.sum()*100:.1f}% del universo" if base_reference.LINEAS.sum() else "Sin referencia","blue"),
+            ("Líneas",f"{lines:,.0f}",f"{lines/base_reference.LINEAS.sum()*100:.1f}% del universo" if base_reference.LINEAS.sum() else "Sin referencia","blue"),
             ("Pedidos",f"{total_pedidos:,.0f}",f"{total_pedidos/base_reference.PEDIDOS.sum()*100:.1f}% del universo" if base_reference.PEDIDOS.sum() else "Sin referencia","green"),
-            ("Pickers",f"{_picker_count:,}",f"{_picker_count/_reference_picker_count*100:.1f}% del universo Â· {_unregistered_count:,} sin registrar" if _reference_picker_count else f"{_unregistered_count:,} sin registrar","blue"),
+            ("Pickers",f"{_picker_count:,}",f"{_picker_count/_reference_picker_count*100:.1f}% del universo · {_unregistered_count:,} sin registrar" if _reference_picker_count else f"{_unregistered_count:,} sin registrar","blue"),
         ])
         render_soft_kpis([
             ("FNR mensual",f"{fnr_rate:.2f}%" if fnr_rate is not None else "N/D","Objetivo < 1.50%","red"),
             ("MC mensual",f"{mc_rate:.2f}%" if mc_rate is not None else "N/D","Objetivo < 1.00%","amber"),
-            ("Fuera objetivo",f"{int(((s_bodega.ESTADO=="ðŸ”´ FUERA DE OBJETIVO") & s_bodega.CATEGORIA.eq("Picker")).sum()):,}",f"de {_picker_count:,} pickers Â· {_unregistered_count:,} sin registrar","red"),
+            ("Fuera objetivo",f"{int(((s_bodega.ESTADO=="🔴 FUERA DE OBJETIVO") & s_bodega.CATEGORIA.eq("Picker")).sum()):,}",f"de {_picker_count:,} pickers · {_unregistered_count:,} sin registrar","red"),
         ])
         if fnr_rate is not None and mc_rate is not None:
-            st.caption(f"KPI mensual del contexto: {fnr_pedidos:,} pedidos con FNR / {total_pedidos:,} pedidos = {fnr_rate:.2f}% Â· {mc_pedidos:,} pedidos con MC / {total_pedidos:,} pedidos = {mc_rate:.2f}%")
+            st.caption(f"KPI mensual del contexto: {fnr_pedidos:,} pedidos con FNR / {total_pedidos:,} pedidos = {fnr_rate:.2f}% · {mc_pedidos:,} pedidos con MC / {total_pedidos:,} pedidos = {mc_rate:.2f}%")
         else:
             st.caption("No hay suficientes pedidos para calcular el KPI mensual.")
 
         st.subheader("Comparativo del contexto")
         render_turn_comparison(base_bodega,base_reference,fnr_bodega,fnr_reference,mc_bodega,mc_reference)
 
-        st.subheader("Indicador operativo por lÃ­neas")
+        st.subheader("Indicador operativo por líneas")
         k=st.columns(2)
-        k[0].metric("FNR / lÃ­neas",f"{F/lines*100:.2f}%" if lines else "N/D")
-        k[1].metric("MC / lÃ­neas",f"{M/lines*100:.2f}%" if lines else "N/D")
+        k[0].metric("FNR / líneas",f"{F/lines*100:.2f}%" if lines else "N/D")
+        k[1].metric("MC / líneas",f"{M/lines*100:.2f}%" if lines else "N/D")
         st.subheader("Detalle por picker")
         st.dataframe(s_bodega,use_container_width=True,hide_index=True)
 
         st.divider()
-        st.subheader("ðŸ·ï¸ ArtÃ­culos")
-        st.caption("ArtÃ­culos con incidencia dentro del mismo turno, supervisor y Ã¡rea seleccionados arriba.")
+        st.subheader("🏷️ Artículos")
+        st.caption("Artículos con incidencia dentro del mismo turno, supervisor y área seleccionados arriba.")
         tipo_articulos=st.radio("Tipo de incidencia",["FNR","MC"],horizontal=True,key="articulos_tipo")
         datos_articulos=fnr_bodega if tipo_articulos=="FNR" else mc_bodega
         articulos_view=(datos_articulos.groupby(["PRODUCTO","AREA"],as_index=False).INCIDENCIAS.sum()
                         .rename(columns={"INCIDENCIAS":"CANTIDAD"}).sort_values("CANTIDAD",ascending=False))
         st.dataframe(articulos_view,use_container_width=True,hide_index=True)
-        st.caption(f"{len(articulos_view):,} artÃ­culos con incidencia Â· {int(articulos_view.CANTIDAD.sum()) if not articulos_view.empty else 0:,} incidencias dentro del contexto seleccionado.")
+        st.caption(f"{len(articulos_view):,} artículos con incidencia · {int(articulos_view.CANTIDAD.sum()) if not articulos_view.empty else 0:,} incidencias dentro del contexto seleccionado.")
 
         st.divider()
-        st.subheader("ðŸ“¦ Pedidos")
-        st.caption("Pedidos con incidencia dentro del mismo turno, supervisor y Ã¡rea seleccionados arriba.")
+        st.subheader("📦 Pedidos")
+        st.caption("Pedidos con incidencia dentro del mismo turno, supervisor y área seleccionados arriba.")
         tipo_pedidos=st.radio("Tipo de incidencia",["FNR","MC"],horizontal=True,key="pedidos_tipo")
         datos_pedidos=fnr_bodega if tipo_pedidos=="FNR" else mc_bodega
         pedidos_bodega=orders(datos_pedidos)
         st.dataframe(pedidos_bodega,use_container_width=True,hide_index=True)
-        st.caption("PICKERS indica cuÃ¡ntos pickers aparecen en el mismo pedido.")
+        st.caption("PICKERS indica cuántos pickers aparecen en el mismo pedido.")
 
 if _tab_active(b):
     with b:
         ctx,_,_,_=global_context(context_identity)
         selected_context=apply_context(s_view,ctx,identity_df=context_identity)
-        st.subheader("ðŸ‘¤ Ficha de picker")
-        st.caption("El turno, supervisor y Ã¡rea se heredan del contexto elegido en Bodega. AquÃ­ solo buscas el picker.")
+        st.subheader("👤 Ficha de picker")
+        st.caption("El turno, supervisor y área se heredan del contexto elegido en Bodega. Aquí solo buscas el picker.")
         render_context_banner(ctx,selected_context,context_reference(s_view,ctx,identity_df=context_identity),"Contexto heredado")
         names=person_options(selected_context[selected_context.get("CATEGORIA",pd.Series("Picker",index=selected_context.index)).astype(str).eq("Picker")])
         with st.container(border=True):
-            search=st.text_input("ðŸ”Ž Buscar picker",placeholder="Escribe parte del nombreâ€¦",key="picker_page_search")
+            search=st.text_input("🔎 Buscar picker",placeholder="Escribe parte del nombre…",key="picker_page_search")
             filtered_names=names
             if search.strip():
                 term=norm(search)
@@ -1934,38 +1934,38 @@ if _tab_active(b):
             st.info("Escribe parte del nombre o selecciona un picker para consultar su ficha completa.")
         else:
             r=s[s.PICKER==sp].iloc[0]
-            st.markdown(f"<div class='justo-card'><div class='justo-kicker'>Ficha de picker</div><div class='justo-title'>{sp}</div><div class='justo-muted'>Turno: {r.TURNO} Â· Supervisor: {r.SUPERVISOR} Â· Ãrea: {r.AREA_BASE} Â· Usuario: {r.CORREO}</div></div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='justo-card'><div class='justo-kicker'>Ficha de picker</div><div class='justo-title'>{sp}</div><div class='justo-muted'>Turno: {r.TURNO} · Supervisor: {r.SUPERVISOR} · Área: {r.AREA_BASE} · Usuario: {r.CORREO}</div></div>", unsafe_allow_html=True)
             q=st.columns(4)
-            q[0].metric("LÃ­neas",f"{r.LINEAS:,.0f}")
+            q[0].metric("Líneas",f"{r.LINEAS:,.0f}")
             q[1].metric("FNR",f"{r.FNR:,.0f}",f"{r['FNR_%']:.2f}%")
             q[2].metric("MC",f"{r.MC:,.0f}",f"{r['MC_%']:.2f}%")
             q[3].metric("Estado",r.ESTADO)
 
-            st.subheader("âš ï¸ Incidencias del picker")
-            st.caption("Cada incidencia estÃ¡ identificada explÃ­citamente como FNR o Mala Calidad (MC).")
+            st.subheader("⚠️ Incidencias del picker")
+            st.caption("Cada incidencia está identificada explícitamente como FNR o Mala Calidad (MC).")
             inc_fnr = fnr[fnr.PICKER == sp].copy()
             inc_mc = mc[mc.PICKER == sp].copy()
             total_fnr_inc = int(pd.to_numeric(inc_fnr["INCIDENCIAS"], errors="coerce").fillna(0).sum()) if not inc_fnr.empty else 0
             total_mc_inc = int(pd.to_numeric(inc_mc["INCIDENCIAS"], errors="coerce").fillna(0).sum()) if not inc_mc.empty else 0
             ic1, ic2 = st.columns(2)
             with ic1:
-                st.markdown("<div class='justo-card' style='border-left:4px solid #d64545'><div class='justo-kicker'>FNR Â· Faltante no reportado</div><div class='justo-title' style='font-size:1.25rem'>%s incidencias</div></div>" % f"{total_fnr_inc:,}", unsafe_allow_html=True)
+                st.markdown("<div class='justo-card' style='border-left:4px solid #d64545'><div class='justo-kicker'>FNR · Faltante no reportado</div><div class='justo-title' style='font-size:1.25rem'>%s incidencias</div></div>" % f"{total_fnr_inc:,}", unsafe_allow_html=True)
             with ic2:
-                st.markdown("<div class='justo-card' style='border-left:4px solid #d6a72c'><div class='justo-kicker'>MC Â· Mala Calidad</div><div class='justo-title' style='font-size:1.25rem'>%s incidencias</div></div>" % f"{total_mc_inc:,}", unsafe_allow_html=True)
+                st.markdown("<div class='justo-card' style='border-left:4px solid #d6a72c'><div class='justo-kicker'>MC · Mala Calidad</div><div class='justo-title' style='font-size:1.25rem'>%s incidencias</div></div>" % f"{total_mc_inc:,}", unsafe_allow_html=True)
             cc=st.columns(2)
             with cc[0]:
-                st.markdown("**ðŸ”´ FNR Â· Faltantes no reportados**")
+                st.markdown("**🔴 FNR · Faltantes no reportados**")
                 fprod=products(fnr,sp).head(15).copy()
                 if not fprod.empty:
                     fprod.insert(0,"TIPO","FNR")
                 st.dataframe(fprod,use_container_width=True,hide_index=True)
             with cc[1]:
-                st.markdown("**ðŸŸ¡ MC Â· Mala Calidad**")
+                st.markdown("**🟡 MC · Mala Calidad**")
                 mprod=products(mc,sp).head(15).copy()
                 if not mprod.empty:
                     mprod.insert(0,"TIPO","MC")
                 st.dataframe(mprod,use_container_width=True,hide_index=True)
-            st.subheader("ðŸ“¦ Pedidos con incidencia")
+            st.subheader("📦 Pedidos con incidencia")
             st.caption("El tipo de incidencia se muestra para distinguir FNR de MC.")
             of=orders(fnr,sp).head(25).copy()
             om=orders(mc,sp).head(25).copy()
@@ -1977,12 +1977,12 @@ if _tab_active(b):
             st.dataframe(pedidos_incidencias,use_container_width=True,hide_index=True)
             st.subheader("Pedidos FNR")
             st.warning(
-                "âš ï¸ **Antes de tomar en cuenta los FNR, revisa si la factura/orden tiene algÃºn reporte o incidencia registrada.** "
+                "⚠️ **Antes de tomar en cuenta los FNR, revisa si la factura/orden tiene algún reporte o incidencia registrada.** "
                 "Valida primero la orden en Backoffice para confirmar si el faltante corresponde realmente a un FNR."
             )
             st.markdown(
-                "ðŸ”Ž **Revisar factura / orden en Backoffice:** "
-                "[Abrir Ã³rdenes en Backoffice](https://orders.backoffice.justo.cloud/es/orders)"
+                "🔎 **Revisar factura / orden en Backoffice:** "
+                "[Abrir órdenes en Backoffice](https://orders.backoffice.justo.cloud/es/orders)"
             )
             st.dataframe(orders(fnr,sp).head(25),use_container_width=True,hide_index=True)
 
@@ -1992,19 +1992,19 @@ if _tab_active(b):
             except Exception:
                 _src_alias=[]
             rec=picker_record(store,sp,aliases=_src_alias)
-            st.subheader("ðŸ“ RetroalimentaciÃ³n y seguimiento")
-            st.caption("Solo se solicita el tipo de seguimiento. La retroalimentaciÃ³n opcional queda dentro del mismo registro.")
+            st.subheader("📝 Retroalimentación y seguimiento")
+            st.caption("Solo se solicita el tipo de seguimiento. La retroalimentación opcional queda dentro del mismo registro.")
             with st.form(f"accion_picker_form_{sp}", clear_on_submit=True):
-                act_type=st.selectbox("Tipo de seguimiento",["Llamada de atenciÃ³n","Advertencia verbal 1","Advertencia verbal 2","Acta 1","Acta 2","Acta 3","Cero tolerancia"])
+                act_type=st.selectbox("Tipo de seguimiento",["Llamada de atención","Advertencia verbal 1","Advertencia verbal 2","Acta 1","Acta 2","Acta 3","Cero tolerancia"])
                 act_sup=st.text_input("Supervisor",value=str(r.get("SUPERVISOR","")))
                 act_motivo=st.text_area("Motivo / detalle")
-                act_retro=st.text_area("RetroalimentaciÃ³n (opcional)",placeholder="ObservaciÃ³n de retroalimentaciÃ³n, si aplicaâ€¦")
+                act_retro=st.text_area("Retroalimentación (opcional)",placeholder="Observación de retroalimentación, si aplica…")
                 if st.form_submit_button("Guardar seguimiento", type="primary"):
                     rec.setdefault("acciones",[])
                     rec["acciones"].append({"id":datetime.now().strftime("%Y%m%d%H%M%S%f"),"fecha":datetime.now().strftime("%Y-%m-%d %H:%M"),"accion":act_type,"supervisor":act_sup.strip() or "No especificado","motivo":act_motivo.strip(),"retroalimentacion":act_retro.strip()})
                     save_store(store); st.success("Seguimiento guardado."); st.rerun()
 
-            st.caption("Los enlaces reutilizables se administran en la pestaÃ±a Seguimiento.")
+            st.caption("Los enlaces reutilizables se administran en la pestaña Seguimiento.")
 
             picker_fb=[x for x in store.get("feedback_rows",[]) if str(x.get("PICKER",""))==sp]
             if picker_fb:
@@ -2015,14 +2015,14 @@ if _tab_active(b):
                 st.dataframe(pd.DataFrame(rec["comentarios"]).sort_values("fecha",ascending=False),use_container_width=True,hide_index=True)
             if rec.get("acciones"):
                 st.markdown("**Seguimientos / actas**")
-                _ah=pd.DataFrame(rec["acciones"]).sort_values("fecha",ascending=False).rename(columns={"fecha":"Fecha","accion":"Tipo","supervisor":"Supervisor","motivo":"Motivo","retroalimentacion":"RetroalimentaciÃ³n"})
-                _cols=[c for c in ["Fecha","Tipo","Supervisor","Motivo","RetroalimentaciÃ³n"] if c in _ah.columns]
+                _ah=pd.DataFrame(rec["acciones"]).sort_values("fecha",ascending=False).rename(columns={"fecha":"Fecha","accion":"Tipo","supervisor":"Supervisor","motivo":"Motivo","retroalimentacion":"Retroalimentación"})
+                _cols=[c for c in ["Fecha","Tipo","Supervisor","Motivo","Retroalimentación"] if c in _ah.columns]
                 st.dataframe(_ah[_cols],use_container_width=True,hide_index=True)
 
-            # El expediente documental es el mismo que usa la pestaÃ±a Seguimiento.
-            # AsÃ­, los PDFs/enlaces cargados en Seguimiento tambiÃ©n quedan visibles en Picker.
+            # El expediente documental es el mismo que usa la pestaña Seguimiento.
+            # Así, los PDFs/enlaces cargados en Seguimiento también quedan visibles en Picker.
             picker_docs=sorted(rec.get("documentos",[]) or [], key=lambda x:str(x.get("fecha","")), reverse=True)
-            st.markdown("### ðŸ“„ Actas y documentos vinculados")
+            st.markdown("### 📄 Actas y documentos vinculados")
             if picker_docs:
                 for i,doc in enumerate(picker_docs):
                     tipo=str(doc.get("tipo","Documento")); titulo=str(doc.get("titulo",doc.get("archivo",tipo)))
@@ -2036,22 +2036,22 @@ if _tab_active(b):
                         with d2:
                             st.markdown(f"**{titulo}**")
                             if doc.get("detalle"): st.caption(doc.get("detalle"))
-                            st.caption(f"RegistrÃ³: {supervisor}")
+                            st.caption(f"Registró: {supervisor}")
                         with d3:
                             if archivo is not None:
-                                st.download_button("ðŸ“¥ Ver PDF",archivo,file_name=str(doc.get("archivo") or f"{tipo}.pdf"),mime="application/pdf",key=f"picker_doc_download_{sp}_{doc.get('id',i)}",use_container_width=True)
+                                st.download_button("📥 Ver PDF",archivo,file_name=str(doc.get("archivo") or f"{tipo}.pdf"),mime="application/pdf",key=f"picker_doc_download_{sp}_{doc.get('id',i)}",use_container_width=True)
                             if doc.get("url"):
-                                st.link_button("ðŸ”— Abrir enlace",str(doc.get("url")),use_container_width=True)
+                                st.link_button("🔗 Abrir enlace",str(doc.get("url")),use_container_width=True)
             else:
-                st.info("No hay actas o documentos vinculados. Puedes agregarlos desde la pestaÃ±a ðŸ›¡ï¸ Seguimiento; quedarÃ¡n visibles aquÃ­ automÃ¡ticamente.")
+                st.info("No hay actas o documentos vinculados. Puedes agregarlos desde la pestaña 🛡️ Seguimiento; quedarán visibles aquí automáticamente.")
 
             if not picker_fb and not rec.get("comentarios") and not rec.get("acciones") and not picker_docs:
-                st.info("Este picker todavÃ­a no tiene retroalimentaciones, seguimientos ni documentos registrados.")
+                st.info("Este picker todavía no tiene retroalimentaciones, seguimientos ni documentos registrados.")
 
 if _tab_active(e):
     with e:
         ctx,_,_,_=global_context(context_identity)
-        st.subheader("ðŸŒ™ Turnos / Ãreas")
+        st.subheader("🌙 Turnos / Áreas")
         st.caption("El contexto seleccionado se mantiene, pero el comparativo conserva todos los turnos para no perder proporciones.")
         selected=apply_context(s_view,ctx,identity_df=context_identity)
         reference=context_reference(s_view,ctx,identity_df=context_identity)
@@ -2067,15 +2067,15 @@ if _tab_active(e):
         st.dataframe(groups(fsel,bsel,"TURNO"),use_container_width=True,hide_index=True)
         st.subheader("MC por turno")
         st.dataframe(groups(msel,bsel,"TURNO"),use_container_width=True,hide_index=True)
-        st.subheader("FNR por Ã¡rea")
+        st.subheader("FNR por área")
         st.dataframe(groups(fsel,bsel,"AREA"),use_container_width=True,hide_index=True)
-        st.subheader("MC por Ã¡rea")
+        st.subheader("MC por área")
         st.dataframe(groups(msel,bsel,"AREA"),use_container_width=True,hide_index=True)
-        st.warning("El % / lÃ­neas por Ã¡rea solo aparece si existe un denominador real de lÃ­neas por Ã¡rea.")
+        st.warning("El % / líneas por área solo aparece si existe un denominador real de líneas por área.")
 
 if _tab_active(x):
     with x:
-        st.subheader("ðŸ§© Cruce por correo y personal no asignado")
+        st.subheader("🧩 Cruce por correo y personal no asignado")
         st.caption("El cruce intenta primero CORREO y, si falta o no coincide, usa una coincidencia conservadora por nombre. El personal que no aparece en la plantilla se conserva en resultados como Sin registrar.")
         cross=cross_status.copy()
         if not cross.empty:
@@ -2087,18 +2087,18 @@ if _tab_active(x):
         k2.metric("Registros sin empatar",f"{len(unmatched_cross):,}" if not unmatched_cross.empty else "0")
         k3.metric("Asignaciones manuales",f"{len(store.get('master_overrides',{})):,}")
         if unmatched_cross.empty:
-            st.success("âœ… Todos los registros de Pickers, FNR y Mala Calidad estÃ¡n asociados a la plantilla.")
+            st.success("✅ Todos los registros de Pickers, FNR y Mala Calidad están asociados a la plantilla.")
         else:
             view_cols=[c for c in ["FUENTE","PICKER","CORREO","TURNO","SUPERVISOR","AREA_BASE"] if c in unmatched_cross.columns]
             st.dataframe(unmatched_cross[view_cols].drop_duplicates(["FUENTE","CORREO"]),use_container_width=True,hide_index=True)
             emails=sorted([str(v) for v in unmatched_cross["CORREO_KEY"].dropna().unique() if str(v).strip()])
             if emails:
-              with st.expander("âž• Asignar correo manualmente",expanded=True):
+              with st.expander("➕ Asignar correo manualmente",expanded=True):
                 with st.form("manual_email_assignment_form",clear_on_submit=True):
                     correo_sel=st.selectbox("Correo sin asignar",emails)
                     row_opts=unmatched_cross[unmatched_cross["CORREO_KEY"]==correo_sel]
                     suggested_name=str(row_opts.iloc[0].get("PICKER","")) if not row_opts.empty else ""
-                    picker_manual=st.text_input("Nombre canÃ³nico del picker",value=suggested_name)
+                    picker_manual=st.text_input("Nombre canónico del picker",value=suggested_name)
                     mc1,mc2,mc3=st.columns(3)
                     with mc1: turno_manual=st.selectbox("Turno",["Matutino","Intermedio","Tarde","Nocturno","Turno de avance","Otro"])
                     with mc2:
@@ -2106,41 +2106,41 @@ if _tab_active(x):
                         sup_manual=st.selectbox("Supervisor",["No asignado"]+sup_options)
                     with mc3:
                         area_options=[str(v) for v in sorted(s_view["AREA_BASE"].dropna().unique()) if str(v).strip() and str(v)!="No especificada"]
-                        area_manual=st.selectbox("Ãrea",["No especificada"]+area_options)
-                    if st.form_submit_button("ðŸ’¾ Guardar asignaciÃ³n",type="primary"):
+                        area_manual=st.selectbox("Área",["No especificada"]+area_options)
+                    if st.form_submit_button("💾 Guardar asignación",type="primary"):
                         if not correo_sel or not picker_manual.strip(): st.error("Correo y nombre son obligatorios.")
                         else:
                             store.setdefault("master_overrides",{})[correo_sel]={"PICKER":picker_manual.strip(),"CORREO":correo_sel,"TURNO":turno_manual,"SUPERVISOR":sup_manual,"AREA_BASE":area_manual,"FECHA":datetime.now().strftime("%Y-%m-%d %H:%M"),"ORIGEN":"Manual por correo"}
-                            save_store(store); st.success("AsignaciÃ³n guardada por correo. El cruce la utilizarÃ¡ en la siguiente carga."); st.rerun()
+                            save_store(store); st.success("Asignación guardada por correo. El cruce la utilizará en la siguiente carga."); st.rerun()
             else:
-                st.info("Estos registros no traen correo. Revisa que sus nombres coincidan con la plantilla; el cruce automÃ¡tico por nombre ya se intentÃ³.")
-        with st.expander("ðŸ“‹ Asignaciones manuales guardadas",expanded=False):
+                st.info("Estos registros no traen correo. Revisa que sus nombres coincidan con la plantilla; el cruce automático por nombre ya se intentó.")
+        with st.expander("📋 Asignaciones manuales guardadas",expanded=False):
             manual_rows=[]
             for ek,ov in store.get("master_overrides",{}).items(): manual_rows.append({"CORREO":ov.get("CORREO",ek),"PICKER":ov.get("PICKER",""),"TURNO":ov.get("TURNO",""),"SUPERVISOR":ov.get("SUPERVISOR",""),"AREA":ov.get("AREA_BASE",""),"FECHA":ov.get("FECHA","")})
             if manual_rows: st.dataframe(pd.DataFrame(manual_rows),use_container_width=True,hide_index=True)
-            else: st.info("TodavÃ­a no hay asignaciones manuales.")
+            else: st.info("Todavía no hay asignaciones manuales.")
 
 if _tab_active(g):
     with g:
         ctx,_,_,_=global_context(context_identity)
-        st.subheader("ðŸ‘¥ Supervisores")
-        st.caption("Vista operativa bajo el mismo contexto global. Los supervisores registrados por correo se excluyen automÃ¡ticamente de incidencias y filtros de pickers.")
-        with st.expander("âž• Dar de alta supervisor",expanded=False):
+        st.subheader("👥 Supervisores")
+        st.caption("Vista operativa bajo el mismo contexto global. Los supervisores registrados por correo se excluyen automáticamente de incidencias y filtros de pickers.")
+        with st.expander("➕ Dar de alta supervisor",expanded=False):
             with st.form("alta_supervisor_form",clear_on_submit=True):
                 sc1,sc2=st.columns(2)
                 with sc1: sup_nombre_nuevo=st.text_input("Nombre del supervisor")
                 with sc2: sup_correo_nuevo=st.text_input("Correo del supervisor")
                 sup_activo=st.checkbox("Excluirlo de incidencias y filtros",value=True)
-                if st.form_submit_button("ðŸ’¾ Guardar supervisor",type="primary"):
+                if st.form_submit_button("💾 Guardar supervisor",type="primary"):
                     ek=email_key(sup_correo_nuevo)
-                    if not sup_nombre_nuevo.strip() or not ek: st.error("Captura nombre y un correo vÃ¡lido.")
+                    if not sup_nombre_nuevo.strip() or not ek: st.error("Captura nombre y un correo válido.")
                     else:
                         current=[z for z in store.get("supervisores",[]) if email_key(z.get("correo",""))!=ek]
                         current.append({"nombre":sup_nombre_nuevo.strip(),"correo":ek,"activo":sup_activo,"fecha":datetime.now().strftime("%Y-%m-%d %H:%M")})
                         store["supervisores"]=current; save_store(store); st.success("Supervisor guardado."); st.rerun()
         _supreg=store.get("supervisores",[]) or []
         if _supreg:
-            st.dataframe(pd.DataFrame([{"Supervisor":z.get("nombre",""),"Correo":z.get("correo",""),"Excluido":"SÃ­" if z.get("activo",True) else "No","Alta":z.get("fecha","")} for z in _supreg]),use_container_width=True,hide_index=True)
+            st.dataframe(pd.DataFrame([{"Supervisor":z.get("nombre",""),"Correo":z.get("correo",""),"Excluido":"Sí" if z.get("activo",True) else "No","Alta":z.get("fecha","")} for z in _supreg]),use_container_width=True,hide_index=True)
         sup_data=apply_context(s_view,ctx,identity_df=context_identity)
         reference=context_reference(s_view,ctx,identity_df=context_identity)
         render_context_banner(ctx,sup_data,reference,"Contexto heredado")
@@ -2159,8 +2159,8 @@ if _tab_active(g):
 
 if _tab_active(h):
     with h:
-        st.subheader("ðŸ›¡ï¸ Seguimiento")
-        st.caption("Vista consolidada de todos los pickers: retroalimentaciones, seguimientos, actas y tolerancias. Filtra y ordena para ver rÃ¡pidamente dÃ³nde hay mÃ¡s seguimiento.")
+        st.subheader("🛡️ Seguimiento")
+        st.caption("Vista consolidada de todos los pickers: retroalimentaciones, seguimientos, actas y tolerancias. Filtra y ordena para ver rápidamente dónde hay más seguimiento.")
         ctx,_,_,_=global_context(context_identity)
         selected_context=apply_context(s_view,ctx,identity_df=context_identity)
         selected_context=selected_context[selected_context.get("CATEGORIA",pd.Series("Picker",index=selected_context.index)).astype(str).eq("Picker")].copy()
@@ -2174,13 +2174,13 @@ if _tab_active(h):
             retro_new=[z for z in acciones if str(z.get("retroalimentacion","")).strip()]
             tipos=[str(z.get("accion","")) for z in acciones]
             actas=sum(1 for t in tipos if "Acta" in t); llamadas=sum(1 for t in tipos if "Llamada" in t or "Advertencia" in t); cero=sum(1 for t in tipos if "Cero tolerancia" in t)
-            all_rows.append({"PICKER":picker,"TURNO":rr.get("TURNO",""),"SUPERVISOR":rr.get("SUPERVISOR",""),"AREA":rr.get("AREA_BASE",""),"RETROALIMENTACIONES":len(retro_legacy)+len(retro_new),"SEGUIMIENTOS":len(acciones),"ACTAS":actas,"LLAMADAS / ADVERTENCIAS":llamadas,"CERO TOLERANCIA":cero,"TOTAL":len(acciones)+len(retro_legacy),"ÃšLTIMO SEGUIMIENTO":max([str(z.get("fecha","")) for z in acciones],default="")})
+            all_rows.append({"PICKER":picker,"TURNO":rr.get("TURNO",""),"SUPERVISOR":rr.get("SUPERVISOR",""),"AREA":rr.get("AREA_BASE",""),"RETROALIMENTACIONES":len(retro_legacy)+len(retro_new),"SEGUIMIENTOS":len(acciones),"ACTAS":actas,"LLAMADAS / ADVERTENCIAS":llamadas,"CERO TOLERANCIA":cero,"TOTAL":len(acciones)+len(retro_legacy),"ÚLTIMO SEGUIMIENTO":max([str(z.get("fecha","")) for z in acciones],default="")})
         seguimiento_df=pd.DataFrame(all_rows)
         if seguimiento_df.empty: st.info("No hay pickers disponibles para seguimiento.")
         else:
             with st.container(border=True):
                 fc1,fc2,fc3,fc4=st.columns(4)
-                search_seg=fc1.text_input("Buscar picker",placeholder="Nombreâ€¦",key="seguimiento_global_search")
+                search_seg=fc1.text_input("Buscar picker",placeholder="Nombre…",key="seguimiento_global_search")
                 seg_filter=fc2.selectbox("Estado",["Todos","Con actas","Sin actas","Con cero tolerancia","Sin seguimiento"],key="seguimiento_global_estado")
                 seg_sort=fc3.selectbox("Ordenar por",["ACTAS","SEGUIMIENTOS","CERO TOLERANCIA","RETROALIMENTACIONES","TOTAL"],key="seguimiento_global_sort")
                 seg_dir=fc4.selectbox("Orden",["Mayor a menor","Menor a mayor"],key="seguimiento_global_dir")
@@ -2197,8 +2197,8 @@ if _tab_active(h):
         st.divider()
         nombres=person_options(selected_context)
         with st.container(border=True):
-            st.markdown("**ðŸ”Ž Abrir expediente individual**")
-            buscar=st.text_input("Nombre del picker",placeholder="Escribe parte del nombreâ€¦",key="seguimiento_picker_search")
+            st.markdown("**🔎 Abrir expediente individual**")
+            buscar=st.text_input("Nombre del picker",placeholder="Escribe parte del nombre…",key="seguimiento_picker_search")
             opciones=nombres
             if buscar.strip():
                 term=norm(buscar); opciones=[n for n in nombres if term in norm(n)]
@@ -2210,44 +2210,44 @@ if _tab_active(h):
             r=s[s.PICKER==seguimiento_picker].iloc[0]
             rec=picker_record(store,seguimiento_picker,aliases=[str(r.get("_SOURCE_PICKER",""))])
             acciones=rec.get("acciones",[]) or []; documentos=rec.get("documentos",[]) or []
-            st.markdown(f"<div class='justo-card'><div class='justo-kicker'>Expediente</div><div class='justo-title'>{seguimiento_picker}</div><div class='justo-muted'>Turno: {r.TURNO} Â· Supervisor: {r.SUPERVISOR} Â· Ãrea: {r.AREA_BASE}</div></div>",unsafe_allow_html=True)
+            st.markdown(f"<div class='justo-card'><div class='justo-kicker'>Expediente</div><div class='justo-title'>{seguimiento_picker}</div><div class='justo-muted'>Turno: {r.TURNO} · Supervisor: {r.SUPERVISOR} · Área: {r.AREA_BASE}</div></div>",unsafe_allow_html=True)
             k1,k2,k3,k4=st.columns(4)
             k1.metric("Retroalimentaciones",f"{sum(1 for z in acciones if str(z.get('retroalimentacion','')).strip()):,}")
             k2.metric("Seguimientos",f"{len(acciones):,}")
             k3.metric("Actas / tolerancias",f"{sum(1 for z in acciones if 'Acta' in str(z.get('accion','')) or 'Cero tolerancia' in str(z.get('accion',''))):,}")
             k4.metric("Documentos",f"{len(documentos):,}")
             with st.container(border=True):
-                st.markdown("### ðŸ“‹ Historial de seguimiento")
+                st.markdown("### 📋 Historial de seguimiento")
                 if acciones:
-                    hist=pd.DataFrame(acciones).rename(columns={"fecha":"Fecha","accion":"Tipo","supervisor":"Supervisor","motivo":"Motivo","retroalimentacion":"RetroalimentaciÃ³n"})
-                    cols=[c for c in ["Fecha","Tipo","Supervisor","Motivo","RetroalimentaciÃ³n"] if c in hist.columns]
+                    hist=pd.DataFrame(acciones).rename(columns={"fecha":"Fecha","accion":"Tipo","supervisor":"Supervisor","motivo":"Motivo","retroalimentacion":"Retroalimentación"})
+                    cols=[c for c in ["Fecha","Tipo","Supervisor","Motivo","Retroalimentación"] if c in hist.columns]
                     st.dataframe(hist.sort_values("Fecha",ascending=False)[cols],use_container_width=True,hide_index=True)
-                else: st.info("Este picker todavÃ­a no tiene seguimientos registrados.")
+                else: st.info("Este picker todavía no tiene seguimientos registrados.")
             with st.container(border=True):
-                st.markdown("### ðŸ“„ Subir seguimiento / acta")
+                st.markdown("### 📄 Subir seguimiento / acta")
                 st.caption("Adjunta un PDF o elige uno de los enlaces de seguimiento que ya guardaste.")
                 recursos=store.get("recursos_formatos",[]) or []
                 recurso_lookup={}
                 for i,z in enumerate(recursos):
                     if str(z.get("url","")).strip():
-                        recurso_lookup[f"{i+1}. {z.get('tipo','Recurso')} Â· {z.get('titulo','Enlace')}"]=z
+                        recurso_lookup[f"{i+1}. {z.get('tipo','Recurso')} · {z.get('titulo','Enlace')}"]=z
                 recurso_opciones=["Sin enlace guardado"]+list(recurso_lookup)
                 with st.container(border=True):
-                    st.markdown("**ðŸ”— Elegir enlace guardado (opcional)**")
+                    st.markdown("**🔗 Elegir enlace guardado (opcional)**")
                     recurso_seleccionado=st.selectbox("Enlaces de seguimiento",recurso_opciones,key=f"seguimiento_enlace_guardado_{person_key(seguimiento_picker)}")
                     recurso_actual=recurso_lookup.get(recurso_seleccionado)
                     if recurso_actual:
-                        st.info(f"Seleccionado: {recurso_actual.get('tipo','Seguimiento')} Â· {recurso_actual.get('titulo','Enlace de seguimiento')}")
+                        st.info(f"Seleccionado: {recurso_actual.get('tipo','Seguimiento')} · {recurso_actual.get('titulo','Enlace de seguimiento')}")
                         st.link_button("Abrir enlace para revisar",str(recurso_actual.get("url","")))
                 enviar_copia=st.checkbox("Enviar copia por correo al guardar",value=False,key=f"seguimiento_email_{person_key(seguimiento_picker)}")
                 destinatarios=st.text_input("Correo(s) destinatario(s)",placeholder="persona@correo.com (separa varios con coma)",key=f"seguimiento_destinatarios_{person_key(seguimiento_picker)}") if enviar_copia else ""
                 with st.form(f"seguimiento_documento_form_{seguimiento_picker}",clear_on_submit=True):
                     dc1,dc2=st.columns([1,2])
-                    with dc1: doc_tipo=st.selectbox("Tipo de documento",["Acta 1","Acta 2","Acta 3","Llamada de atenciÃ³n","Advertencia verbal 1","Advertencia verbal 2","Cero tolerancia","Otro"])
-                    with dc2: doc_titulo=st.text_input("Nombre / referencia",placeholder="Ej. Acta por FNR â€” septiembre 2026")
-                    doc_detalle=st.text_area("Detalle / motivo",placeholder="QuÃ© originÃ³ el seguimiento y cualquier dato importanteâ€¦")
-                    doc_pdf=st.file_uploader("ðŸ“Ž Adjuntar PDF",type=["pdf"],accept_multiple_files=False,key=f"seguimiento_pdf_{seguimiento_picker}")
-                    if st.form_submit_button("ðŸ’¾ Guardar seguimiento / documento",type="primary"):
+                    with dc1: doc_tipo=st.selectbox("Tipo de documento",["Acta 1","Acta 2","Acta 3","Llamada de atención","Advertencia verbal 1","Advertencia verbal 2","Cero tolerancia","Otro"])
+                    with dc2: doc_titulo=st.text_input("Nombre / referencia",placeholder="Ej. Acta por FNR — septiembre 2026")
+                    doc_detalle=st.text_area("Detalle / motivo",placeholder="Qué originó el seguimiento y cualquier dato importante…")
+                    doc_pdf=st.file_uploader("📎 Adjuntar PDF",type=["pdf"],accept_multiple_files=False,key=f"seguimiento_pdf_{seguimiento_picker}")
+                    if st.form_submit_button("💾 Guardar seguimiento / documento",type="primary"):
                         url=str(recurso_actual.get("url","")).strip() if recurso_actual else ""
                         titulo=doc_titulo.strip() or (doc_pdf.name if doc_pdf is not None else (str(recurso_actual.get("titulo",doc_tipo)) if recurso_actual else doc_tipo))
                         if doc_pdf is None and not url: st.error("Adjunta un PDF o selecciona un enlace guardado.")
@@ -2258,12 +2258,12 @@ if _tab_active(h):
                                 path,_=save_followup_pdf(doc_pdf.getvalue(),seguimiento_picker,doc_pdf.name); registro["path"]=path; registro["archivo"]=_safe_filename(doc_pdf.name); pdf_bytes=doc_pdf.getvalue()
                             rec.setdefault("documentos",[]).append(registro)
                             if enviar_copia:
-                                registro["email_estado"]="Pendiente de envÃ­o"
+                                registro["email_estado"]="Pendiente de envío"
                                 save_store(store)
-                                email_body=f"Se registrÃ³ un {doc_tipo} para {seguimiento_picker}.\n\nDetalle: {doc_detalle.strip() or 'Sin detalle.'}"
+                                email_body=f"Se registró un {doc_tipo} para {seguimiento_picker}.\n\nDetalle: {doc_detalle.strip() or 'Sin detalle.'}"
                                 if url: email_body+=f"\n\nEnlace de seguimiento: {url}"
-                                ok,msg=send_followup_email(f"Seguimiento {doc_tipo} Â· {seguimiento_picker}",email_body,destinatarios,pdf_bytes,registro.get("archivo") or "seguimiento.pdf")
-                                registro["email_estado"]="Enviado" if ok else "Pendiente: error de envÃ­o"
+                                ok,msg=send_followup_email(f"Seguimiento {doc_tipo} · {seguimiento_picker}",email_body,destinatarios,pdf_bytes,registro.get("archivo") or "seguimiento.pdf")
+                                registro["email_estado"]="Enviado" if ok else "Pendiente: error de envío"
                                 registro["email_ultimo_envio"]=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                                 registro["email_mensaje"]=msg
                                 save_store(store)
@@ -2272,16 +2272,16 @@ if _tab_active(h):
                             else:
                                 save_store(store)
                                 st.success("Seguimiento / documento guardado.")
-            st.markdown("### ðŸ”— Enlaces de seguimiento")
-            st.caption("AquÃ­ puedes consultar y administrar los enlaces guardados.")
+            st.markdown("### 🔗 Enlaces de seguimiento")
+            st.caption("Aquí puedes consultar y administrar los enlaces guardados.")
             with st.expander(f"Administrar enlaces de seguimiento ({len(recursos)})",expanded=False):
-                st.info("Los enlaces guardados aparecen aquÃ­ para abrirlos o quitarlos.")
+                st.info("Los enlaces guardados aparecen aquí para abrirlos o quitarlos.")
                 for idx,recurso in enumerate(recursos):
                     with st.container(border=True):
                         rr1,rr2,rr3=st.columns([4,1.3,1])
                         with rr1:
-                            st.markdown(f"**ðŸ”— {recurso.get('titulo','Formato')}**")
-                            st.caption(f"ðŸŸ¦ {recurso.get('tipo','Recurso')} Â· Agregado {recurso.get('fecha','')}")
+                            st.markdown(f"**🔗 {recurso.get('titulo','Formato')}**")
+                            st.caption(f"🟦 {recurso.get('tipo','Recurso')} · Agregado {recurso.get('fecha','')}")
                         with rr2:
                             if recurso.get("url"): st.link_button("Abrir enlace",str(recurso.get("url")),use_container_width=True)
                         with rr3:
@@ -2289,10 +2289,10 @@ if _tab_active(h):
                                 st.session_state["confirm_delete_resource_index"]=idx
                                 st.rerun()
                         if st.session_state.get("confirm_delete_resource_index")==idx:
-                            st.warning(f"Â¿Quitar el enlace â€˜{recurso.get('titulo','Formato')}â€™ de la lista reutilizable?")
+                            st.warning(f"¿Quitar el enlace ‘{recurso.get('titulo','Formato')}’ de la lista reutilizable?")
                             del_yes,del_no=st.columns(2)
                             with del_yes:
-                                if st.button("SÃ­, quitar enlace",key=f"seg_recurso_confirm_{idx}",type="primary"):
+                                if st.button("Sí, quitar enlace",key=f"seg_recurso_confirm_{idx}",type="primary"):
                                     if idx < len(store.get("recursos_formatos",[])):
                                         store["recursos_formatos"].pop(idx)
                                     st.session_state.pop("confirm_delete_resource_index",None)
@@ -2303,15 +2303,15 @@ if _tab_active(h):
                                     st.rerun()
                 with st.form("seg_recurso_form",clear_on_submit=True):
                     q1,q2=st.columns([1,2])
-                    with q1: rt=st.selectbox("Tipo",["RetroalimentaciÃ³n","Seguimiento","Llamada de atenciÃ³n","Acta","Otro"])
+                    with q1: rt=st.selectbox("Tipo",["Retroalimentación","Seguimiento","Llamada de atención","Acta","Otro"])
                     with q2: rn=st.text_input("Nombre")
                     ru=st.text_input("Enlace",placeholder="https://...")
                     if st.form_submit_button("Guardar enlace reutilizable"):
                         if rn.strip() and ru.startswith(("http://","https://")):
                             store.setdefault("recursos_formatos",[]).append({"tipo":rt,"titulo":rn.strip(),"url":ru.strip(),"fecha":datetime.now().strftime("%Y-%m-%d %H:%M")}); save_store(store); st.rerun()
-                        else: st.error("Nombre y enlace vÃ¡lido son obligatorios.")
+                        else: st.error("Nombre y enlace válido son obligatorios.")
             documentos=sorted(rec.get("documentos",[]) or [],key=lambda z:str(z.get("fecha","")),reverse=True)
-            st.markdown("### ðŸ“Ž Documentos del expediente")
+            st.markdown("### 📎 Documentos del expediente")
             if documentos:
                 for i,doc in enumerate(documentos):
                     archivo=load_followup_pdf(doc)
@@ -2323,8 +2323,8 @@ if _tab_active(h):
                         if archivo is not None: st.download_button("Ver PDF",archivo,file_name=str(doc.get("archivo") or "seguimiento.pdf"),mime="application/pdf",key=f"seg_download_{seguimiento_picker}_{doc.get('id',i)}",use_container_width=True)
                         if doc.get("url"): st.link_button(f"Abrir: {doc.get('url_titulo') or 'enlace'}",str(doc.get("url")),use_container_width=True)
                     if doc.get("email_estado"):
-                        st.caption(f"Correo: {doc.get('email_estado')} Â· {doc.get('email_ultimo_envio','')}")
-                    with st.expander("âœ‰ï¸ Reenviar este documento por correo",expanded=False):
+                        st.caption(f"Correo: {doc.get('email_estado')} · {doc.get('email_ultimo_envio','')}")
+                    with st.expander("✉️ Reenviar este documento por correo",expanded=False):
                         resend_to=st.text_input(
                             "Destinatario(s)",
                             value=str(doc.get("destinatarios", "")),
@@ -2336,14 +2336,14 @@ if _tab_active(h):
                             if doc.get("url"):
                                 email_body+=f"\n\nEnlace de seguimiento: {doc.get('url')}"
                             ok,msg=send_followup_email(
-                                f"Seguimiento {doc.get('tipo','Documento')} Â· {seguimiento_picker}",
+                                f"Seguimiento {doc.get('tipo','Documento')} · {seguimiento_picker}",
                                 email_body,
                                 resend_to,
                                 archivo,
                                 str(doc.get("archivo") or "seguimiento.pdf"),
                             )
                             doc["destinatarios"]=resend_to.strip()
-                            doc["email_estado"]="Enviado" if ok else "Pendiente: error de envÃ­o"
+                            doc["email_estado"]="Enviado" if ok else "Pendiente: error de envío"
                             doc["email_ultimo_envio"]=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                             doc["email_mensaje"]=msg
                             save_store(store)
@@ -2353,28 +2353,28 @@ if _tab_active(h):
 
 if _tab_active(f):
     with f:
-        st.download_button("ðŸ“¥ Descargar Excel completo",export(s,fnr,mc,None if sp=="Todos" else sp,roster),f"Analisis_FNR_MC_{periodo}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        st.info("La app utiliza 3 Excel operativos separados (Pickers, FNR y MC) y un Master consolidado para turno, correo, supervisor y Ã¡rea.")
-        st.success(f"Persistencia activa: {len(store.get('excluded_orders',[]))} pedidos excluidos Â· {len(store.get('master_overrides',{}))} asignaciones manuales Â· {len(store.get('master_excluded',[]))} exclusiones de personal Â· {len(store.get('feedback_rows',[]))} retroalimentaciones guardadas.")
+        st.download_button("📥 Descargar Excel completo",export(s,fnr,mc,None if sp=="Todos" else sp,roster),f"Analisis_FNR_MC_{periodo}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.info("La app utiliza 3 Excel operativos separados (Pickers, FNR y MC) y un Master consolidado para turno, correo, supervisor y área.")
+        st.success(f"Persistencia activa: {len(store.get('excluded_orders',[]))} pedidos excluidos · {len(store.get('master_overrides',{}))} asignaciones manuales · {len(store.get('master_excluded',[]))} exclusiones de personal · {len(store.get('feedback_rows',[]))} retroalimentaciones guardadas.")
 
 if _tab_active(j):
     with j:
-        st.subheader("ðŸ“Œ Tablero de pendientes y procesos")
-        st.caption("AquÃ­ el responsable puede publicar procesos nuevos, pendientes operativos y material visual de referencia. Todo queda guardado.")
+        st.subheader("📌 Tablero de pendientes y procesos")
+        st.caption("Aquí el responsable puede publicar procesos nuevos, pendientes operativos y material visual de referencia. Todo queda guardado.")
 
-        with st.expander("âž• Crear nuevo proceso / pendiente", expanded=False):
+        with st.expander("➕ Crear nuevo proceso / pendiente", expanded=False):
             with st.form("nuevo_proceso_form", clear_on_submit=True):
                 p1,p2=st.columns([2,1])
                 with p1:
-                    proc_titulo=st.text_input("Nombre del proceso / pendiente",placeholder="Ej. ValidaciÃ³n de pedidos 07:00â€“12:00")
-                    proc_obj=st.text_area("Objetivo / quÃ© se debe hacer",height=90)
+                    proc_titulo=st.text_input("Nombre del proceso / pendiente",placeholder="Ej. Validación de pedidos 07:00–12:00")
+                    proc_obj=st.text_area("Objetivo / qué se debe hacer",height=90)
                     proc_pasos=st.text_area("Pasos o instrucciones",height=130,placeholder="1. ...\n2. ...\n3. ...")
                 with p2:
                     proc_resp=st.text_input("Responsable")
                     proc_prior=st.selectbox("Prioridad",["Alta","Media","Baja"])
                     proc_status=st.selectbox("Estado",["Pendiente","En proceso","Completado"])
                     proc_fecha=st.date_input("Fecha objetivo",value=datetime.now().date())
-                    proc_imgs=st.file_uploader("ImÃ¡genes referenciales",type=["png","jpg","jpeg","webp"],accept_multiple_files=True,key="proc_imgs_new")
+                    proc_imgs=st.file_uploader("Imágenes referenciales",type=["png","jpg","jpeg","webp"],accept_multiple_files=True,key="proc_imgs_new")
                 if st.form_submit_button("Guardar proceso",type="primary"):
                     if not proc_titulo.strip():
                         st.warning("Escribe un nombre para el proceso.")
@@ -2391,19 +2391,19 @@ if _tab_active(j):
 
         procesos=store.get("procesos",[])
         if not procesos:
-            st.info("TodavÃ­a no hay procesos o pendientes publicados.")
+            st.info("Todavía no hay procesos o pendientes publicados.")
         else:
             status_order=["Pendiente","En proceso","Completado"]
             for status_name in status_order:
                 items=[p for p in procesos if p.get("estado")==status_name]
-                st.markdown(f"### {status_name} Â· {len(items)}")
+                st.markdown(f"### {status_name} · {len(items)}")
                 cols=st.columns(3)
                 if not items:
                     st.caption("Sin elementos en esta columna.")
                 for idx,proc in enumerate(items):
                     with cols[idx%3]:
                         priority=proc.get("prioridad","Media")
-                        st.markdown(f"<div class='justo-card'><div class='justo-kicker'>{priority}</div><div class='justo-title'>{proc.get('titulo','Sin tÃ­tulo')}</div><div class='justo-muted'>Responsable: {proc.get('responsable') or 'Sin asignar'} Â· Fecha: {proc.get('fecha_objetivo') or 'Sin fecha'}</div></div>",unsafe_allow_html=True)
+                        st.markdown(f"<div class='justo-card'><div class='justo-kicker'>{priority}</div><div class='justo-title'>{proc.get('titulo','Sin título')}</div><div class='justo-muted'>Responsable: {proc.get('responsable') or 'Sin asignar'} · Fecha: {proc.get('fecha_objetivo') or 'Sin fecha'}</div></div>",unsafe_allow_html=True)
                         if proc.get("objetivo"): st.write(proc["objetivo"])
                         if proc.get("pasos"):
                             with st.expander("Ver instrucciones"):
@@ -2423,10 +2423,10 @@ if _tab_active(j):
                                 st.session_state["confirm_delete_process_id"]=proc.get("id")
                                 st.rerun()
                         if st.session_state.get("confirm_delete_process_id")==proc.get("id"):
-                            st.warning(f"Â¿Eliminar el proceso â€˜{proc.get('titulo','Sin tÃ­tulo')}â€™?")
+                            st.warning(f"¿Eliminar el proceso ‘{proc.get('titulo','Sin título')}’?")
                             yes_col,no_col=st.columns(2)
                             with yes_col:
-                                if st.button("SÃ­, eliminar",key=f"proc_del_confirm_{proc['id']}",type="primary"):
+                                if st.button("Sí, eliminar",key=f"proc_del_confirm_{proc['id']}",type="primary"):
                                     store["procesos"]=[pp for pp in store["procesos"] if pp.get("id")!=proc.get("id")]
                                     st.session_state.pop("confirm_delete_process_id",None)
                                     save_store(store); st.rerun()
@@ -2436,7 +2436,7 @@ if _tab_active(j):
                                     st.rerun()
 
         st.divider()
-        st.subheader("ðŸ’¾ Respaldo de configuraciÃ³n")
+        st.subheader("💾 Respaldo de configuración")
         st.caption("Para evitar perder asignaciones, seguimientos y procesos si Streamlit Cloud reinicia el contenedor, puedes descargar un respaldo y conservarlo.")
         backup_json=json.dumps(store,ensure_ascii=False,indent=2).encode("utf-8")
-        st.download_button("Descargar respaldo de configuraciÃ³n",backup_json,f"Respaldo_Control_FNR_{periodo}.json","application/json")
+        st.download_button("Descargar respaldo de configuración",backup_json,f"Respaldo_Control_FNR_{periodo}.json","application/json")
