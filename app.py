@@ -10,7 +10,7 @@ from difflib import SequenceMatcher
 from datetime import datetime
 from email.message import EmailMessage
 import numpy as np
-import pandas as pdE
+import pandas as pd
 import streamlit as st
 
 st.set_page_config(page_title="Control FNR & Mala Calidad", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
@@ -1536,6 +1536,9 @@ with st.sidebar:
     with st.expander("🗂️ Historial de archivos Excel",expanded=False):
         _history=upload_history_rows()
         if _history:
+            # Importación local defensiva: esta tabla es la línea señalada por
+            # Streamlit cuando una copia de app.py quedó sin el alias global.
+            import pandas as pd
             st.dataframe(pd.DataFrame(_history),use_container_width=True,hide_index=True)
             if st.button("Preparar ZIP de respaldo",key="prepare_excel_history_zip"):
                 with st.spinner("Preparando el respaldo de archivos…"):
