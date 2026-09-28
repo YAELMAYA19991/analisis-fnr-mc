@@ -2058,40 +2058,6 @@ with st.container(border=True):
         else:
             st.caption("Selecciona CYN-PCABA-U1–U30 para generar el QR al instante.")
 
-with st.expander("📄 Hoja imprimible con los 30 códigos U1–U30",expanded=False):
-    st.caption("Genera una hoja tamaño A4 para imprimir y escanear los códigos sin seleccionarlos uno por uno.")
-    if st.button("Crear hoja PDF",key="create_qr_picker_sheet"):
-        try:
-            _page_width,_page_height=1654,2339
-            _page_margin=45; _columns,_rows=5,6
-            _cell_width=(_page_width-2*_page_margin)//_columns
-            _cell_height=(_page_height-2*_page_margin)//_rows
-            _sheet=Image.new("RGB",(_page_width,_page_height),"white")
-            _draw=ImageDraw.Draw(_sheet)
-            try:
-                _font=ImageFont.truetype("DejaVuSans.ttf",28)
-            except OSError:
-                _font=ImageFont.load_default()
-            for _index in range(30):
-                _code=f"CYN-PCABA-U{_index+1}"
-                _qr_sheet_code=qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M,box_size=9,border=4)
-                _qr_sheet_code.add_data(_code); _qr_sheet_code.make(fit=True)
-                _qr_sheet_image=_qr_sheet_code.make_image(fill_color="black",back_color="white").convert("RGB")
-                _column=_index%_columns; _row=_index//_columns
-                _left=_page_margin+_column*_cell_width; _top=_page_margin+_row*_cell_height
-                _draw.rounded_rectangle((_left+5,_top+5,_left+_cell_width-5,_top+_cell_height-5),radius=14,outline="#D8DCE4",width=2)
-                _draw.text((_left+_cell_width//2,_top+18),_code,fill="#242833",font=_font,anchor="mt")
-                _qr_x=_left+(_cell_width-_qr_sheet_image.width)//2
-                _qr_y=_top+58
-                _sheet.paste(_qr_sheet_image,(_qr_x,_qr_y))
-            _pdf_buffer=io.BytesIO()
-            _sheet.save(_pdf_buffer,format="PDF",resolution=200.0)
-            st.session_state["qr_picker_sheet_pdf"]=_pdf_buffer.getvalue()
-            st.success("La hoja con CYN-PCABA-U1 hasta CYN-PCABA-U30 está lista.")
-        except Exception as _sheet_error:
-            st.error(f"No se pudo preparar la hoja: {_sheet_error}")
-    if st.session_state.get("qr_picker_sheet_pdf"):
-        st.download_button("⬇️ Descargar hoja U1–U30",st.session_state["qr_picker_sheet_pdf"],file_name="Codigos_QR_CYN-PCABA-U1-U30.pdf",mime="application/pdf",key="download_qr_picker_sheet")
 st.divider()
 
 _tab_labels=["🏠 Bodega y turnos / áreas","👤 Pickers y supervisores","📅 Faltas y retardos","🛡️ Seguimiento","📌 Pendientes","🧰 Herramientas"]
