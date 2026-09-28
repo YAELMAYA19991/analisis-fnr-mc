@@ -2028,11 +2028,11 @@ if isinstance(s,pd.DataFrame) and "PICKER" in s.columns:
             if not any(x["PICKER"]==_candidate["PICKER"] and x["CATEGORIA"]==_candidate["CATEGORIA"] for x in _bucket): _bucket.append(_candidate)
 app_people_names=sorted({z["PICKER"] for _bucket in app_people_by_name.values() for z in _bucket},key=lambda z:z.upper())
 
-_tab_labels=["🏠 Bodega y turnos / áreas","👤 Pickers y supervisores","📅 Faltas y retardos","🛡️ Seguimiento","📌 Pendientes","🧰 Herramientas"]
+_tab_labels=["🏠 Bodega y turnos / áreas","👤 Pickers y supervisores","📅 Faltas y retardos","🛡️ Seguimiento","📌 Pendientes","🔳 Códigos QR","🧰 Herramientas"]
 try:
-    a,b,i,h,j,x=st.tabs(_tab_labels,on_change="rerun",key="control_fnr_mc_tabs_v3")
+    a,b,i,h,j,q,x=st.tabs(_tab_labels,on_change="rerun",key="control_fnr_mc_tabs_v4")
 except TypeError:
-    a,b,i,h,j,x=st.tabs(_tab_labels)
+    a,b,i,h,j,q,x=st.tabs(_tab_labels)
 # Agrupa las secciones en una sola pestaña y conserva sus formularios y cálculos.
 e=a  # Turnos / Áreas comparte la pestaña de Bodega.
 g=b  # Supervisores comparte la pestaña de Pickers.
@@ -2761,8 +2761,8 @@ if _tab_active(h):
                             else: st.error(msg)
             else: st.info("No hay documentos vinculados a este expediente.")
 
-if _tab_active(x):
-    with x:
+if _tab_active(q):
+    with q:
         st.subheader("🔳 Generador de códigos QR")
         st.caption("Pega un enlace o escribe texto, genera el código y descárgalo como imagen PNG.")
         with st.container(border=True):
@@ -2788,6 +2788,9 @@ if _tab_active(x):
                 else:
                     st.info("Al escribir un enlace o texto, aquí aparecerá la vista previa y podrás descargar el QR.")
 
+
+if _tab_active(x):
+    with x:
         st.divider()
         st.markdown("### 📤 Exportar")
         st.download_button("📥 Descargar Excel completo",export(s,fnr,mc,None if sp=="Todos" else sp,roster),f"Analisis_FNR_MC_{periodo}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
