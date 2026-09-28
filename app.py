@@ -13,7 +13,6 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import qrcode
-from PIL import Image, ImageDraw, ImageFont
 
 st.set_page_config(page_title="Control FNR & Mala Calidad", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
 
