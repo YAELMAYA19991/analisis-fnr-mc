@@ -12,6 +12,7 @@ from email.message import EmailMessage
 import numpy as np
 import pandas as pd
 import streamlit as st
+import qrcode
 
 st.set_page_config(page_title="Control FNR & Mala Calidad", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
 
@@ -2762,6 +2763,31 @@ if _tab_active(h):
 
 if _tab_active(x):
     with x:
+        st.subheader("🔳 Generador de códigos QR")
+        st.caption("Pega un enlace o escribe texto, genera el código y descárgalo como imagen PNG.")
+        with st.container(border=True):
+            _qr_input_col,_qr_preview_col=st.columns([1.2,1])
+            with _qr_input_col:
+                _qr_content=st.text_area("Enlace o texto para el QR",placeholder="https://... o escribe el texto que quieras compartir",height=130,key="qr_generator_content")
+                _qr_filename_input=st.text_input("Nombre del archivo",value="codigo_qr",key="qr_generator_filename")
+            with _qr_preview_col:
+                if _qr_content.strip():
+                    try:
+                        _qr_code=qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M,box_size=8,border=4)
+                        _qr_code.add_data(_qr_content.strip())
+                        _qr_code.make(fit=True)
+                        _qr_image=_qr_code.make_image(fill_color="black",back_color="white").convert("RGB")
+                        _qr_buffer=io.BytesIO()
+                        _qr_image.save(_qr_buffer,format="PNG")
+                        _qr_bytes=_qr_buffer.getvalue()
+                        st.image(_qr_bytes,caption="Vista previa del código QR",width=240)
+                        _qr_filename=re.sub(r"[^A-Za-z0-9_-]+","_",_qr_filename_input.strip()).strip("_") or "codigo_qr"
+                        st.download_button("⬇️ Descargar QR",_qr_bytes,file_name=f"{_qr_filename}.png",mime="image/png",key="download_generated_qr")
+                    except Exception as _qr_error:
+                        st.error(f"No se pudo generar el QR: {_qr_error}")
+                else:
+                    st.info("Al escribir un enlace o texto, aquí aparecerá la vista previa y podrás descargar el QR.")
+
         st.divider()
         st.markdown("### 📤 Exportar")
         st.download_button("📥 Descargar Excel completo",export(s,fnr,mc,None if sp=="Todos" else sp,roster),f"Analisis_FNR_MC_{periodo}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
