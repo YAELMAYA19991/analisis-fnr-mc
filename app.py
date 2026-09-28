@@ -58,158 +58,6 @@ def sheets_from_bytes(data):
         df=pd.read_excel(xls, sheet_name=sh)
         if not df.empty: out[sh]=clean(df)
     return out
-
-def _attendance_find_sheet(data, required_columns, label):
-    """Encuentra la hoja de asistencia que contiene las columnas necesarias."""
-    parsed=sheets_from_bytes(data)
-    wanted=set(required_columns)
-    for frame in parsed.values():
-        if wanted.issubset(set(frame.columns)):
-            return frame
-    actual=[", ".join(map(str,frame.columns)) for frame in parsed.values()]
-    raise ValueError(f"No encontré en el Excel de {label} las columnas necesarias: {', '.join(required_columns)}. Hojas encontradas: {'; '.join(actual)}")
-
-def _attendance_minutes(value):
-    """Convierte el atraso a minutos, admitiendo los formatos comunes de Excel."""
-    if pd.isna(value): return 0
-    if isinstance(value,(int,float,np.integer,np.floating)):
-        return max(0,int(round(float(value))))
-    try:
-        td=pd.to_timedelta(value)
-        return max(0,int(round(td.total_seconds()/60)))
-    except Exception:
-        try: return max(0,int(round(float(str(value).strip()))))
-        except Exception: return 0
-
-def _attendance_start_hour(value):
-    """Devuelve la hora de inicio del turno como HH:MM."""
-    if pd.isna(value): return ""
-    if hasattr(value,"hour") and hasattr(value,"minute"):
-        return f"{int(value.hour):02d}:{int(value.minute):02d}"
-    if isinstance(value,(int,float,np.integer,np.floating)):
-        number=float(value)
-        if 0 <= number < 1: number*=24
-        hour=int(number); minute=int(round((number-hour)*60))
-        if minute==60: hour+=1; minute=0
-        return f"{hour%24:02d}:{minute:02d}"
-    text=str(value).strip()
-    try:
-        td=pd.to_timedelta(text)
-        total=int(round(td.total_seconds()/60))
-        return f"{(total//60)%24:02d}:{total%60:02d}"
-    except Exception:
-        return text[:5]
-
-def _attendance_shift(start):
-    """Clasificación de turnos indicada para los reportes de Coyoacán."""
-    if not start: return "Sin dato"
-    try: hour=int(str(start).split(":",1)[0])
-    except Exception: return "Sin dato"
-    if hour in {6,7,8,9,10}: return "Mañana"
-    if hour==11: return "Intermedio"
-    if hour in {13,14}: return "Tarde"
-    if hour==22: return "Nocturno"
-    return "Otro horario"
-
-def _attendance_person_key(identifier, lastname, firstname):
-    """Usa el CURP solo durante el cruce; el CURP no se guarda en el resumen."""
-    value=str(identifier or "").strip().upper()
-    if value and value not in {"NAN","NONE","NAT"}: return "id:"+value
-    return "nombre:"+(token_key(f"{lastname} {firstname}") or person_key(f"{lastname} {firstname}"))
-
-def build_attendance_summary(absence_bytes, tardy_bytes, absence_name="Faltas", tardy_name="Retardos"):
-    """Cruza ambos reportes por CURP (temporalmente) y entrega solo datos agregados."""
-    absent=_attendance_find_sheet(absence_bytes,["apellidos","nombre","fecha"],"faltas")
-    tardy=_attendance_find_sheet(tardy_bytes,["apellidos","nombre","fecha","hora_inicio_turno","minutos_de_atraso"],"retardos")
-    people={}
-    event_rows=[]
-    date_values=[]
-
-    def row_person(row):
-        _last=row.get("apellidos",""); _first=row.get("nombre","")
-        lastname="" if pd.isna(_last) else str(_last).strip()
-        firstname="" if pd.isna(_first) else str(_first).strip()
-        display=f"{lastname}, {firstname}".strip(" ,")
-        _identifier=row.get("curp","")
-        if pd.isna(_identifier): _identifier=""
-        return _attendance_person_key(_identifier,lastname,firstname),display
-
-    for _,row in absent.iterrows():
-        key,name=row_person(row)
-        if not name: continue
-        item=people.setdefault(key,{"nombre":name,"faltas":0,"retardos":0,"minutos_atraso":0,"turnos":{},"cargos":set()})
-        item["faltas"]+=1
-        _cargo=row.get("cargo",""); cargo="" if pd.isna(_cargo) else str(_cargo).strip()
-        if cargo and cargo.lower() not in {"nan","none"}: item["cargos"].add(cargo)
-        date=pd.to_datetime(row.get("fecha"),errors="coerce")
-        if not pd.isna(date): date_values.append(date.strftime("%Y-%m-%d"))
-
-    for _,row in tardy.iterrows():
-        key,name=row_person(row)
-        if not name: continue
-        item=people.setdefault(key,{"nombre":name,"faltas":0,"retardos":0,"minutos_atraso":0,"turnos":{},"cargos":set()})
-        item["retardos"]+=1
-        minutes=_attendance_minutes(row.get("minutos_de_atraso",0))
-        item["minutos_atraso"]+=minutes
-        start=_attendance_start_hour(row.get("hora_inicio_turno",""))
-        shift=_attendance_shift(start)
-        item["turnos"][shift]=item["turnos"].get(shift,0)+1
-        event_rows.append({"turno":shift,"persona_key":key,"minutos":minutes})
-        _cargo=row.get("cargo",""); cargo="" if pd.isna(_cargo) else str(_cargo).strip()
-        if cargo and cargo.lower() not in {"nan","none"}: item["cargos"].add(cargo)
-        date=pd.to_datetime(row.get("fecha"),errors="coerce")
-        if not pd.isna(date): date_values.append(date.strftime("%Y-%m-%d"))
-
-    person_rows=[]
-    absent_by_shift={}
-    for key,item in people.items():
-        turns=item["turnos"]
-        if turns:
-            max_count=max(turns.values())
-            leading=sorted([shift for shift,count in turns.items() if count==max_count])
-            usual=leading[0] if len(leading)==1 else "Varios turnos"
-            varies=len(turns)>1
-        else:
-            usual="Sin turno"; varies=False
-        person_rows.append({
-            "Persona":item["nombre"],
-            "Turno habitual":usual,
-            "Turnos observados":", ".join(sorted(turns)) if turns else "Sin dato",
-            "Turno variable":bool(varies),
-            "Faltas":int(item["faltas"]),
-            "Retardos":int(item["retardos"]),
-            "Minutos acumulados":int(item["minutos_atraso"]),
-            "Cargo":", ".join(sorted(item["cargos"])) if item["cargos"] else "",
-        })
-        shift=usual if usual!="Varios turnos" else "Revisar turno"
-        if item["faltas"]:
-            absent_by_shift.setdefault(shift,{"personas":set(),"faltas":0})
-            absent_by_shift[shift]["personas"].add(key)
-            absent_by_shift[shift]["faltas"]+=int(item["faltas"])
-
-    shift_summary={}
-    for event in event_rows:
-        shift=event["turno"]
-        shift_summary.setdefault(shift,{"personas":set(),"retardos":0,"minutos":0})
-        shift_summary[shift]["personas"].add(event["persona_key"])
-        shift_summary[shift]["retardos"]+=1
-        shift_summary[shift]["minutos"]+=int(event["minutos"])
-    return {
-        "personas":person_rows,
-        "faltas_por_turno":[{"Turno":k,"Personas":len(v["personas"]),"Faltas":int(v["faltas"])} for k,v in sorted(absent_by_shift.items())],
-        "retardos_por_turno":[{"Turno":k,"Personas":len(v["personas"]),"Retardos":int(v["retardos"]),"Minutos acumulados":int(v["minutos"])} for k,v in sorted(shift_summary.items())],
-        "total_personas":len(person_rows),
-        "total_faltas":int(sum(x["Faltas"] for x in person_rows)),
-        "personas_con_faltas":int(sum(x["Faltas"]>0 for x in person_rows)),
-        "total_retardos":int(sum(x["Retardos"] for x in person_rows)),
-        "personas_con_retardos":int(sum(x["Retardos"]>0 for x in person_rows)),
-        "minutos_acumulados":int(sum(x["Minutos acumulados"] for x in person_rows)),
-        "fecha_desde":min(date_values) if date_values else "",
-        "fecha_hasta":max(date_values) if date_values else "",
-        "archivos":{"faltas":_safe_filename(absence_name),"retardos":_safe_filename(tardy_name)},
-        "fecha_carga":datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
-
 FNR_OBJ, MC_OBJ = 1.50, 1.00
 FOLLOWUP_CATEGORIES = ["1. Seguimiento", "2. Acta", "3. 0 Tolerancia"]
 PERSIST_DIR = "app_data"
@@ -577,7 +425,7 @@ def load_store():
     if cloud_data is not None:
         data=json.loads(cloud_data.decode("utf-8"))
         if not isinstance(data,dict): raise RuntimeError("El expediente guardado en la nube no contiene un objeto JSON válido.")
-        for key,value in {"pickers":{},"feedback_rows":[],"recursos_formatos":[],"procesos":[],"excluded_orders":[],"master_overrides":{},"master_excluded":[],"seguimientos_documentos":[],"supervisores":[],"upload_meta":{},"attendance_summary":None,"attendance_meta":{},"attendance_links":{}}.items(): data.setdefault(key,value)
+        for key,value in {"pickers":{},"feedback_rows":[],"recursos_formatos":[],"procesos":[],"excluded_orders":[],"master_overrides":{},"master_excluded":[],"seguimientos_documentos":[],"supervisores":[],"upload_meta":{}}.items(): data.setdefault(key,value)
         try:
             with open(STORE_FILE,"wb") as f: f.write(json.dumps(data,ensure_ascii=False,indent=2).encode("utf-8"))
         except OSError: pass
@@ -600,14 +448,11 @@ def load_store():
                 data.setdefault("seguimientos_documentos", [])
                 data.setdefault("supervisores", [])
                 data.setdefault("upload_meta", {})
-                data.setdefault("attendance_summary", None)
-                data.setdefault("attendance_meta", {})
-                data.setdefault("attendance_links", {})
                 if path != STORE_FILE or cloud_enabled(): save_store(data)
                 return data
             except Exception:
                 continue
-    data={"pickers": {}, "feedback_rows": [], "recursos_formatos": [], "procesos": [], "excluded_orders": [], "master_overrides": {}, "master_excluded": [], "seguimientos_documentos": [], "supervisores": [], "upload_meta": {}, "attendance_summary": None, "attendance_meta": {}, "attendance_links": {}}
+    data={"pickers": {}, "feedback_rows": [], "recursos_formatos": [], "procesos": [], "excluded_orders": [], "master_overrides": {}, "master_excluded": [], "seguimientos_documentos": [], "supervisores": [], "upload_meta": {}}
     if cloud_enabled(): save_store(data)
     return data
 
@@ -1644,9 +1489,6 @@ store.setdefault("recursos_formatos", [])
 store.setdefault("seguimientos_documentos", [])
 store.setdefault("supervisores", [])
 store.setdefault("upload_meta", {})
-store.setdefault("attendance_summary", None)
-store.setdefault("attendance_meta", {})
-store.setdefault("attendance_links", {})
 if normalize_saved_followup_categories(store):
     save_store(store)
 
@@ -2007,31 +1849,11 @@ base_view=select_summary_people(base,s_view)
 fnr_view=select_summary_people(fnr,s_view)
 mc_view=select_summary_people(mc,s_view)
 
-attendance_summary=store.get("attendance_summary") or {}
-attendance_people=attendance_summary.get("personas",[]) if isinstance(attendance_summary,dict) else []
-attendance_by_name={}
-for _person in attendance_people:
-    _k=token_key(_person.get("Persona",""))
-    if _k: attendance_by_name.setdefault(_k,[]).append(_person)
-app_people_by_name={}
-if isinstance(s,pd.DataFrame) and "PICKER" in s.columns:
-    for _,_row in s.iterrows():
-        _name=str(_row.get("PICKER","")).strip()
-        _k=token_key(_name)
-        if _k:
-            _category=_row.get("CATEGORIA","Picker"); _supervisor=_row.get("SUPERVISOR","No especificado")
-            if pd.isna(_category) or not str(_category).strip(): _category="Picker"
-            if pd.isna(_supervisor) or not str(_supervisor).strip(): _supervisor="No especificado"
-            _candidate={"PICKER":_name,"CATEGORIA":str(_category),"SUPERVISOR":str(_supervisor)}
-            _bucket=app_people_by_name.setdefault(_k,[])
-            if not any(x["PICKER"]==_candidate["PICKER"] and x["CATEGORIA"]==_candidate["CATEGORIA"] for x in _bucket): _bucket.append(_candidate)
-app_people_names=sorted({z["PICKER"] for _bucket in app_people_by_name.values() for z in _bucket},key=lambda z:z.upper())
-
-_tab_labels=["🏠 Bodega","👤 Picker","🌙 Turnos / Áreas","🧰 Herramientas","👥 Supervisores","📅 Faltas y retardos","🛡️ Seguimiento","📌 Pendientes & Procesos"]
+_tab_labels=["🏠 Bodega","👤 Picker","🌙 Turnos / Áreas","🧰 Herramientas","👥 Supervisores","🛡️ Seguimiento","📌 Pendientes & Procesos"]
 try:
-    a,b,e,x,g,i,h,j=st.tabs(_tab_labels,on_change="rerun",key="control_fnr_mc_tabs_v2")
+    a,b,e,x,g,h,j=st.tabs(_tab_labels,on_change="rerun",key="control_fnr_mc_tabs_v2")
 except TypeError:
-    a,b,e,x,g,i,h,j=st.tabs(_tab_labels)
+    a,b,e,x,g,h,j=st.tabs(_tab_labels)
 def _tab_active(tab):
     # Older Streamlit versions return no selected state; render normally there.
     return getattr(tab,"open",None) is not False
@@ -2368,174 +2190,6 @@ if _tab_active(g):
         else:
             st.info("No hay datos para el contexto actual.")
 
-if _tab_active(i):
-    with i:
-        st.subheader("📅 Faltas y retardos")
-        st.caption("Carga los dos reportes para ver incidencias por persona y turno. Los turnos se agrupan así: mañana 06:00–10:00, intermedio 11:00, tarde 13:00–14:00 y nocturno 22:00.")
-        with st.container(border=True):
-            u_abs,u_late=st.columns(2)
-            with u_abs:
-                attendance_absence_upload=st.file_uploader("① Reporte de faltas",type=["xlsx","xls"],key="attendance_absence_upload")
-            with u_late:
-                attendance_tardy_upload=st.file_uploader("② Reporte de retardos",type=["xlsx","xls"],key="attendance_tardy_upload")
-            st.caption("Para actualizar los resultados, selecciona ambos archivos. El resumen agregado se conserva con los datos guardados de la app y se respalda en nube si está configurado.")
-
-        if attendance_absence_upload is not None and attendance_tardy_upload is not None:
-            _abs_bytes=attendance_absence_upload.getvalue(); _late_bytes=attendance_tardy_upload.getvalue()
-            _fingerprint=hashlib.sha256(_abs_bytes+b"\0"+_late_bytes).hexdigest()
-            _old_meta=store.get("attendance_meta",{}) or {}
-            if _fingerprint!=_old_meta.get("fingerprint"):
-                try:
-                    with st.spinner("Leyendo y cruzando los reportes…"):
-                        _attendance_new=build_attendance_summary(_abs_bytes,_late_bytes,attendance_absence_upload.name,attendance_tardy_upload.name)
-                    _attendance_new["fingerprint"]=_fingerprint
-                    store["attendance_summary"]=_attendance_new
-                    store["attendance_meta"]={"fingerprint":_fingerprint,"faltas":_safe_filename(attendance_absence_upload.name),"retardos":_safe_filename(attendance_tardy_upload.name),"fecha_carga":_attendance_new["fecha_carga"]}
-                    save_store(store)
-                    attendance_summary=_attendance_new
-                    attendance_people=attendance_summary.get("personas",[])
-                    attendance_by_name={}
-                    for _person in attendance_people:
-                        _k=token_key(_person.get("Persona",""))
-                        if _k: attendance_by_name.setdefault(_k,[]).append(_person)
-                    st.success("Reportes cargados y cruzados. Los CURP se usan solo durante el cruce y no quedan guardados en el resumen.")
-                except Exception as _att_error:
-                    st.error(f"No pude leer los reportes: {_att_error}")
-            else:
-                attendance_summary=store.get("attendance_summary") or {}
-                attendance_people=attendance_summary.get("personas",[]) if isinstance(attendance_summary,dict) else []
-        elif attendance_absence_upload is not None or attendance_tardy_upload is not None:
-            st.info("Selecciona también el otro archivo para poder cruzar las faltas y los retardos por persona.")
-
-        attendance_summary=store.get("attendance_summary") or attendance_summary
-        attendance_people=attendance_summary.get("personas",[]) if isinstance(attendance_summary,dict) else []
-        if not attendance_people:
-            st.info("Carga el reporte de faltas y el de retardos para ver el resumen.")
-        else:
-            _period=f"{attendance_summary.get('fecha_desde','')} a {attendance_summary.get('fecha_hasta','')}".strip(" a") or "Fechas no especificadas"
-            st.caption(f"Periodo de los reportes: {_period} · Última carga: {attendance_summary.get('fecha_carga','')}")
-            _hours,_mins=divmod(int(attendance_summary.get("minutos_acumulados",0)),60)
-            _k1,_k2,_k3,_k4=st.columns(4)
-            _k1.metric("Faltas registradas",f"{int(attendance_summary.get('total_faltas',0)):,}",f"{int(attendance_summary.get('personas_con_faltas',0)):,} personas")
-            _k2.metric("Retardos registrados",f"{int(attendance_summary.get('total_retardos',0)):,}",f"{int(attendance_summary.get('personas_con_retardos',0)):,} personas")
-            _k3.metric("Tiempo acumulado de retardos",f"{_hours} h {_mins:02d} min")
-            _k4.metric("Personas en los reportes",f"{int(attendance_summary.get('total_personas',0)):,}")
-
-            _shift_order={"Mañana":0,"Intermedio":1,"Tarde":2,"Nocturno":3,"Sin turno":4,"Otro horario":5,"Revisar turno":6}
-            _tardy_shift_df=pd.DataFrame(attendance_summary.get("retardos_por_turno",[]))
-            _absence_shift_df=pd.DataFrame(attendance_summary.get("faltas_por_turno",[]))
-            if not _tardy_shift_df.empty:
-                _tardy_shift_df["_orden"]=_tardy_shift_df["Turno"].map(lambda z:_shift_order.get(z,9))
-                _tardy_shift_df=_tardy_shift_df.sort_values("_orden").drop(columns="_orden")
-            if not _absence_shift_df.empty:
-                _absence_shift_df["_orden"]=_absence_shift_df["Turno"].map(lambda z:_shift_order.get(z,9))
-                _absence_shift_df=_absence_shift_df.sort_values("_orden").drop(columns="_orden")
-            with st.expander("Resumen por turno",expanded=True):
-                _shift_col1,_shift_col2=st.columns(2)
-                with _shift_col1:
-                    st.markdown("**Retardos por turno**")
-                    if not _tardy_shift_df.empty:
-                        _tardy_shift_df["Tiempo acumulado"]=_tardy_shift_df["Minutos acumulados"].map(lambda v:f"{int(v)//60} h {int(v)%60:02d} min")
-                        st.dataframe(_tardy_shift_df[["Turno","Personas","Retardos","Tiempo acumulado"]],use_container_width=True,hide_index=True)
-                with _shift_col2:
-                    st.markdown("**Faltas por turno habitual**")
-                    if not _absence_shift_df.empty:
-                        st.dataframe(_absence_shift_df,use_container_width=True,hide_index=True)
-                    st.caption("El archivo de faltas no incluye turno. Se usa el turno más frecuente de retardos de cada persona; ‘Sin turno’ indica que no hubo coincidencia en el reporte de retardos.")
-
-            _att_df=pd.DataFrame(attendance_people)
-            def _attendance_app_link(name):
-                _manual=store.get("attendance_links",{}).get(token_key(name),"")
-                if _manual:
-                    for _bucket in app_people_by_name.values():
-                        for _candidate in _bucket:
-                            if _candidate["PICKER"]==_manual: return _manual,_candidate["CATEGORIA"]
-                _matches=app_people_by_name.get(token_key(name),[])
-                if len(_matches)==1:
-                    return _matches[0]["PICKER"],_matches[0]["CATEGORIA"]
-                if len(_matches)>1: return "Revisar coincidencia","Ambigua"
-                return "Sin coincidencia exacta","Sin registrar"
-            _links=_att_df["Persona"].map(_attendance_app_link)
-            _att_df["Personal en la app"]=[x[0] for x in _links]
-            _att_df["Categoría en la app"]=[x[1] for x in _links]
-            _att_df["Turno"]=_att_df.apply(lambda row:str(row["Turno habitual"])+("*" if row["Turno variable"] else ""),axis=1)
-            with st.container(border=True):
-                _f1,_f2,_f3=st.columns([2,1,1])
-                _search=_f1.text_input("Buscar persona",placeholder="Escribe un nombre…",key="attendance_search")
-                _shift_filter=_f2.selectbox("Turno",["Todos"]+sorted(_att_df["Turno habitual"].dropna().unique().tolist(),key=lambda z:_shift_order.get(z,9)),key="attendance_shift_filter")
-                _sort=_f3.selectbox("Ordenar por",["Más faltas","Más retardos","Más minutos acumulados","Nombre"],key="attendance_sort")
-                _view=_att_df.copy()
-                if _search.strip(): _view=_view[_view["Persona"].map(norm).str.contains(norm(_search),regex=False)]
-                if _shift_filter!="Todos": _view=_view[_view["Turno habitual"]==_shift_filter]
-                _sort_col={"Más faltas":"Faltas","Más retardos":"Retardos","Más minutos acumulados":"Minutos acumulados","Nombre":"Persona"}[_sort]
-                _view=_view.sort_values(_sort_col,ascending=(_sort=="Nombre"))
-                _show_cols=["Persona","Turno","Faltas","Retardos","Minutos acumulados","Personal en la app","Categoría en la app"]
-                st.dataframe(_view[_show_cols],use_container_width=True,hide_index=True)
-                st.caption(f"{len(_view):,} personas visibles · * indica registros de la persona en más de una categoría de turno.")
-
-            with st.container(border=True):
-                st.markdown("### 📝 Vincular con Seguimiento")
-                _attendance_names=sorted(_att_df["Persona"].astype(str).unique().tolist(),key=lambda z:z.upper())
-                _person_selected=st.selectbox("Persona",_attendance_names,key="attendance_followup_person")
-                _person_row=_att_df[_att_df["Persona"]==_person_selected].iloc[0].to_dict()
-                _person_token=token_key(_person_selected)
-                _candidate_matches=app_people_by_name.get(_person_token,[])
-                _saved_link=(store.get("attendance_links",{}) or {}).get(_person_token,"")
-                if _saved_link:
-                    _linked_name=_saved_link
-                    _selected_candidate=next((z for _bucket in app_people_by_name.values() for z in _bucket if z["PICKER"]==_linked_name),{})
-                    st.caption(f"Vínculo guardado con {_linked_name}.")
-                elif len(_candidate_matches)>1:
-                    _target_names=sorted({z["PICKER"] for z in _candidate_matches})
-                    _linked_name=st.selectbox("Hay más de una coincidencia. Elige a quién vincular",["No asociar"]+_target_names,key=f"attendance_link_choice_{person_key(_person_selected)}")
-                    _selected_candidate=next((z for z in _candidate_matches if z["PICKER"]==_linked_name),{})
-                elif len(_candidate_matches)==1:
-                    _linked_name=_candidate_matches[0]["PICKER"]
-                    _selected_candidate=_candidate_matches[0]
-                    st.caption(f"Coincidencia con el expediente de {_linked_name}.")
-                else:
-                    _manual_options=["Sin asociar"]+app_people_names
-                    _manual_key=f"attendance_manual_link_{person_key(_person_selected)}"
-                    _manual_choice=st.selectbox("No hay coincidencia exacta. Puedes vincular manualmente con la plantilla",_manual_options,key=_manual_key)
-                    if st.button("Guardar vínculo de esta persona",key=f"attendance_save_link_{person_key(_person_selected)}"):
-                        if _manual_choice=="Sin asociar":
-                            (store.get("attendance_links",{}) or {}).pop(_person_token,None)
-                            store["attendance_links"]=store.get("attendance_links",{}) or {}
-                        else:
-                            store.setdefault("attendance_links",{})[_person_token]=_manual_choice
-                        save_store(store); st.success("Vínculo guardado."); st.rerun()
-                    _linked_name=_manual_choice if _manual_choice!="Sin asociar" else _person_selected
-                    _selected_candidate=next((z for _bucket in app_people_by_name.values() for z in _bucket if z["PICKER"]==_linked_name),{})
-                    if _linked_name==_person_selected: st.caption("Sin coincidencia guardada: se registrará con este nombre como personal sin registrar.")
-                if _linked_name!="No asociar":
-                    _default_supervisor=_selected_candidate.get("SUPERVISOR","No especificado")
-                    _form_suffix=person_key(_linked_name) or "persona"
-                    with st.form(f"attendance_followup_form_{_form_suffix}",clear_on_submit=True):
-                        _ac1,_ac2=st.columns([1,2])
-                        _att_category=_ac1.selectbox("Categoría del registro",FOLLOWUP_CATEGORIES,key=f"attendance_followup_category_{_form_suffix}")
-                        _att_supervisor=_ac2.text_input("Supervisor",value=_default_supervisor,key=f"attendance_followup_supervisor_{_form_suffix}")
-                        _att_detail=st.text_area("Motivo / detalle",value=f"Faltas: {int(_person_row['Faltas'])} · Retardos: {int(_person_row['Retardos'])} · Minutos acumulados de retardo: {int(_person_row['Minutos acumulados'])} · Periodo: {_period}",key=f"attendance_followup_detail_{_form_suffix}")
-                        _att_feedback=st.text_area("Retroalimentación (opcional)",key=f"attendance_followup_feedback_{_form_suffix}")
-                        if st.form_submit_button("Guardar en expediente de seguimiento",type="primary"):
-                            _rec_followup=picker_record(store,_linked_name,aliases=[_person_selected])
-                            _rec_followup.setdefault("acciones",[])
-                            _rec_followup["acciones"].append({"id":datetime.now().strftime("%Y%m%d%H%M%S%f"),"fecha":datetime.now().strftime("%Y-%m-%d %H:%M"),"accion":_att_category,"supervisor":_att_supervisor.strip() or "No especificado","motivo":_att_detail.strip(),"retroalimentacion":_att_feedback.strip()})
-                            save_store(store)
-                            st.success("Registro agregado al expediente compartido de seguimiento.")
-                            st.rerun()
-                    _stored_record=None
-                    for _stored_name,_stored_value in (store.get("pickers",{}) or {}).items():
-                        if token_key(_stored_name) in {token_key(_linked_name),token_key(_person_selected)}:
-                            _stored_record=_stored_value
-                            break
-                    if _stored_record and _stored_record.get("acciones"):
-                        st.markdown("**Historial de seguimiento de esta persona**")
-                        _history_df=pd.DataFrame(_stored_record["acciones"]).rename(columns={"fecha":"Fecha","accion":"Categoría","supervisor":"Supervisor","motivo":"Motivo","retroalimentacion":"Retroalimentación"})
-                        _history_columns=[z for z in ["Fecha","Categoría","Supervisor","Motivo","Retroalimentación"] if z in _history_df.columns]
-                        st.dataframe(_history_df.sort_values("Fecha",ascending=False)[_history_columns],use_container_width=True,hide_index=True)
-                    else:
-                        st.caption("Todavía no hay registros en el expediente de esta persona.")
-
 if _tab_active(h):
     with h:
         st.subheader("🛡️ Seguimiento")
@@ -2611,17 +2265,6 @@ if _tab_active(h):
             k3.metric("2. Acta",f"{sum(c==FOLLOWUP_CATEGORIES[1] for c in categorias_picker):,}")
             k4.metric("3. 0 Tolerancia",f"{sum(c==FOLLOWUP_CATEGORIES[2] for c in categorias_picker):,}")
             k5.metric("Documentos",f"{len(documentos):,}")
-            _attendance_matches=attendance_by_name.get(token_key(seguimiento_picker),[])
-            if len(_attendance_matches)==1:
-                _att_row=_attendance_matches[0]
-                st.markdown("### 📅 Asistencia del periodo cargado")
-                _ak1,_ak2,_ak3,_ak4=st.columns(4)
-                _ak1.metric("Faltas",f"{int(_att_row.get('Faltas',0)):,}")
-                _ak2.metric("Retardos",f"{int(_att_row.get('Retardos',0)):,}")
-                _am=int(_att_row.get("Minutos acumulados",0)); _ah,_amin=divmod(_am,60)
-                _ak3.metric("Tiempo de retardo",f"{_ah} h {_amin:02d} min")
-                _ak4.metric("Turno de referencia",str(_att_row.get("Turno habitual","Sin dato"))+(" · variable" if _att_row.get("Turno variable") else ""))
-                st.caption(f"Datos del periodo {attendance_summary.get('fecha_desde','')} a {attendance_summary.get('fecha_hasta','')}. El turno proviene del reporte de retardos.")
             with st.container(border=True):
                 st.markdown("### 📋 Historial de seguimiento")
                 if acciones:
@@ -2848,3 +2491,4 @@ if _tab_active(j):
                                 if st.button("Cancelar",key=f"proc_del_cancel_{proc['id']}"):
                                     st.session_state.pop("confirm_delete_process_id",None)
                                     st.rerun()
+
