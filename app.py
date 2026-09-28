@@ -2029,12 +2029,15 @@ if isinstance(s,pd.DataFrame) and "PICKER" in s.columns:
 app_people_names=sorted({z["PICKER"] for _bucket in app_people_by_name.values() for z in _bucket},key=lambda z:z.upper())
 
 st.subheader("🔳 Generador de códigos QR")
-st.caption("Pega un enlace o escribe texto, genera el código y descárgalo como imagen PNG.")
 with st.container(border=True):
-    _qr_input_col,_qr_preview_col=st.columns([1.2,1])
+    _qr_mode_col,_qr_input_col,_qr_preview_col=st.columns([1.15,1.35,1])
+    with _qr_mode_col:
+        _qr_mode=st.radio("Código rápido",["Personalizado","CYN-PCABA-U"],horizontal=True,key="qr_generator_mode")
     with _qr_input_col:
-        _qr_content=st.text_area("Enlace o texto para el QR",placeholder="https://... o escribe el texto que quieras compartir",height=130,key="qr_generator_content")
-        _qr_filename_input=st.text_input("Nombre del archivo",value="codigo_qr",key="qr_generator_filename")
+        if _qr_mode=="CYN-PCABA-U":
+            _qr_content=st.text_input("Contenido del QR",value="CYN-PCABA-U",disabled=True)
+        else:
+            _qr_content=st.text_input("Enlace o texto",placeholder="Pega un enlace o escribe texto",key="qr_generator_content")
     with _qr_preview_col:
         if _qr_content.strip():
             try:
@@ -2045,14 +2048,13 @@ with st.container(border=True):
                 _qr_buffer=io.BytesIO()
                 _qr_image.save(_qr_buffer,format="PNG")
                 _qr_bytes=_qr_buffer.getvalue()
-                st.image(_qr_bytes,caption="Vista previa del código QR",width=240)
-                _qr_filename=re.sub(r"[^A-Za-z0-9_-]+","_",_qr_filename_input.strip()).strip("_") or "codigo_qr"
+                st.image(_qr_bytes,caption="Vista previa",width=145)
+                _qr_filename=re.sub(r"[^A-Za-z0-9_-]+","_",_qr_content.strip()).strip("_")[:60] or "codigo_qr"
                 st.download_button("⬇️ Descargar QR",_qr_bytes,file_name=f"{_qr_filename}.png",mime="image/png",key="download_generated_qr")
             except Exception as _qr_error:
                 st.error(f"No se pudo generar el QR: {_qr_error}")
         else:
-            st.info("Al escribir un enlace o texto, aquí aparecerá la vista previa y podrás descargar el QR.")
-
+            st.caption("Elige CYN-PCABA-U o escribe el contenido para generar el QR.")
 st.divider()
 
 _tab_labels=["🏠 Bodega y turnos / áreas","👤 Pickers y supervisores","📅 Faltas y retardos","🛡️ Seguimiento","📌 Pendientes","🧰 Herramientas"]
