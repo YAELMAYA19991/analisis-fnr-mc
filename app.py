@@ -2028,6 +2028,33 @@ if isinstance(s,pd.DataFrame) and "PICKER" in s.columns:
             if not any(x["PICKER"]==_candidate["PICKER"] and x["CATEGORIA"]==_candidate["CATEGORIA"] for x in _bucket): _bucket.append(_candidate)
 app_people_names=sorted({z["PICKER"] for _bucket in app_people_by_name.values() for z in _bucket},key=lambda z:z.upper())
 
+st.subheader("🔳 Generador de códigos QR")
+st.caption("Pega un enlace o escribe texto, genera el código y descárgalo como imagen PNG.")
+with st.container(border=True):
+    _qr_input_col,_qr_preview_col=st.columns([1.2,1])
+    with _qr_input_col:
+        _qr_content=st.text_area("Enlace o texto para el QR",placeholder="https://... o escribe el texto que quieras compartir",height=130,key="qr_generator_content")
+        _qr_filename_input=st.text_input("Nombre del archivo",value="codigo_qr",key="qr_generator_filename")
+    with _qr_preview_col:
+        if _qr_content.strip():
+            try:
+                _qr_code=qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M,box_size=8,border=4)
+                _qr_code.add_data(_qr_content.strip())
+                _qr_code.make(fit=True)
+                _qr_image=_qr_code.make_image(fill_color="black",back_color="white").convert("RGB")
+                _qr_buffer=io.BytesIO()
+                _qr_image.save(_qr_buffer,format="PNG")
+                _qr_bytes=_qr_buffer.getvalue()
+                st.image(_qr_bytes,caption="Vista previa del código QR",width=240)
+                _qr_filename=re.sub(r"[^A-Za-z0-9_-]+","_",_qr_filename_input.strip()).strip("_") or "codigo_qr"
+                st.download_button("⬇️ Descargar QR",_qr_bytes,file_name=f"{_qr_filename}.png",mime="image/png",key="download_generated_qr")
+            except Exception as _qr_error:
+                st.error(f"No se pudo generar el QR: {_qr_error}")
+        else:
+            st.info("Al escribir un enlace o texto, aquí aparecerá la vista previa y podrás descargar el QR.")
+
+st.divider()
+
 _tab_labels=["🏠 Bodega y turnos / áreas","👤 Pickers y supervisores","📅 Faltas y retardos","🛡️ Seguimiento","📌 Pendientes","🧰 Herramientas"]
 try:
     a,b,i,h,j,x=st.tabs(_tab_labels,on_change="rerun",key="control_fnr_mc_tabs_v5")
@@ -2045,30 +2072,6 @@ if _tab_active(a):
         st.subheader(f"Resumen de bodega — {periodo}")
         st.caption("El contexto elegido aquí se comparte automáticamente con todas las pestañas.")
 
-        st.subheader("🔳 Generador de códigos QR")
-        st.caption("Pega un enlace o escribe texto, genera el código y descárgalo como imagen PNG.")
-        with st.container(border=True):
-            _qr_input_col,_qr_preview_col=st.columns([1.2,1])
-            with _qr_input_col:
-                _qr_content=st.text_area("Enlace o texto para el QR",placeholder="https://... o escribe el texto que quieras compartir",height=130,key="qr_generator_content")
-                _qr_filename_input=st.text_input("Nombre del archivo",value="codigo_qr",key="qr_generator_filename")
-            with _qr_preview_col:
-                if _qr_content.strip():
-                    try:
-                        _qr_code=qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M,box_size=8,border=4)
-                        _qr_code.add_data(_qr_content.strip())
-                        _qr_code.make(fit=True)
-                        _qr_image=_qr_code.make_image(fill_color="black",back_color="white").convert("RGB")
-                        _qr_buffer=io.BytesIO()
-                        _qr_image.save(_qr_buffer,format="PNG")
-                        _qr_bytes=_qr_buffer.getvalue()
-                        st.image(_qr_bytes,caption="Vista previa del código QR",width=240)
-                        _qr_filename=re.sub(r"[^A-Za-z0-9_-]+","_",_qr_filename_input.strip()).strip("_") or "codigo_qr"
-                        st.download_button("⬇️ Descargar QR",_qr_bytes,file_name=f"{_qr_filename}.png",mime="image/png",key="download_generated_qr")
-                    except Exception as _qr_error:
-                        st.error(f"No se pudo generar el QR: {_qr_error}")
-                else:
-                    st.info("Al escribir un enlace o texto, aquí aparecerá la vista previa y podrás descargar el QR.")
         _meta=store.get("upload_meta",{}) or {}
         _upload_rows=[]
         for _k,_label in [("base_picker","Pickers / Líneas"),("detalle_fnr","FNR"),("detalle_mc","Mala Calidad"),("plantilla_personal","Plantilla consolidada")]:
