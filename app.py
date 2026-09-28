@@ -2027,11 +2027,14 @@ if isinstance(s,pd.DataFrame) and "PICKER" in s.columns:
             if not any(x["PICKER"]==_candidate["PICKER"] and x["CATEGORIA"]==_candidate["CATEGORIA"] for x in _bucket): _bucket.append(_candidate)
 app_people_names=sorted({z["PICKER"] for _bucket in app_people_by_name.values() for z in _bucket},key=lambda z:z.upper())
 
-_tab_labels=["🏠 Bodega","👤 Picker","🌙 Turnos / Áreas","🧰 Herramientas","👥 Supervisores","📅 Faltas y retardos","🛡️ Seguimiento","📌 Pendientes & Procesos"]
+_tab_labels=["🏠 Bodega y turnos / áreas","👤 Pickers y supervisores","📅 Faltas y retardos","🛡️ Seguimiento","📌 Pendientes","🧰 Herramientas"]
 try:
-    a,b,e,x,g,i,h,j=st.tabs(_tab_labels,on_change="rerun",key="control_fnr_mc_tabs_v2")
+    a,b,i,h,j,x=st.tabs(_tab_labels,on_change="rerun",key="control_fnr_mc_tabs_v3")
 except TypeError:
-    a,b,e,x,g,i,h,j=st.tabs(_tab_labels)
+    a,b,i,h,j,x=st.tabs(_tab_labels)
+# Agrupa las secciones en una sola pestaña y conserva sus formularios y cálculos.
+e=a  # Turnos / Áreas comparte la pestaña de Bodega.
+g=b  # Supervisores comparte la pestaña de Pickers.
 def _tab_active(tab):
     # Older Streamlit versions return no selected state; render normally there.
     return getattr(tab,"open",None) is not False
