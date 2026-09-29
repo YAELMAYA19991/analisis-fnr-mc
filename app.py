@@ -1981,8 +1981,11 @@ def _severity_css(value, warning, critical):
     return "background-color:#e2f3e5;color:#166534"
 
 def _style_severity(frame, rules):
-    """Colorea solo las celdas de incidencias con reglas explícitas."""
+    """Colorea incidencias y presenta conteos como enteros sin alterar sus datos."""
     styled=frame.style
+    for column in ["LINEAS","PEDIDOS","FNR","MC","INCIDENCIAS","PICKERS","PRODUCTOS","Faltas","Retardos","Minutos acumulados"]:
+        if column in frame.columns:
+            styled=styled.format("{:,.0f}",subset=[column],na_rep="—")
     for column,(warning,critical) in rules.items():
         if column in frame.columns:
             styled=styled.apply(
