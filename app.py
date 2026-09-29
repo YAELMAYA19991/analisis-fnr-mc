@@ -2546,19 +2546,44 @@ if _tab_active(i):
                 if _linked_name!="No asociar":
                     _default_supervisor=_selected_candidate.get("SUPERVISOR","No especificado")
                     _form_suffix=person_key(_linked_name) or "persona"
+                    _saved_resource_options={}
+                    for _resource_index,_resource in enumerate(store.get("recursos_formatos",[]) or []):
+                        _resource_url=str(_resource.get("url","")).strip()
+                        if _resource_url.startswith(("https://","http://")):
+                            _resource_label=f"{_resource_index+1}. {_resource.get('tipo','Documento')} · {_resource.get('titulo','Enlace')}"
+                            _saved_resource_options[_resource_label]={"titulo":str(_resource.get("titulo","Documento")),"url":_resource_url}
                     with st.form(f"attendance_followup_form_{_form_suffix}",clear_on_submit=True):
                         _ac1,_ac2=st.columns([1,2])
                         _att_category=_ac1.selectbox("Categoría del registro",FOLLOWUP_CATEGORIES,key=f"attendance_followup_category_{_form_suffix}")
                         _att_supervisor=_ac2.text_input("Supervisor",value=_default_supervisor,key=f"attendance_followup_supervisor_{_form_suffix}")
                         _att_detail=st.text_area("Motivo / detalle",value=f"Faltas: {int(_person_row['Faltas'])} · Retardos: {int(_person_row['Retardos'])} · Minutos acumulados de retardo: {int(_person_row['Minutos acumulados'])} · Periodo: {_period}",key=f"attendance_followup_detail_{_form_suffix}")
                         _att_feedback=st.text_area("Retroalimentación (opcional)",key=f"attendance_followup_feedback_{_form_suffix}")
+                        st.caption("Puedes elegir enlaces guardados o pegar otros enlaces de documentos.")
+                        _att_saved_links=st.multiselect("Enlaces guardados (opcional)",options=list(_saved_resource_options),placeholder="Selecciona uno o varios documentos",key=f"attendance_followup_links_{_form_suffix}")
+                        _att_other_links=st.text_area("Otros enlaces de documentos (opcional)",placeholder="Pega una URL por línea",height=70,key=f"attendance_followup_other_links_{_form_suffix}")
                         if st.form_submit_button("Guardar en expediente de seguimiento",type="primary"):
-                            _rec_followup=picker_record(store,_linked_name,aliases=[_person_selected])
-                            _rec_followup.setdefault("acciones",[])
-                            _rec_followup["acciones"].append({"id":datetime.now().strftime("%Y%m%d%H%M%S%f"),"fecha":datetime.now().strftime("%Y-%m-%d %H:%M"),"accion":_att_category,"supervisor":_att_supervisor.strip() or "No especificado","motivo":_att_detail.strip(),"retroalimentacion":_att_feedback.strip()})
-                            save_store(store)
-                            st.success("Registro agregado al expediente compartido de seguimiento.")
-                            st.rerun()
+                            _document_links=[]
+                            for _selected_label in _att_saved_links:
+                                _link=dict(_saved_resource_options[_selected_label])
+                                if not any(_existing.get("url")==_link.get("url") for _existing in _document_links):
+                                    _document_links.append(_link)
+                            _invalid_links=[]
+                            for _raw_link in re.split(r"[\\n,;]+",_att_other_links):
+                                _url=_raw_link.strip()
+                                if not _url: continue
+                                if not _url.startswith(("https://","http://")):
+                                    _invalid_links.append(_url)
+                                elif not any(_existing.get("url")==_url for _existing in _document_links):
+                                    _document_links.append({"titulo":_url,"url":_url})
+                            if _invalid_links:
+                                st.error("Cada enlace debe comenzar con https:// o http://. Revisa los enlaces escritos.")
+                            else:
+                                _rec_followup=picker_record(store,_linked_name,aliases=[_person_selected])
+                                _rec_followup.setdefault("acciones",[])
+                                _rec_followup["acciones"].append({"id":datetime.now().strftime("%Y%m%d%H%M%S%f"),"fecha":datetime.now().strftime("%Y-%m-%d %H:%M"),"accion":_att_category,"supervisor":_att_supervisor.strip() or "No especificado","motivo":_att_detail.strip(),"retroalimentacion":_att_feedback.strip(),"documentos_enlaces":_document_links})
+                                save_store(store)
+                                st.success("Registro agregado al expediente compartido de seguimiento.")
+                                st.rerun()
                     _stored_record=None
                     for _stored_name,_stored_value in (store.get("pickers",{}) or {}).items():
                         if token_key(_stored_name) in {token_key(_linked_name),token_key(_person_selected)}:
@@ -2569,6 +2594,16 @@ if _tab_active(i):
                         _history_df=pd.DataFrame(_stored_record["acciones"]).rename(columns={"fecha":"Fecha","accion":"Categoría","supervisor":"Supervisor","motivo":"Motivo","retroalimentacion":"Retroalimentación"})
                         _history_columns=[z for z in ["Fecha","Categoría","Supervisor","Motivo","Retroalimentación"] if z in _history_df.columns]
                         st.dataframe(_history_df.sort_values("Fecha",ascending=False)[_history_columns],use_container_width=True,hide_index=True)
+                        for _action_index,_history_action in enumerate(reversed(_stored_record["acciones"])):
+                            _history_links=_history_action.get("documentos_enlaces",[]) or []
+                            if _history_links:
+                                st.caption(f"Documentos vinculados · {_history_action.get('fecha','')}")
+                                _link_columns=st.columns(min(len(_history_links),3))
+                                for _link_index,_history_link in enumerate(_history_links):
+                                    _link_url=str(_history_link.get("url","")).strip()
+                                    if _link_url.startswith(("https://","http://")):
+                                        _link_title=str(_history_link.get("titulo") or f"Documento {_link_index+1}")
+                                        _link_columns[_link_index%len(_link_columns)].link_button(f"📎 {_link_title}",_link_url,key=f"attendance_followup_doc_{_form_suffix}_{_action_index}_{_link_index}",use_container_width=True)
                     else:
                         st.caption("Todavía no hay registros en el expediente de esta persona.")
 
