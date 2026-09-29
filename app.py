@@ -2278,7 +2278,7 @@ if _tab_active(a):
         for _k,_label in [("base_picker","Pickers / Líneas"),("detalle_fnr","FNR"),("detalle_mc","Mala Calidad"),("plantilla_personal","Plantilla consolidada")]:
             _m=_meta.get(_k,{}) or {}
             _upload_rows.append({"Archivo":_label,"Última carga":_m.get("fecha","Sin registro"),"Nombre":_m.get("archivo","")})
-        with st.expander("🕒 Última carga de Excel",expanded=False):
+        with st.expander("📂 Ver última carga de Excel",expanded=False):
             st.dataframe(pd.DataFrame(_upload_rows),use_container_width=True,hide_index=True)
         ctx,turns,sups,areas=global_context(context_identity)
         with st.container(border=True):
@@ -2315,13 +2315,13 @@ if _tab_active(a):
         render_soft_kpis([
             ("Líneas",f"{lines:,.0f}",f"{lines/base_reference.LINEAS.sum()*100:.1f}% del universo" if base_reference.LINEAS.sum() else "Sin referencia","blue"),
             ("Pedidos",f"{total_pedidos:,.0f}",f"{total_pedidos/base_reference.PEDIDOS.sum()*100:.1f}% del universo" if base_reference.PEDIDOS.sum() else "Sin referencia","green"),
-            ("Pickers",f"{_picker_count:,}",f"{_picker_count/_reference_picker_count*100:.1f}% del universo · {_unregistered_count:,} sin registrar" if _reference_picker_count else f"{_unregistered_count:,} sin registrar","blue"),
+            ("Pickers",f"{_picker_count:,}",f"{_picker_count/_reference_picker_count*100:.1f}% del universo · {_unregistered_count:,} sin registrar en el contexto" if _reference_picker_count else f"{_unregistered_count:,} sin registrar en el contexto","blue"),
         ])
         _outside_goal=int(((s_bodega.ESTADO=="🔴 FUERA DE OBJETIVO") & s_bodega.CATEGORIA.eq("Picker")).sum())
         render_soft_kpis([
             ("FNR operativo",f"{fnr_rate:.2f}%" if fnr_rate is not None else "N/D","Excel operativo · meta < 1.50%",_severity_tone(fnr_rate,FNR_OBJ*.8,FNR_OBJ)),
             ("MC operativo",f"{mc_rate:.2f}%" if mc_rate is not None else "N/D","Excel operativo · meta < 1.00%",_severity_tone(mc_rate,MC_OBJ*.8,MC_OBJ)),
-            ("Fuera objetivo",f"{_outside_goal:,}",f"de {_picker_count:,} pickers · {_unregistered_count:,} sin registrar","red" if _outside_goal else "green"),
+            ("Fuera objetivo",f"{_outside_goal:,}",f"de {_picker_count:,} pickers · {_unregistered_count:,} sin registrar en el contexto","red" if _outside_goal else "green"),
         ])
         if fnr_rate is not None and mc_rate is not None:
             st.caption(f"Cálculo operativo desde Excel (por pedido): {fnr_pedidos:,} con FNR / {total_pedidos:,} pedidos = {fnr_rate:.2f}% · {mc_pedidos:,} con MC / {total_pedidos:,} pedidos = {mc_rate:.2f}%. Este cálculo es distinto al acumulado importado de Power BI.")
