@@ -1986,6 +1986,9 @@ def _style_severity(frame, rules):
     for column in ["LINEAS","PEDIDOS","FNR","MC","INCIDENCIAS","PICKERS","PRODUCTOS","Faltas","Retardos","Minutos acumulados"]:
         if column in frame.columns:
             styled=styled.format("{:,.0f}",subset=[column],na_rep="—")
+    for column in ["FNR_%","MC_%","FNR %","MC %","% DEL TOTAL","% / LINEAS"]:
+        if column in frame.columns:
+            styled=styled.format("{:.2f}%",subset=[column],na_rep="—")
     for column,(warning,critical) in rules.items():
         if column in frame.columns:
             styled=styled.apply(
@@ -2189,6 +2192,7 @@ if _tab_active(a):
             ("MC / líneas",f"{mc_lines_rate:.2f}%" if mc_lines_rate is not None else "N/D",f"Objetivo < {MC_OBJ:.2f}%",_severity_tone(mc_lines_rate,MC_OBJ*.8,MC_OBJ)),
         ])
         st.caption(f"Semáforo por picker: FNR verde < {FNR_OBJ*.8:.2f}%, amarillo {FNR_OBJ*.8:.2f}–<{FNR_OBJ:.2f}%, rojo ≥ {FNR_OBJ:.2f}% · MC verde < {MC_OBJ*.8:.2f}%, amarillo {MC_OBJ*.8:.2f}–<{MC_OBJ:.2f}%, rojo ≥ {MC_OBJ:.2f}%.")
+        st.caption("En la tabla, FNR_% y MC_% significan incidencias divididas entre líneas × 100; el indicador mensual usa pedidos.")
         st.subheader("Detalle por picker")
         st.dataframe(_style_severity(s_bodega,{"FNR_%":(FNR_OBJ*.8,FNR_OBJ),"MC_%":(MC_OBJ*.8,MC_OBJ)}),use_container_width=True,hide_index=True)
 
