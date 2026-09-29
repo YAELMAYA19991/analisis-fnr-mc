@@ -23,8 +23,12 @@ st.markdown("""
 :root { --justo-red:#BD2426; --ink:#272936; --muted:#6f7480; --soft:#f7f7f5; --line:#e7e7e3; --success:#15803d; }
 .main .block-container { max-width: 1500px; padding-top: 1.1rem; padding-bottom: 2.5rem; }
 [data-testid="stSidebar"] { border-right: 1px solid var(--line); }
-section[data-testid="stSidebar"] { width: 320px !important; }
-section[data-testid="stSidebar"] > div { width: 320px !important; }
+section[data-testid="stSidebar"] { width: min(320px, 28vw) !important; min-width: 260px !important; }
+section[data-testid="stSidebar"] > div { width: inherit !important; }
+@media (max-width: 700px) {
+  section[data-testid="stSidebar"] { width: min(88vw, 320px) !important; min-width: 0 !important; }
+  section[data-testid="stSidebar"] > div { width: 100% !important; }
+}
 .page-filter { background:#fafaf8; border:1px solid var(--line); border-radius:16px; padding:12px 14px 2px; margin:0 0 18px; }
 [data-testid="stMetric"] { background:#fff; border:1px solid var(--line); border-radius:16px; padding:.75rem .9rem; box-shadow:0 2px 10px rgba(30,30,30,.035); }
 .kpi-soft-blue { background:#f3f8ff; border:1px solid #dcecff; }
@@ -1735,10 +1739,12 @@ with st.sidebar:
     else:
         st.warning("Respaldo en nube pendiente: configura SUPABASE_URL y SUPABASE_SECRET_KEY en los secretos del servidor.")
         st.caption('Agrega también SUPABASE_STORAGE_BUCKET="control-fnr-mc". El bucket privado se crea automáticamente al conectar.')
-    ub_upload=st.file_uploader("① Base de Pickers / Líneas",type=["xlsx","xls"],key="base_picker")
-    uf_upload=st.file_uploader("② Detalle FNR",type=["xlsx","xls"],key="detalle_fnr")
-    um_upload=st.file_uploader("③ Detalle Mala Calidad",type=["xlsx","xls"],key="detalle_mc")
-    up_upload=st.file_uploader("④ Plantilla consolidada",type=["xlsx","xls"],key="plantilla_personal")
+    with st.expander("📁 Actualizar archivos operativos",expanded=False):
+        st.caption("Carga los Excel que alimentan el análisis. Se conserva cada versión en el historial.")
+        ub_upload=st.file_uploader("① Base de Pickers / Líneas",type=["xlsx","xls"],key="base_picker")
+        uf_upload=st.file_uploader("② Detalle FNR",type=["xlsx","xls"],key="detalle_fnr")
+        um_upload=st.file_uploader("③ Detalle Mala Calidad",type=["xlsx","xls"],key="detalle_mc")
+        up_upload=st.file_uploader("④ Plantilla consolidada",type=["xlsx","xls"],key="plantilla_personal")
 
     # Cada archivo nuevo reemplaza automáticamente al guardado. Si solo se recarga
     # la página, la app recupera la última versión guardada sin pedir volver a subirla.
@@ -1790,13 +1796,14 @@ with st.sidebar:
 
 # Indicadores compactos de Power BI: siempre visibles en portada, fuera de las pestañas.
 with st.container(border=True):
-    st.markdown("### 📊 Indicadores diarios · Coyoacán")
+    st.markdown("### 📊 Indicadores Power BI · Coyoacán")
+    st.caption("Valores acumulados del periodo, actualizados al cargar el Excel de Power BI. Se muestran aparte del cálculo operativo basado en los Excel.")
     _krs_history=store.get("powerbi_krs_history",[]) or []
     _home_latest=_krs_history[-1] if _krs_history else None
 
     # El cargador queda plegado para dejar los resultados como foco de la portada.
     with st.expander("⬆️ Actualizar indicadores desde Power BI",expanded=False):
-        st.caption("Sube el Excel descargado desde Power BI. Se conserva el historial diario.")
+        st.caption("Sube el Excel descargado desde Power BI. Se conserva un registro por fecha para revisar la evolución diaria.")
         with st.form("powerbi_krs_upload_home_form",clear_on_submit=True):
             _krs_upload=st.file_uploader("Excel de Power BI",type=["xlsx","xls"],key="powerbi_krs_excel_upload_home")
             _krs_submit=st.form_submit_button("Guardar valores",type="primary",use_container_width=True)
@@ -1930,10 +1937,10 @@ if roster is not None:
     total=len(base); unmatched=total-matched-int(excluded_series.sum())
     matched_turn=int((match_series & ~excluded_series & base["TURNO"].astype(str).str.strip().ne("") & base["TURNO"].astype(str).str.strip().ne("No especificado") & base["TURNO"].astype(str).str.strip().ne("__EXCLUIDO__")).sum())
     with st.sidebar:
-        st.success(f"Personal identificado: {matched}/{total}")
-        st.caption(f"Turnos asignados: {matched_turn}/{total} · Excluidos: {int(excluded_series.sum())}")
+        st.success(f"Base Pickers/Líneas: {matched} identificados de {total} registros")
+        st.caption(f"Con turno asignado: {matched_turn}/{total} · Excluidos: {int(excluded_series.sum())}")
         if unmatched:
-            st.caption(f"{unmatched} registro(s) en la categoría Sin registrar.")
+            st.caption(f"Pendientes de asociar en esta base: {unmatched} registros.")
         email_match=int(base.get("_MASTER_MATCH",pd.Series(False,index=base.index)).fillna(False).astype(bool).sum())
         st.caption(f"🔑 Cruce de identidad: CORREO primero · {email_match} registros identificados")
 
@@ -2092,7 +2099,7 @@ def render_context_banner(ctx, selected_df, reference_df, label="Contexto de an�
     sel_u=int(selected_df.get("CATEGORIA",pd.Series("Picker",index=selected_df.index)).astype(str).eq("Sin registrar").sum())
     ref_p=int(reference_df.get("CATEGORIA",pd.Series("Picker",index=reference_df.index)).astype(str).eq("Picker").sum())
     pct=(sel_p/ref_p*100) if ref_p else 0
-    count_text=f"{sel_p:,} pickers · {sel_u:,} sin registrar" if sel_u else f"{sel_p:,} pickers"
+    count_text=f"{sel_p:,} pickers · {sel_u:,} sin registrar en base e incidencias" if sel_u else f"{sel_p:,} pickers"
     st.markdown(
         f"<div class='context-banner'><div class='context-title'>🎯 {label}: {scope}</div>"
         f"<div class='context-detail'>{count_text} · {pct:.1f}% del universo de comparación · Las demás pestañas utilizan este mismo contexto.</div></div>",
@@ -2271,7 +2278,7 @@ if _tab_active(a):
         for _k,_label in [("base_picker","Pickers / Líneas"),("detalle_fnr","FNR"),("detalle_mc","Mala Calidad"),("plantilla_personal","Plantilla consolidada")]:
             _m=_meta.get(_k,{}) or {}
             _upload_rows.append({"Archivo":_label,"Última carga":_m.get("fecha","Sin registro"),"Nombre":_m.get("archivo","")})
-        with st.expander("🕒 Última carga de Excel",expanded=True):
+        with st.expander("🕒 Última carga de Excel",expanded=False):
             st.dataframe(pd.DataFrame(_upload_rows),use_container_width=True,hide_index=True)
         ctx,turns,sups,areas=global_context(context_identity)
         with st.container(border=True):
@@ -2312,12 +2319,12 @@ if _tab_active(a):
         ])
         _outside_goal=int(((s_bodega.ESTADO=="🔴 FUERA DE OBJETIVO") & s_bodega.CATEGORIA.eq("Picker")).sum())
         render_soft_kpis([
-            ("FNR mensual",f"{fnr_rate:.2f}%" if fnr_rate is not None else "N/D","Objetivo < 1.50%",_severity_tone(fnr_rate,FNR_OBJ*.8,FNR_OBJ)),
-            ("MC mensual",f"{mc_rate:.2f}%" if mc_rate is not None else "N/D","Objetivo < 1.00%",_severity_tone(mc_rate,MC_OBJ*.8,MC_OBJ)),
+            ("FNR operativo",f"{fnr_rate:.2f}%" if fnr_rate is not None else "N/D","Excel operativo · meta < 1.50%",_severity_tone(fnr_rate,FNR_OBJ*.8,FNR_OBJ)),
+            ("MC operativo",f"{mc_rate:.2f}%" if mc_rate is not None else "N/D","Excel operativo · meta < 1.00%",_severity_tone(mc_rate,MC_OBJ*.8,MC_OBJ)),
             ("Fuera objetivo",f"{_outside_goal:,}",f"de {_picker_count:,} pickers · {_unregistered_count:,} sin registrar","red" if _outside_goal else "green"),
         ])
         if fnr_rate is not None and mc_rate is not None:
-            st.caption(f"KPI mensual del contexto: {fnr_pedidos:,} pedidos con FNR / {total_pedidos:,} pedidos = {fnr_rate:.2f}% · {mc_pedidos:,} pedidos con MC / {total_pedidos:,} pedidos = {mc_rate:.2f}%")
+            st.caption(f"Cálculo operativo desde Excel (por pedido): {fnr_pedidos:,} con FNR / {total_pedidos:,} pedidos = {fnr_rate:.2f}% · {mc_pedidos:,} con MC / {total_pedidos:,} pedidos = {mc_rate:.2f}%. Este cálculo es distinto al acumulado importado de Power BI.")
         else:
             st.caption("No hay suficientes pedidos para calcular el KPI mensual.")
 
