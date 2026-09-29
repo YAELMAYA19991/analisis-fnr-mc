@@ -1969,6 +1969,48 @@ def render_soft_kpis(cards):
                 f"<div class='justo-muted'>{detail}</div></div>",
                 unsafe_allow_html=True)
 
+def _severity_css(value, warning, critical):
+    """Color pastel; N/D queda sin color para no sugerir un nivel desconocido."""
+    try:
+        number=float(value)
+    except (TypeError,ValueError):
+        return ""
+    if pd.isna(number): return ""
+    if number>=critical: return "background-color:#fde2e2;color:#991b1b;font-weight:600"
+    if number>=warning: return "background-color:#fff4cc;color:#854d0e;font-weight:600"
+    return "background-color:#e2f3e5;color:#166534"
+
+def _style_severity(frame, rules):
+    """Colorea solo las celdas de incidencias con reglas explícitas."""
+    styled=frame.style
+    for column,(warning,critical) in rules.items():
+        if column in frame.columns:
+            styled=styled.apply(
+                lambda values,w=warning,c=critical:[_severity_css(value,w,c) for value in values],
+                subset=[column],
+            )
+    return styled
+
+def _percentile_severity_rules(frame, columns, percentile=.75):
+    """Calcula corte rojo del cuartil superior de la plantilla cargada."""
+    rules={}
+    for column in columns:
+        if column not in frame.columns: continue
+        values=pd.to_numeric(frame[column],errors="coerce").replace([np.inf,-np.inf],np.nan).dropna()
+        positive=values[values>0]
+        if positive.empty: continue
+        cutoff=int(np.ceil(values.quantile(percentile)))
+        if cutoff<1: cutoff=int(np.ceil(positive.quantile(percentile)))
+        rules[column]=(1,max(cutoff,1))
+    return rules
+
+def _severity_tone(value, warning, critical):
+    css=_severity_css(value,warning,critical)
+    if "fde2e2" in css: return "red"
+    if "fff4cc" in css: return "amber"
+    if "e2f3e5" in css: return "green"
+    return "blue"
+
 def render_turn_comparison(selected_base, reference_base, selected_fnr, reference_fnr, selected_mc, reference_mc):
     """Muestra cantidad y porcentaje del contexto contra el universo de comparación."""
     def pct(v,d): return (v/d*100) if d else 0
@@ -2120,10 +2162,11 @@ if _tab_active(a):
             ("Pedidos",f"{total_pedidos:,.0f}",f"{total_pedidos/base_reference.PEDIDOS.sum()*100:.1f}% del universo" if base_reference.PEDIDOS.sum() else "Sin referencia","green"),
             ("Pickers",f"{_picker_count:,}",f"{_picker_count/_reference_picker_count*100:.1f}% del universo · {_unregistered_count:,} sin registrar" if _reference_picker_count else f"{_unregistered_count:,} sin registrar","blue"),
         ])
+        _outside_goal=int(((s_bodega.ESTADO=="🔴 FUERA DE OBJETIVO") & s_bodega.CATEGORIA.eq("Picker")).sum())
         render_soft_kpis([
-            ("FNR mensual",f"{fnr_rate:.2f}%" if fnr_rate is not None else "N/D","Objetivo < 1.50%","red"),
-            ("MC mensual",f"{mc_rate:.2f}%" if mc_rate is not None else "N/D","Objetivo < 1.00%","amber"),
-            ("Fuera objetivo",f"{int(((s_bodega.ESTADO=="🔴 FUERA DE OBJETIVO") & s_bodega.CATEGORIA.eq("Picker")).sum()):,}",f"de {_picker_count:,} pickers · {_unregistered_count:,} sin registrar","red"),
+            ("FNR mensual",f"{fnr_rate:.2f}%" if fnr_rate is not None else "N/D","Objetivo < 1.50%",_severity_tone(fnr_rate,FNR_OBJ*.8,FNR_OBJ)),
+            ("MC mensual",f"{mc_rate:.2f}%" if mc_rate is not None else "N/D","Objetivo < 1.00%",_severity_tone(mc_rate,MC_OBJ*.8,MC_OBJ)),
+            ("Fuera objetivo",f"{_outside_goal:,}",f"de {_picker_count:,} pickers · {_unregistered_count:,} sin registrar","red" if _outside_goal else "green"),
         ])
         if fnr_rate is not None and mc_rate is not None:
             st.caption(f"KPI mensual del contexto: {fnr_pedidos:,} pedidos con FNR / {total_pedidos:,} pedidos = {fnr_rate:.2f}% · {mc_pedidos:,} pedidos con MC / {total_pedidos:,} pedidos = {mc_rate:.2f}%")
@@ -2135,10 +2178,13 @@ if _tab_active(a):
 
         st.subheader("Indicador operativo por líneas")
         k=st.columns(2)
-        k[0].metric("FNR / líneas",f"{F/lines*100:.2f}%" if lines else "N/D")
-        k[1].metric("MC / líneas",f"{M/lines*100:.2f}%" if lines else "N/D")
+        fnr_lines_rate=F/lines*100 if lines else None
+        mc_lines_rate=M/lines*100 if lines else None
+        k[0].metric("FNR / líneas",f"{fnr_lines_rate:.2f}%" if fnr_lines_rate is not None else "N/D")
+        k[1].metric("MC / líneas",f"{mc_lines_rate:.2f}%" if mc_lines_rate is not None else "N/D")
+        st.caption(f"Semáforo por picker: FNR verde < {FNR_OBJ*.8:.2f}%, amarillo {FNR_OBJ*.8:.2f}–<{FNR_OBJ:.2f}%, rojo ≥ {FNR_OBJ:.2f}% · MC verde < {MC_OBJ*.8:.2f}%, amarillo {MC_OBJ*.8:.2f}–<{MC_OBJ:.2f}%, rojo ≥ {MC_OBJ:.2f}%.")
         st.subheader("Detalle por picker")
-        st.dataframe(s_bodega,use_container_width=True,hide_index=True)
+        st.dataframe(_style_severity(s_bodega,{"FNR_%":(FNR_OBJ*.8,FNR_OBJ),"MC_%":(MC_OBJ*.8,MC_OBJ)}),use_container_width=True,hide_index=True)
 
         st.divider()
         st.subheader("🏷️ Artículos")
@@ -2308,14 +2354,15 @@ if _tab_active(e):
         fref=select_summary_people(fnr,reference)
         mref=select_summary_people(mc,reference)
         render_turn_comparison(bsel,bref,fsel,fref,msel,mref)
+        st.caption("Las celdas de tasa por líneas usan el mismo semáforo de objetivos de FNR y MC.")
         st.subheader("FNR por turno")
-        st.dataframe(groups(fsel,bsel,"TURNO"),use_container_width=True,hide_index=True)
+        st.dataframe(_style_severity(groups(fsel,bsel,"TURNO"),{"% / LINEAS":(FNR_OBJ*.8,FNR_OBJ)}),use_container_width=True,hide_index=True)
         st.subheader("MC por turno")
-        st.dataframe(groups(msel,bsel,"TURNO"),use_container_width=True,hide_index=True)
+        st.dataframe(_style_severity(groups(msel,bsel,"TURNO"),{"% / LINEAS":(MC_OBJ*.8,MC_OBJ)}),use_container_width=True,hide_index=True)
         st.subheader("FNR por área")
-        st.dataframe(groups(fsel,bsel,"AREA"),use_container_width=True,hide_index=True)
+        st.dataframe(_style_severity(groups(fsel,bsel,"AREA"),{"% / LINEAS":(FNR_OBJ*.8,FNR_OBJ)}),use_container_width=True,hide_index=True)
         st.subheader("MC por área")
-        st.dataframe(groups(msel,bsel,"AREA"),use_container_width=True,hide_index=True)
+        st.dataframe(_style_severity(groups(msel,bsel,"AREA"),{"% / LINEAS":(MC_OBJ*.8,MC_OBJ)}),use_container_width=True,hide_index=True)
         st.warning("El % / líneas por área solo aparece si existe un denominador real de líneas por área.")
 
 if _tab_active(x):
@@ -2397,7 +2444,7 @@ if _tab_active(g):
                 .sort_values("FNR",ascending=False))
             sup_summary["FNR %"]=safe_pct(sup_summary["FNR"],sup_summary["LINEAS"])
             sup_summary["MC %"]=safe_pct(sup_summary["MC"],sup_summary["LINEAS"])
-            st.dataframe(sup_summary,use_container_width=True,hide_index=True)
+            st.dataframe(_style_severity(sup_summary,{"FNR %":(FNR_OBJ*.8,FNR_OBJ),"MC %":(MC_OBJ*.8,MC_OBJ)}),use_container_width=True,hide_index=True)
             sup_focus=st.selectbox("Supervisor",["Todos"]+sorted([str(x) for x in sup_summary["SUPERVISOR"] if str(x).strip()]))
             if sup_focus!="Todos":
                 st.dataframe(sup_data[sup_data["SUPERVISOR"]==sup_focus],use_container_width=True,hide_index=True)
@@ -2506,7 +2553,20 @@ if _tab_active(i):
                 _sort_col={"Más faltas":"Faltas","Más retardos":"Retardos","Más minutos acumulados":"Minutos acumulados","Nombre":"Persona"}[_sort]
                 _view=_view.sort_values(_sort_col,ascending=(_sort=="Nombre"))
                 _show_cols=["Persona","Turno","Faltas","Retardos","Minutos acumulados","Personal en la app","Categoría en la app"]
-                st.dataframe(_view[_show_cols],use_container_width=True,hide_index=True)
+                _attendance_color_rules=_percentile_severity_rules(_att_df,["Faltas","Retardos","Minutos acumulados"])
+                st.dataframe(_style_severity(_view[_show_cols],_attendance_color_rules),use_container_width=True,hide_index=True)
+                def _attendance_cutoff_label(label,column,unit=""):
+                    _rule=_attendance_color_rules.get(column)
+                    if not _rule: return f"{label}: sin casos positivos"
+                    _yellow_max=_rule[1]-1
+                    if _yellow_max<_rule[0]:
+                        return f"{label}: 0 verde · ≥{_rule[1]}{unit} rojo"
+                    return f"{label}: 0 verde · {_rule[0]}–{_yellow_max}{unit} amarillo · ≥{_rule[1]}{unit} rojo"
+                st.caption("Semáforo del periodo (corte rojo = cuartil superior de las personas cargadas): "+" · ".join([
+                    _attendance_cutoff_label("Faltas","Faltas"),
+                    _attendance_cutoff_label("Retardos","Retardos"),
+                    _attendance_cutoff_label("Minutos","Minutos acumulados"," min"),
+                ]))
                 st.caption(f"{len(_view):,} personas visibles · * indica registros de la persona en más de una categoría de turno.")
 
             with st.container(border=True):
