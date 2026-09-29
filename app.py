@@ -1998,7 +1998,9 @@ def _percentile_severity_rules(frame, columns, percentile=.75):
         if column not in frame.columns: continue
         values=pd.to_numeric(frame[column],errors="coerce").replace([np.inf,-np.inf],np.nan).dropna()
         positive=values[values>0]
-        if positive.empty: continue
+        if positive.empty:
+            rules[column]=(1,1)
+            continue
         cutoff=int(np.ceil(values.quantile(percentile)))
         if cutoff<1: cutoff=int(np.ceil(positive.quantile(percentile)))
         rules[column]=(1,max(cutoff,1))
@@ -2558,6 +2560,8 @@ if _tab_active(i):
                 st.dataframe(_style_severity(_view[_show_cols],_attendance_color_rules),use_container_width=True,hide_index=True)
                 def _attendance_cutoff_label(label,column,unit=""):
                     _rule=_attendance_color_rules.get(column)
+                    if not pd.to_numeric(_att_df.get(column,pd.Series(dtype=float)),errors="coerce").gt(0).any():
+                        return f"{label}: sin casos positivos (0 verde)"
                     if not _rule: return f"{label}: sin casos positivos"
                     _yellow_max=_rule[1]-1
                     if _yellow_max<_rule[0]:
