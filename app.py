@@ -54,6 +54,35 @@ button[kind="primary"]:hover { background:#a91f21; border-color:#a91f21; }
 </style>
 """, unsafe_allow_html=True)
 
+@st.cache_data(show_spinner=False, max_entries=4)
+def parse_oneoff_area_fnr(data):
+    """Lee un Excel puntual de faltantes por artículo, sin guardar el archivo en la nube."""
+    try:
+        raw=pd.read_excel(io.BytesIO(data))
+    except Exception as exc:
+        raise ValueError(f"No pude abrir el Excel: {exc}") from exc
+    columns={str(c).strip().casefold().replace("_"," ").replace("-"," "):c for c in raw.columns}
+    def pick(*names):
+        for name in names:
+            key=name.casefold().replace("_"," ").replace("-"," ")
+            if key in columns: return columns[key]
+        return None
+    date_col=pick("date","fecha")
+    product_col=pick("product","producto","article","articulo")
+    department_col=pick("department","departamento","area","área")
+    order_col=pick("order number","order_number","pedido","numero de pedido")
+    if date_col is None or product_col is None or department_col is None:
+        raise ValueError("El Excel debe incluir columnas de fecha, artículo/producto y departamento.")
+    out=pd.DataFrame({
+        "Fecha":pd.to_datetime(raw[date_col],errors="coerce"),
+        "Artículo":raw[product_col].astype("string").str.strip(),
+        "Departamento":raw[department_col].astype("string").str.strip(),
+    })
+    out["Pedido"]=raw[order_col].astype("string").str.strip() if order_col is not None else pd.NA
+    out=out.dropna(subset=["Fecha","Artículo","Departamento"])
+    out=out[out["Artículo"].ne("") & out["Departamento"].ne("")]
+    return out.reset_index(drop=True)
+
 @st.cache_data(show_spinner=False, max_entries=12)
 def sheets_from_bytes(data):
     """Lee un Excel una sola vez por contenido; evita releer los mismos archivos en cada rerun."""
@@ -2570,6 +2599,57 @@ if _tab_active(x):
             for ek,ov in store.get("master_overrides",{}).items(): manual_rows.append({"CORREO":ov.get("CORREO",ek),"PICKER":ov.get("PICKER",""),"TURNO":ov.get("TURNO",""),"SUPERVISOR":ov.get("SUPERVISOR",""),"AREA":ov.get("AREA_BASE",""),"FECHA":ov.get("FECHA","")})
             if manual_rows: st.dataframe(pd.DataFrame(manual_rows),use_container_width=True,hide_index=True)
             else: st.info("Todavía no hay asignaciones manuales.")
+
+        st.divider()
+        st.markdown("### 📊 Análisis puntual de FNR · otra área")
+        st.caption("Carga un Excel cuando necesites revisarlo. El archivo se analiza aquí y no se incorpora a los datos operativos ni al respaldo en nube.")
+        _other_area_upload=st.file_uploader("Excel de FNR de otra área",type=["xlsx","xls"],key="oneoff_area_fnr_upload")
+        if _other_area_upload is not None:
+            try:
+                _other_fnr=parse_oneoff_area_fnr(_other_area_upload.getvalue())
+                if _other_fnr.empty:
+                    st.info("El archivo no contiene filas con fecha, artículo y departamento.")
+                else:
+                    _dept_counts=(_other_fnr.groupby("Departamento").size().rename("Reportes FNR").reset_index()
+                        .sort_values("Reportes FNR",ascending=False))
+                    _article_counts=(_other_fnr.groupby(["Departamento","Artículo"]).size().rename("Reportes FNR").reset_index()
+                        .sort_values(["Reportes FNR","Artículo"],ascending=[False,True]))
+                    _article_totals=(_other_fnr.groupby("Artículo").size().sort_values(ascending=False))
+                    _daily=(_other_fnr.groupby("Fecha").size().rename("Reportes FNR")
+                        .reindex(pd.date_range(_other_fnr["Fecha"].min().normalize(),_other_fnr["Fecha"].max().normalize(),freq="D"),fill_value=0)
+                        .rename_axis("Fecha").reset_index())
+                    _valid_orders=_other_fnr["Pedido"].dropna().astype(str).str.strip()
+                    _valid_orders=_valid_orders[_valid_orders.ne("")]
+                    _top_day=_daily.loc[_daily["Reportes FNR"].idxmax()]
+                    _top_dept=_dept_counts.iloc[0]
+                    _top_article=_article_totals.index[0]
+                    _top_article_count=int(_article_totals.iloc[0])
+                    st.caption(f"{len(_other_fnr):,} registros de artículo · {_valid_orders.nunique():,} pedidos · {_other_fnr['Artículo'].nunique():,} artículos · {_other_fnr['Departamento'].nunique():,} departamentos. Cada registro cuenta un artículo reportado, no unidades físicas.")
+                    _a1,_a2,_a3,_a4=st.columns(4)
+                    _a1.metric("Registros FNR",f"{len(_other_fnr):,}")
+                    _a2.metric("Departamento con más",str(_top_dept["Departamento"]),f"{int(_top_dept['Reportes FNR']):,} registros")
+                    _a3.metric("Artículo más reportado",str(_top_article),f"{_top_article_count:,} registros")
+                    _a4.metric("Día con más reportes",_top_day["Fecha"].strftime("%d/%m/%Y"),f"{int(_top_day['Reportes FNR']):,} registros")
+                    _ch1,_ch2=st.columns(2)
+                    with _ch1:
+                        st.markdown("**Reportes FNR por departamento**")
+                        st.bar_chart(_dept_counts.set_index("Departamento"),horizontal=True)
+                    with _ch2:
+                        st.markdown("**Reportes FNR por día**")
+                        st.line_chart(_daily.set_index("Fecha"))
+                    st.markdown("**Conteo por artículo**")
+                    _f1,_f2=st.columns([1,2])
+                    with _f1:
+                        _dept_options=["Todos"]+_dept_counts["Departamento"].tolist()
+                        _dept_choice=st.selectbox("Departamento",_dept_options,key="oneoff_fnr_department_filter")
+                    with _f2:
+                        _article_query=st.text_input("Buscar artículo",key="oneoff_fnr_article_search",placeholder="Escribe parte del nombre")
+                    _article_view=_article_counts if _dept_choice=="Todos" else _article_counts[_article_counts["Departamento"]==_dept_choice]
+                    if _article_query.strip():
+                        _article_view=_article_view[_article_view["Artículo"].str.contains(_article_query.strip(),case=False,na=False)]
+                    st.dataframe(_article_view,use_container_width=True,hide_index=True,height=420)
+            except Exception as _other_fnr_error:
+                st.error(f"No pude analizar ese archivo: {_other_fnr_error}")
 
 if _tab_active(g):
     with g:
