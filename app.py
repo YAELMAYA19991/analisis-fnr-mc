@@ -2177,11 +2177,12 @@ if _tab_active(a):
         render_turn_comparison(base_bodega,base_reference,fnr_bodega,fnr_reference,mc_bodega,mc_reference)
 
         st.subheader("Indicador operativo por líneas")
-        k=st.columns(2)
         fnr_lines_rate=F/lines*100 if lines else None
         mc_lines_rate=M/lines*100 if lines else None
-        k[0].metric("FNR / líneas",f"{fnr_lines_rate:.2f}%" if fnr_lines_rate is not None else "N/D")
-        k[1].metric("MC / líneas",f"{mc_lines_rate:.2f}%" if mc_lines_rate is not None else "N/D")
+        render_soft_kpis([
+            ("FNR / líneas",f"{fnr_lines_rate:.2f}%" if fnr_lines_rate is not None else "N/D",f"Objetivo < {FNR_OBJ:.2f}%",_severity_tone(fnr_lines_rate,FNR_OBJ*.8,FNR_OBJ)),
+            ("MC / líneas",f"{mc_lines_rate:.2f}%" if mc_lines_rate is not None else "N/D",f"Objetivo < {MC_OBJ:.2f}%",_severity_tone(mc_lines_rate,MC_OBJ*.8,MC_OBJ)),
+        ])
         st.caption(f"Semáforo por picker: FNR verde < {FNR_OBJ*.8:.2f}%, amarillo {FNR_OBJ*.8:.2f}–<{FNR_OBJ:.2f}%, rojo ≥ {FNR_OBJ:.2f}% · MC verde < {MC_OBJ*.8:.2f}%, amarillo {MC_OBJ*.8:.2f}–<{MC_OBJ:.2f}%, rojo ≥ {MC_OBJ:.2f}%.")
         st.subheader("Detalle por picker")
         st.dataframe(_style_severity(s_bodega,{"FNR_%":(FNR_OBJ*.8,FNR_OBJ),"MC_%":(MC_OBJ*.8,MC_OBJ)}),use_container_width=True,hide_index=True)
