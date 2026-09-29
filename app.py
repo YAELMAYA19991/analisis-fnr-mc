@@ -15,7 +15,7 @@ import streamlit as st
 import qrcode
 from zoneinfo import ZoneInfo
 
-st.set_page_config(page_title="Control FNR & Mala Calidad", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Control FNR & Mala Calidad", page_icon="🥑", layout="wide", initial_sidebar_state="expanded")
 
 # Estilo visual inspirado en la interfaz limpia de Jüsto: blanco, rojo de marca y tarjetas suaves.
 st.markdown("""
@@ -1728,7 +1728,19 @@ def export(summary,fnr,mc,picker,roster=None):
     return b.getvalue()
 
 st.markdown('<div class="justo-kicker">Operación · Coyoacán</div>', unsafe_allow_html=True)
-st.title("📊 Control FNR & Mala Calidad")
+st.markdown("""
+<div style="display:flex;align-items:center;gap:14px;margin:.5rem 0 .15rem;">
+  <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 80 80" role="img" aria-label="Dibujo de un aguacate">
+    <path d="M39 9c2-5 8-7 13-5-1 6-6 10-12 10" fill="#72a848"/>
+    <path d="M42 14c-5-7-14-8-20-3-6 5-8 14-11 23-4 11-6 19-2 28 5 12 18 16 31 14 14-2 26-10 28-23 2-10-4-22-10-31-4-6-9-10-15-8z" fill="#3f7d3b"/>
+    <path d="M41 19c-5-5-12-5-17-1-5 5-7 13-10 21-3 9-5 16-1 23 4 9 15 12 26 10 12-2 21-8 23-19 2-8-3-19-8-27-4-5-8-8-13-7z" fill="#a8d66d"/>
+    <path d="M40 32c-8 0-14 7-14 15 0 9 7 15 15 15s15-6 15-15c0-8-7-15-16-15z" fill="#87522f"/>
+    <path d="M40 37c-5 0-9 5-9 10s4 10 10 10 10-5 10-10-5-10-11-10z" fill="#a9683b"/>
+    <path d="M19 22c-1-7 3-13 10-15 3 7 1 13-5 17" fill="#78a944"/>
+  </svg>
+  <h1 style="margin:0;color:#272936;font-size:2.45rem;line-height:1.15;font-weight:750;">Control FNR &amp; Mala Calidad</h1>
+</div>
+""", unsafe_allow_html=True)
 st.caption("Control operativo de pickers, calidad, seguimiento y procesos")
 
 # Estado persistente: se carga antes de construir los widgets.
