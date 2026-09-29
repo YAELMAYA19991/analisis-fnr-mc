@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import qrcode
+from zoneinfo import ZoneInfo
 
 st.set_page_config(page_title="Control FNR & Mala Calidad", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
 
@@ -644,6 +645,74 @@ def save_store(store):
         write_local(cloud_payload)
     else:
         write_local(payload)
+
+def parse_powerbi_krs_excel(data, filename=""):
+    """Extrae On Time, FNR y Mala Calidad de la hoja exportada desde Power BI."""
+    try:
+        sheets=pd.read_excel(io.BytesIO(data),sheet_name=None)
+    except Exception as exc:
+        raise ValueError(f"No pude abrir el Excel: {exc}") from exc
+    selected=None
+    for sheet_name,frame in sheets.items():
+        frame=frame.copy()
+        frame.columns=[str(c).strip() for c in frame.columns]
+        lower={str(c).strip().casefold():c for c in frame.columns}
+        kr_col=next((v for k,v in lower.items() if k in {"kr","indicador","nombre kr"}),None)
+        value_col=next((v for k,v in lower.items() if k in {"valor","value"}),None)
+        if kr_col is not None and value_col is not None:
+            selected=(sheet_name,frame,kr_col,value_col,lower)
+            break
+    if selected is None:
+        raise ValueError("No encontré una tabla con las columnas KR y Valor. En Power BI descarga los datos de la tabla de indicadores.")
+
+    sheet_name,frame,kr_col,value_col,lower=selected
+    def find_col(*names):
+        for name in names:
+            if name.casefold() in lower: return lower[name.casefold()]
+        return None
+    target_col=find_col("Meta MTD","Meta")
+    def as_percent(value):
+        if pd.isna(value): return None
+        if isinstance(value,str):
+            cleaned=value.strip().replace(",","")
+            has_percent="%" in cleaned
+            cleaned=cleaned.replace("%","").strip()
+            try: number=float(cleaned)
+            except (TypeError,ValueError): return None
+            if not has_percent and abs(number)<=1: number*=100
+            return round(number,4)
+        try: number=float(value)
+        except (TypeError,ValueError): return None
+        if abs(number)<=1: number*=100
+        return round(number,4)
+
+    definitions={
+        "On Time":lambda text:"on time" in text,
+        "FNR":lambda text:"fnr" in text and ("no report" in text or "no reportad" in text or "faltantes no" in text),
+        "Mala Calidad":lambda text:"mala calidad" in text,
+    }
+    indicators={}
+    for _,row in frame.iterrows():
+        label=str(row.get(kr_col,"")).strip()
+        normalized=label.casefold()
+        for name,matcher in definitions.items():
+            if name not in indicators and matcher(normalized):
+                indicators[name]={"valor":as_percent(row.get(value_col)),"meta":as_percent(row.get(target_col)) if target_col else None,"nombre_fuente":label}
+    missing=[name for name in definitions if name not in indicators or indicators[name]["valor"] is None]
+    if missing:
+        raise ValueError("Faltan estos indicadores o no pude leer sus valores: " + ", ".join(missing) + ". Revisa que el Excel incluya On Time, FNR y Mala calidad.")
+
+    all_text="\n".join(str(value) for sheet in sheets.values() for value in sheet.to_numpy().ravel() if pd.notna(value))
+    period_match=re.search(r"MesAño\s+es\s+([^\r\n]+)",all_text,re.IGNORECASE)
+    store_match=re.search(r"Tienda\s+es\s+([^\r\n]+)",all_text,re.IGNORECASE)
+    period=period_match.group(1).strip() if period_match else "No indicado"
+    store_name=store_match.group(1).strip() if store_match else "No indicada"
+    if "coyoac" in store_name.casefold(): store_name="Coyoacán"
+    local_now=datetime.now(ZoneInfo("America/Mexico_City"))
+    fingerprint=hashlib.sha256(data).hexdigest()
+    return {"fecha":local_now.strftime("%Y-%m-%d"),"cargado":local_now.strftime("%Y-%m-%d %H:%M:%S"),
+            "periodo":period,"tienda":store_name,"archivo":_safe_filename(filename),
+            "huella":fingerprint,"indicadores":indicators}
 
 def normalize_followup_category(value):
     """Reduce los nombres históricos al catálogo operativo de tres categorías."""
@@ -1648,6 +1717,7 @@ store.setdefault("upload_meta", {})
 store.setdefault("attendance_summary", None)
 store.setdefault("attendance_meta", {})
 store.setdefault("attendance_links", {})
+store.setdefault("powerbi_krs_history", [])
 if normalize_saved_followup_categories(store):
     save_store(store)
 
@@ -2902,6 +2972,63 @@ if _tab_active(h):
 
 if _tab_active(x):
     with x:
+        st.divider()
+        st.markdown("### 📊 Indicadores diarios de Power BI")
+        st.caption("Descarga desde Power BI el Excel de la tabla de indicadores de Operaciones y súbelo aquí. Guardaremos On Time, FNR y Mala Calidad con la fecha de carga para conservar el historial en la nube.")
+        with st.form("powerbi_krs_upload_form",clear_on_submit=True):
+            _krs_upload=st.file_uploader("Excel de indicadores de Power BI",type=["xlsx","xls"],key="powerbi_krs_excel_upload")
+            _krs_submit=st.form_submit_button("Guardar valores del día",type="primary")
+        if _krs_submit:
+            if _krs_upload is None:
+                st.warning("Selecciona primero el Excel descargado desde Power BI.")
+            else:
+                try:
+                    _snapshot=parse_powerbi_krs_excel(_krs_upload.getvalue(),_krs_upload.name)
+                    if _snapshot.get("tienda") not in {"Coyoacán","Coyoacan"}:
+                        st.error(f"El archivo indica tienda: {_snapshot.get('tienda','No indicada')}. Para evitar mezclar resultados, descarga el reporte con Coyoacán seleccionado y vuelve a subirlo.")
+                    else:
+                        _krs_history=store.setdefault("powerbi_krs_history",[])
+                        _same_day=next((n for n,item in enumerate(_krs_history) if item.get("fecha")==_snapshot["fecha"] and item.get("periodo")==_snapshot["periodo"] and item.get("tienda")==_snapshot["tienda"]),None)
+                        if _same_day is not None and _krs_history[_same_day].get("huella")==_snapshot["huella"]:
+                            st.info("Este mismo Excel ya está guardado para hoy; no agregué un duplicado.")
+                        else:
+                            if _same_day is None: _krs_history.append(_snapshot)
+                            else: _krs_history[_same_day]=_snapshot
+                            _krs_history.sort(key=lambda item:(str(item.get("fecha","")),str(item.get("cargado",""))))
+                            store["powerbi_krs_history"]=_krs_history
+                            save_store(store)
+                            st.success(f"Valores guardados en el historial: {_snapshot['fecha']} · {_snapshot['periodo']} · Coyoacán.")
+                except Exception as _krs_error:
+                    st.error(f"No pude leer ese Excel: {_krs_error}")
+
+        _krs_history=store.get("powerbi_krs_history",[]) or []
+        if _krs_history:
+            _latest=_krs_history[-1]
+            st.caption(f"Último registro: {_latest.get('fecha','')} · Periodo del reporte: {_latest.get('periodo','')} · Cargas guardadas: {len(_krs_history)}")
+            _metric_cols=st.columns(3)
+            for _col,_name in zip(_metric_cols,["On Time","FNR","Mala Calidad"]):
+                _item=(_latest.get("indicadores",{}) or {}).get(_name,{})
+                _value=_item.get("valor")
+                _target=_item.get("meta")
+                _col.metric(_name,f"{float(_value):.2f}%" if _value is not None else "N/D",f"Meta: {float(_target):.2f}%" if _target is not None else "Meta no incluida")
+            _history_rows=[]
+            for _snap in _krs_history:
+                _row={"Fecha de carga":_snap.get("fecha",""),"Periodo":_snap.get("periodo",""),"Tienda":_snap.get("tienda","")}
+                for _name in ["On Time","FNR","Mala Calidad"]:
+                    _v=(_snap.get("indicadores",{}) or {}).get(_name,{}).get("valor")
+                    _row[_name]=float(_v) if _v is not None else None
+                _history_rows.append(_row)
+            _history_df=pd.DataFrame(_history_rows)
+            _history_df["Fecha de carga"]=pd.to_datetime(_history_df["Fecha de carga"],errors="coerce")
+            _history_df=_history_df.dropna(subset=["Fecha de carga"]).sort_values("Fecha de carga")
+            if len(_history_df)>1:
+                st.markdown("**Tendencia de los valores guardados (%)**")
+                st.line_chart(_history_df.set_index("Fecha de carga")[["On Time","FNR","Mala Calidad"]],use_container_width=True)
+            st.dataframe(_history_df.sort_values("Fecha de carga",ascending=False).assign(**{"Fecha de carga":lambda df:df["Fecha de carga"].dt.strftime("%Y-%m-%d")}),use_container_width=True,hide_index=True)
+            st.caption("Para tener un punto nuevo en la gráfica, sube el Excel de Power BI cada día. Si corriges la carga del mismo día y periodo, se reemplaza ese día sin borrar el resto del historial.")
+        else:
+            st.info("Aún no hay valores de Power BI guardados. Sube el primer Excel para iniciar el historial diario.")
+
         st.divider()
         st.markdown("### 📤 Exportar")
         st.download_button("📥 Descargar Excel completo",export(s,fnr,mc,None if sp=="Todos" else sp,roster),f"Analisis_FNR_MC_{periodo}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
