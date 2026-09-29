@@ -1788,6 +1788,73 @@ with st.sidebar:
     store["excluded_orders"]=sorted(excluded)
     save_store(store)
 
+# Indicadores de Power BI: visibles en portada, sin entrar a una pestaña.
+with st.container(border=True):
+    st.markdown("### 📊 Indicadores diarios · Coyoacán")
+    _krs_history=store.get("powerbi_krs_history",[]) or []
+    _home_latest=_krs_history[-1] if _krs_history else None
+    _home_metrics,_home_upload=st.columns([3.2,1.25],gap="small")
+    with _home_upload:
+        with st.form("powerbi_krs_upload_home_form",clear_on_submit=True):
+            _krs_upload=st.file_uploader("Excel de Power BI",type=["xlsx","xls"],key="powerbi_krs_excel_upload_home")
+            _krs_submit=st.form_submit_button("Guardar valores",type="primary",use_container_width=True)
+    if _krs_submit:
+        if _krs_upload is None:
+            st.warning("Selecciona primero el Excel descargado desde Power BI.")
+        else:
+            try:
+                _snapshot=parse_powerbi_krs_excel(_krs_upload.getvalue(),_krs_upload.name)
+                if _snapshot.get("tienda") not in {"Coyoacán","Coyoacan"}:
+                    st.error(f"El archivo indica tienda: {_snapshot.get('tienda','No indicada')}. Selecciona Coyoacán en Power BI para guardar estos indicadores.")
+                else:
+                    _krs_history=store.setdefault("powerbi_krs_history",[])
+                    _same_day=next((n for n,item in enumerate(_krs_history) if item.get("fecha")==_snapshot["fecha"] and item.get("periodo")==_snapshot["periodo"] and item.get("tienda")==_snapshot["tienda"]),None)
+                    if _same_day is not None and _krs_history[_same_day].get("huella")==_snapshot["huella"]:
+                        st.info("Este Excel ya está guardado para hoy; no agregué un duplicado.")
+                    else:
+                        if _same_day is None: _krs_history.append(_snapshot)
+                        else: _krs_history[_same_day]=_snapshot
+                        _krs_history.sort(key=lambda item:(str(item.get("fecha","")),str(item.get("cargado",""))))
+                        store["powerbi_krs_history"]=_krs_history
+                        save_store(store)
+                        st.success(f"Valores guardados: {_snapshot['fecha']} · {_snapshot['periodo']} · Coyoacán.")
+                    _home_latest=store.get("powerbi_krs_history",[])[-1]
+            except Exception as _krs_error:
+                st.error(f"No pude leer ese Excel: {_krs_error}")
+    with _home_metrics:
+        if _home_latest:
+            st.caption(f"Última carga: {_home_latest.get('fecha','')} · Periodo: {_home_latest.get('periodo','')} · Verde = en meta · Rojo = fuera de meta")
+            _home_card_cols=st.columns(3,gap="small")
+            for _col,_name in zip(_home_card_cols,["On Time","FNR","Mala Calidad"]):
+                _item=(_home_latest.get("indicadores",{}) or {}).get(_name,{})
+                _value=_item.get("valor"); _target=_item.get("meta")
+                _outside=False
+                if _value is not None and _target is not None:
+                    _outside=float(_value)<float(_target) if _name=="On Time" else float(_value)>float(_target)
+                _tone="#fff1f2" if _outside else ("#f0fdf4" if _value is not None and _target is not None else "#f8fafc")
+                _edge="#fca5a5" if _outside else ("#86efac" if _value is not None and _target is not None else "#cbd5e1")
+                _state="FUERA DE META" if _outside else ("EN META" if _value is not None and _target is not None else "SIN META")
+                _value_text=f"{float(_value):.2f}%" if _value is not None else "N/D"
+                _target_text=f"Meta: {float(_target):.2f}%" if _target is not None else "Meta no incluida"
+                _col.markdown(f"<div style='background:{_tone};border:1px solid {_edge};border-radius:12px;padding:10px 12px;min-height:92px'><div style='font-size:.82rem;color:#4b5563'>{_name}</div><div style='font-size:1.45rem;font-weight:750;color:#272936'>{_value_text}</div><div style='font-size:.74rem;color:{'#b4232c' if _outside else '#15803d' if _value is not None and _target is not None else '#6b7280'};font-weight:700'>{_state} · {_target_text}</div></div>",unsafe_allow_html=True)
+            with st.expander(f"Ver historial ({len(_krs_history)} cargas)",expanded=False):
+                _history_rows=[]
+                for _snap in _krs_history:
+                    _row={"Fecha":_snap.get("fecha",""),"Periodo":_snap.get("periodo",""),"Tienda":_snap.get("tienda","")}
+                    for _name in ["On Time","FNR","Mala Calidad"]:
+                        _v=(_snap.get("indicadores",{}) or {}).get(_name,{}).get("valor")
+                        _row[_name]=float(_v) if _v is not None else None
+                    _history_rows.append(_row)
+                _history_df=pd.DataFrame(_history_rows)
+                _history_df["Fecha"]=pd.to_datetime(_history_df["Fecha"],errors="coerce")
+                _history_df=_history_df.dropna(subset=["Fecha"]).sort_values("Fecha")
+                if len(_history_df)>1: st.line_chart(_history_df.set_index("Fecha")[["On Time","FNR","Mala Calidad"]],use_container_width=True)
+                _show_history=_history_df.sort_values("Fecha",ascending=False).copy()
+                _show_history["Fecha"]=_show_history["Fecha"].dt.strftime("%Y-%m-%d")
+                st.dataframe(_show_history,use_container_width=True,hide_index=True)
+        else:
+            st.info("Sube el Excel para mostrar aquí On Time, FNR y Mala Calidad. Los valores se guardarán con la fecha y quedarán en el historial.")
+
 if not (ub and uf and um and up):
     st.info("Carga los 3 Excel operativos y la plantilla consolidada para comenzar. Para que el cruce sea por correo, los registros que deban asociarse deben traer CORREO / CODIGO + CORREO.")
     st.markdown("**Fuentes:** ① Pickers/Líneas · ② FNR · ③ Mala Calidad · ④ Plantilla consolidada (correo → nombre asociado, turno, supervisor y área).")
@@ -2972,63 +3039,6 @@ if _tab_active(h):
 
 if _tab_active(x):
     with x:
-        st.divider()
-        st.markdown("### 📊 Indicadores diarios de Power BI")
-        st.caption("Descarga desde Power BI el Excel de la tabla de indicadores de Operaciones y súbelo aquí. Guardaremos On Time, FNR y Mala Calidad con la fecha de carga para conservar el historial en la nube.")
-        with st.form("powerbi_krs_upload_form",clear_on_submit=True):
-            _krs_upload=st.file_uploader("Excel de indicadores de Power BI",type=["xlsx","xls"],key="powerbi_krs_excel_upload")
-            _krs_submit=st.form_submit_button("Guardar valores del día",type="primary")
-        if _krs_submit:
-            if _krs_upload is None:
-                st.warning("Selecciona primero el Excel descargado desde Power BI.")
-            else:
-                try:
-                    _snapshot=parse_powerbi_krs_excel(_krs_upload.getvalue(),_krs_upload.name)
-                    if _snapshot.get("tienda") not in {"Coyoacán","Coyoacan"}:
-                        st.error(f"El archivo indica tienda: {_snapshot.get('tienda','No indicada')}. Para evitar mezclar resultados, descarga el reporte con Coyoacán seleccionado y vuelve a subirlo.")
-                    else:
-                        _krs_history=store.setdefault("powerbi_krs_history",[])
-                        _same_day=next((n for n,item in enumerate(_krs_history) if item.get("fecha")==_snapshot["fecha"] and item.get("periodo")==_snapshot["periodo"] and item.get("tienda")==_snapshot["tienda"]),None)
-                        if _same_day is not None and _krs_history[_same_day].get("huella")==_snapshot["huella"]:
-                            st.info("Este mismo Excel ya está guardado para hoy; no agregué un duplicado.")
-                        else:
-                            if _same_day is None: _krs_history.append(_snapshot)
-                            else: _krs_history[_same_day]=_snapshot
-                            _krs_history.sort(key=lambda item:(str(item.get("fecha","")),str(item.get("cargado",""))))
-                            store["powerbi_krs_history"]=_krs_history
-                            save_store(store)
-                            st.success(f"Valores guardados en el historial: {_snapshot['fecha']} · {_snapshot['periodo']} · Coyoacán.")
-                except Exception as _krs_error:
-                    st.error(f"No pude leer ese Excel: {_krs_error}")
-
-        _krs_history=store.get("powerbi_krs_history",[]) or []
-        if _krs_history:
-            _latest=_krs_history[-1]
-            st.caption(f"Último registro: {_latest.get('fecha','')} · Periodo del reporte: {_latest.get('periodo','')} · Cargas guardadas: {len(_krs_history)}")
-            _metric_cols=st.columns(3)
-            for _col,_name in zip(_metric_cols,["On Time","FNR","Mala Calidad"]):
-                _item=(_latest.get("indicadores",{}) or {}).get(_name,{})
-                _value=_item.get("valor")
-                _target=_item.get("meta")
-                _col.metric(_name,f"{float(_value):.2f}%" if _value is not None else "N/D",f"Meta: {float(_target):.2f}%" if _target is not None else "Meta no incluida")
-            _history_rows=[]
-            for _snap in _krs_history:
-                _row={"Fecha de carga":_snap.get("fecha",""),"Periodo":_snap.get("periodo",""),"Tienda":_snap.get("tienda","")}
-                for _name in ["On Time","FNR","Mala Calidad"]:
-                    _v=(_snap.get("indicadores",{}) or {}).get(_name,{}).get("valor")
-                    _row[_name]=float(_v) if _v is not None else None
-                _history_rows.append(_row)
-            _history_df=pd.DataFrame(_history_rows)
-            _history_df["Fecha de carga"]=pd.to_datetime(_history_df["Fecha de carga"],errors="coerce")
-            _history_df=_history_df.dropna(subset=["Fecha de carga"]).sort_values("Fecha de carga")
-            if len(_history_df)>1:
-                st.markdown("**Tendencia de los valores guardados (%)**")
-                st.line_chart(_history_df.set_index("Fecha de carga")[["On Time","FNR","Mala Calidad"]],use_container_width=True)
-            st.dataframe(_history_df.sort_values("Fecha de carga",ascending=False).assign(**{"Fecha de carga":lambda df:df["Fecha de carga"].dt.strftime("%Y-%m-%d")}),use_container_width=True,hide_index=True)
-            st.caption("Para tener un punto nuevo en la gráfica, sube el Excel de Power BI cada día. Si corriges la carga del mismo día y periodo, se reemplaza ese día sin borrar el resto del historial.")
-        else:
-            st.info("Aún no hay valores de Power BI guardados. Sube el primer Excel para iniciar el historial diario.")
-
         st.divider()
         st.markdown("### 📤 Exportar")
         st.download_button("📥 Descargar Excel completo",export(s,fnr,mc,None if sp=="Todos" else sp,roster),f"Analisis_FNR_MC_{periodo}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
