@@ -2568,7 +2568,7 @@ if _tab_active(i):
                                 if not any(_existing.get("url")==_link.get("url") for _existing in _document_links):
                                     _document_links.append(_link)
                             _invalid_links=[]
-                            for _raw_link in re.split(r"[\\n,;]+",_att_other_links):
+                            for _raw_link in re.split(r"[\n,;]+",_att_other_links):
                                 _url=_raw_link.strip()
                                 if not _url: continue
                                 if not _url.startswith(("https://","http://")):
