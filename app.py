@@ -612,7 +612,7 @@ def load_store():
     if cloud_data is not None:
         data=json.loads(cloud_data.decode("utf-8"))
         if not isinstance(data,dict): raise RuntimeError("El expediente guardado en la nube no contiene un objeto JSON válido.")
-        for key,value in {"pickers":{},"feedback_rows":[],"recursos_formatos":[],"procesos":[],"excluded_orders":[],"master_overrides":{},"master_excluded":[],"seguimientos_documentos":[],"supervisores":[],"upload_meta":{},"attendance_summary":None,"attendance_meta":{},"attendance_links":{},"order_audits":[]}.items(): data.setdefault(key,value)
+        for key,value in {"pickers":{},"feedback_rows":[],"recursos_formatos":[],"procesos":[],"excluded_orders":[],"master_overrides":{},"master_excluded":[],"seguimientos_documentos":[],"supervisores":[],"upload_meta":{},"attendance_summary":None,"attendance_meta":{},"attendance_links":{},"order_audits":[],"monthly_history":{}}.items(): data.setdefault(key,value)
         try:
             with open(STORE_FILE,"wb") as f: f.write(json.dumps(data,ensure_ascii=False,indent=2).encode("utf-8"))
         except OSError: pass
@@ -639,11 +639,12 @@ def load_store():
                 data.setdefault("attendance_meta", {})
                 data.setdefault("attendance_links", {})
                 data.setdefault("order_audits", [])
+                data.setdefault("monthly_history", {})
                 if path != STORE_FILE or cloud_enabled(): save_store(data)
                 return data
             except Exception:
                 continue
-    data={"pickers": {}, "feedback_rows": [], "recursos_formatos": [], "procesos": [], "excluded_orders": [], "master_overrides": {}, "master_excluded": [], "seguimientos_documentos": [], "supervisores": [], "upload_meta": {}, "attendance_summary": None, "attendance_meta": {}, "attendance_links": {}, "order_audits": []}
+    data={"pickers": {}, "feedback_rows": [], "recursos_formatos": [], "procesos": [], "excluded_orders": [], "master_overrides": {}, "master_excluded": [], "seguimientos_documentos": [], "supervisores": [], "upload_meta": {}, "attendance_summary": None, "attendance_meta": {}, "attendance_links": {}, "order_audits": [], "monthly_history": {}}
     if cloud_enabled(): save_store(data)
     return data
 
@@ -1460,6 +1461,33 @@ def prepare_source_frames(base_data,fnr_data,mc_data,roster_data,personnel_confi
     fnr=_dedupe_columns(fnr); mc=_dedupe_columns(mc)
     return base,fnr,mc,roster
 
+@st.cache_data(show_spinner="Procesando histórico del mes anterior…",max_entries=4,ttl=1800)
+def prepare_history_frames(base_data,fnr_data,mc_data,roster,personnel_config_json):
+    """Procesa los mismos 3 Excel operativos de un periodo anterior.
+
+    Se usa la plantilla consolidada actual como identidad canónica para poder
+    comparar al mismo picker entre periodos sin pedir un cuarto archivo.
+    """
+    config=json.loads(personnel_config_json)
+    hist_base=parse_base(choose(sheets_from_bytes(base_data),["picker","lineas","resumen"]))
+    hist_fnr=parse_inc(choose(sheets_from_bytes(fnr_data),["fnr","detalle"]),"FNR")
+    hist_mc=parse_inc(choose(sheets_from_bytes(mc_data),["mc","mala"]),"MC")
+    hist_base=apply_roster(hist_base,roster)
+    hist_base=apply_manual_personnel(hist_base,config)
+    matched=(hist_base.get("_MASTER_MATCH",pd.Series(False,index=hist_base.index)).fillna(False).astype(bool)
+             | hist_base.get("_MANUAL_MATCH",pd.Series(False,index=hist_base.index)).fillna(False).astype(bool))
+    hist_base["CATEGORIA"]=np.where(matched,"Picker","Sin registrar")
+    hist_base=_dedupe_columns(hist_base)
+
+    hist_fnr=canonicalize_incidents(hist_fnr,roster)
+    hist_mc=canonicalize_incidents(hist_mc,roster)
+    identity=roster.rename(columns={"TURNO_MAESTRO":"TURNO","AREA_MAESTRO":"AREA_BASE"}).copy()
+    hist_fnr=attach(hist_fnr,identity)
+    hist_mc=attach(hist_mc,identity)
+    hist_fnr["CORREO_KEY"]=hist_fnr.get("CORREO",pd.Series("",index=hist_fnr.index)).map(email_key)
+    hist_mc["CORREO_KEY"]=hist_mc.get("CORREO",pd.Series("",index=hist_mc.index)).map(email_key)
+    return _dedupe_columns(hist_base),_dedupe_columns(hist_fnr),_dedupe_columns(hist_mc)
+
 def summary(base,fnr,mc):
     keys=["CATEGORIA","PICKER"]
     b=base.copy()
@@ -1521,6 +1549,124 @@ def summary(base,fnr,mc):
         return "🟢 EN OBJETIVO"
     s["ESTADO"]=s.apply(sem,axis=1)
     return s
+
+def monthly_history_snapshot(label,summary_df,source_files=None):
+    """Convierte un resumen mensual en un snapshot JSON pequeño y persistente."""
+    x=summary_df.copy()
+    keep=[col for col in ["CATEGORIA","PICKER","CORREO","TURNO","SUPERVISOR","AREA_BASE","LINEAS","PEDIDOS","FNR","MC"] if col in x.columns]
+    x=x[keep].copy()
+    for colname in ["LINEAS","PEDIDOS","FNR","MC"]:
+        if colname not in x.columns: x[colname]=0.0
+        x[colname]=pd.to_numeric(x[colname],errors="coerce").fillna(0.0)
+    lines=float(x["LINEAS"].sum())
+    fnr_total=float(x["FNR"].sum())
+    mc_total=float(x["MC"].sum())
+    pedidos=float(x["PEDIDOS"].sum())
+    snapshot={
+        "periodo":str(label).strip() or "Periodo anterior",
+        "guardado":datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "archivos":source_files or {},
+        "totales":{
+            "lineas":lines,
+            "pedidos":pedidos,
+            "fnr":fnr_total,
+            "mc":mc_total,
+            "fnr_pct":(fnr_total/lines*100) if lines else None,
+            "mc_pct":(mc_total/lines*100) if lines else None,
+            "incidencias":fnr_total+mc_total,
+            "incidencias_1000":((fnr_total+mc_total)/lines*1000) if lines else None,
+        },
+        "pickers":json.loads(x.to_json(orient="records",force_ascii=False)),
+    }
+    return snapshot
+
+def monthly_picker_comparison(current_summary,previous_rows):
+    """Compara producción e incidencias por identidad canónica entre dos periodos."""
+    def rollup(frame,suffix):
+        x=frame.copy() if isinstance(frame,pd.DataFrame) else pd.DataFrame(frame or [])
+        if x.empty:
+            return pd.DataFrame(columns=["_CMP_KEY",f"Picker {suffix}",f"Líneas {suffix}",f"FNR {suffix}",f"MC {suffix}"])
+        for colname in ["PICKER","CORREO","LINEAS","FNR","MC"]:
+            if colname not in x.columns:
+                x[colname]="" if colname in {"PICKER","CORREO"} else 0.0
+        x["PICKER"]=x["PICKER"].fillna("").astype(str).str.strip()
+        x["CORREO"]=x["CORREO"].fillna("").astype(str).str.strip()
+        _email=x["CORREO"].map(email_key)
+        _name=x["PICKER"].map(person_key)
+        x["_CMP_KEY"]=[
+            ("email:"+ek) if ek else (("name:"+nk) if nk else ("row:"+str(idx)))
+            for idx,(ek,nk) in enumerate(zip(_email,_name))
+        ]
+        for colname in ["LINEAS","FNR","MC"]:
+            x[colname]=pd.to_numeric(x[colname],errors="coerce").fillna(0.0)
+        rows=[]
+        for key,g in x.groupby("_CMP_KEY",sort=False):
+            name=next((str(v).strip() for v in g["PICKER"] if str(v).strip()),"Sin registrar")
+            rows.append({
+                "_CMP_KEY":key,
+                f"Picker {suffix}":name,
+                f"Líneas {suffix}":float(g["LINEAS"].sum()),
+                f"FNR {suffix}":float(g["FNR"].sum()),
+                f"MC {suffix}":float(g["MC"].sum()),
+            })
+        return pd.DataFrame(rows)
+
+    cur=rollup(current_summary,"actual")
+    prev=rollup(pd.DataFrame(previous_rows or []),"anterior")
+    out=prev.merge(cur,on="_CMP_KEY",how="outer")
+    for colname in ["Picker anterior","Picker actual"]:
+        if colname not in out.columns: out[colname]=""
+        out[colname]=out[colname].fillna("").astype(str)
+    out["Picker"]=out["Picker actual"].where(out["Picker actual"].str.strip().ne(""),out["Picker anterior"])
+    for colname in ["Líneas anterior","Líneas actual","FNR anterior","FNR actual","MC anterior","MC actual"]:
+        if colname not in out.columns: out[colname]=0.0
+        out[colname]=pd.to_numeric(out[colname],errors="coerce").fillna(0.0)
+
+    out["Δ líneas"]=out["Líneas actual"]-out["Líneas anterior"]
+    out["% Δ líneas"]=np.where(out["Líneas anterior"]>0,out["Δ líneas"]/out["Líneas anterior"]*100,np.nan)
+    out["Δ FNR"]=out["FNR actual"]-out["FNR anterior"]
+    out["Δ MC"]=out["MC actual"]-out["MC anterior"]
+    out["Incidencias anterior"]=out["FNR anterior"]+out["MC anterior"]
+    out["Incidencias actual"]=out["FNR actual"]+out["MC actual"]
+    out["Δ incidencias"]=out["Incidencias actual"]-out["Incidencias anterior"]
+
+    out["FNR % anterior"]=np.where(out["Líneas anterior"]>0,out["FNR anterior"]/out["Líneas anterior"]*100,np.nan)
+    out["FNR % actual"]=np.where(out["Líneas actual"]>0,out["FNR actual"]/out["Líneas actual"]*100,np.nan)
+    out["Δ FNR pp"]=out["FNR % actual"]-out["FNR % anterior"]
+    out["MC % anterior"]=np.where(out["Líneas anterior"]>0,out["MC anterior"]/out["Líneas anterior"]*100,np.nan)
+    out["MC % actual"]=np.where(out["Líneas actual"]>0,out["MC actual"]/out["Líneas actual"]*100,np.nan)
+    out["Δ MC pp"]=out["MC % actual"]-out["MC % anterior"]
+    out["Inc./1000 anterior"]=np.where(out["Líneas anterior"]>0,out["Incidencias anterior"]/out["Líneas anterior"]*1000,np.nan)
+    out["Inc./1000 actual"]=np.where(out["Líneas actual"]>0,out["Incidencias actual"]/out["Líneas actual"]*1000,np.nan)
+    out["Δ Inc./1000"]=out["Inc./1000 actual"]-out["Inc./1000 anterior"]
+
+    def trend(row):
+        inc_delta=float(row.get("Δ incidencias",0))
+        line_delta=float(row.get("Δ líneas",0))
+        rate_delta=row.get("Δ Inc./1000",np.nan)
+        if inc_delta<0 and line_delta>=0:
+            return "🟢 Más/igual líneas y menos incidencias"
+        if inc_delta>0 and line_delta<=0:
+            return "🔴 Menos/igual líneas y más incidencias"
+        if pd.notna(rate_delta) and rate_delta<0:
+            return "🟢 Menor tasa de incidencias"
+        if pd.notna(rate_delta) and rate_delta>0:
+            return "🟠 Mayor tasa de incidencias"
+        if line_delta>0:
+            return "🔵 Más líneas, incidencia estable"
+        if line_delta<0:
+            return "⚪ Menos líneas, incidencia estable"
+        return "⚪ Sin cambio"
+    out["Tendencia"]=out.apply(trend,axis=1)
+
+    numeric_round=[
+        "% Δ líneas","FNR % anterior","FNR % actual","Δ FNR pp",
+        "MC % anterior","MC % actual","Δ MC pp",
+        "Inc./1000 anterior","Inc./1000 actual","Δ Inc./1000",
+    ]
+    for colname in numeric_round:
+        out[colname]=pd.to_numeric(out[colname],errors="coerce").round(2)
+    return out.sort_values(["Δ Inc./1000","Δ incidencias"],ascending=[False,False],na_position="last").reset_index(drop=True)
 
 def monthly_kpis(base,fnr,mc):
     total_pedidos=pd.to_numeric(base["PEDIDOS"],errors="coerce").fillna(0).sum()
@@ -2533,6 +2679,160 @@ if _tab_active(a):
             _upload_rows.append({"Archivo":_label,"Última carga":_m.get("fecha","Sin registro"),"Nombre":_m.get("archivo","")})
         with st.expander("📂 Ver última carga de Excel",expanded=False):
             st.dataframe(pd.DataFrame(_upload_rows),use_container_width=True,hide_index=True)
+
+        with st.expander("📊 Histórico · comparar con mes anterior",expanded=False):
+            st.caption("Sube los mismos 3 Excel operativos del periodo anterior. La plantilla actual se usa para identificar a los mismos pickers. Al guardar el histórico, ya no tendrás que volver a subirlo para comparar.")
+            _monthly_history=store.get("monthly_history",{}) or {}
+            _history_options=["➕ Cargar nuevo periodo"]+sorted(_monthly_history.keys(),reverse=True)
+            _history_choice=st.selectbox("Comparar contra",_history_options,key="monthly_history_choice")
+            _history_snapshot=None
+
+            if _history_choice=="➕ Cargar nuevo periodo":
+                _today=datetime.now()
+                _prev_month=12 if _today.month==1 else _today.month-1
+                _prev_year=_today.year-1 if _today.month==1 else _today.year
+                _month_names=["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"]
+                _default_hist_label=f"{_month_names[_prev_month-1]} {_prev_year}"
+                _hist_label=st.text_input("Nombre del periodo",value=_default_hist_label,key="monthly_history_label")
+                _hu1,_hu2,_hu3=st.columns(3)
+                with _hu1:
+                    _hist_base_up=st.file_uploader("① Pickers / líneas · mes anterior",type=["xlsx","xls"],key="monthly_hist_base")
+                with _hu2:
+                    _hist_fnr_up=st.file_uploader("② FNR · mes anterior",type=["xlsx","xls"],key="monthly_hist_fnr")
+                with _hu3:
+                    _hist_mc_up=st.file_uploader("③ Mala Calidad · mes anterior",type=["xlsx","xls"],key="monthly_hist_mc")
+
+                if _hist_base_up and _hist_fnr_up and _hist_mc_up:
+                    try:
+                        _hist_base,_hist_fnr,_hist_mc=prepare_history_frames(
+                            _hist_base_up.getvalue(),_hist_fnr_up.getvalue(),_hist_mc_up.getvalue(),
+                            roster,personnel_config_json
+                        )
+                        _hist_base,_hist_fnr,_hist_mc=exclude_registered_supervisors(_hist_base,_hist_fnr,_hist_mc,store)
+                        _hist_summary=summary(_hist_base,_hist_fnr,_hist_mc)
+                        _history_snapshot=monthly_history_snapshot(
+                            _hist_label,_hist_summary,
+                            {
+                                "pickers":_hist_base_up.name,
+                                "fnr":_hist_fnr_up.name,
+                                "mc":_hist_mc_up.name,
+                            }
+                        )
+                        st.success(f"Periodo leído: {_hist_label} · {len(_hist_summary):,} personas encontradas.")
+                        if st.button("💾 Guardar / actualizar este histórico",type="primary",key="save_monthly_history"):
+                            _clean_label=_hist_label.strip() or _default_hist_label
+                            _history_snapshot["periodo"]=_clean_label
+                            store.setdefault("monthly_history",{})[_clean_label]=_history_snapshot
+                            save_store(store)
+                            st.success(f"Histórico {_clean_label} guardado.")
+                    except Exception as _hist_error:
+                        st.error(f"No pude procesar los 3 Excel históricos: {_hist_error}")
+                else:
+                    st.info("Carga los 3 archivos para generar el comparativo.")
+            else:
+                _history_snapshot=_monthly_history.get(_history_choice)
+                if _history_snapshot:
+                    st.caption(f"Histórico guardado: {_history_snapshot.get('guardado','')}")
+
+            if _history_snapshot:
+                _prev_tot=_history_snapshot.get("totales",{}) or {}
+                _cur_lines=float(pd.to_numeric(s.get("LINEAS",0),errors="coerce").fillna(0).sum())
+                _cur_fnr=float(pd.to_numeric(s.get("FNR",0),errors="coerce").fillna(0).sum())
+                _cur_mc=float(pd.to_numeric(s.get("MC",0),errors="coerce").fillna(0).sum())
+                _prev_lines=float(_prev_tot.get("lineas",0) or 0)
+                _prev_fnr=float(_prev_tot.get("fnr",0) or 0)
+                _prev_mc=float(_prev_tot.get("mc",0) or 0)
+                _cur_fnr_pct=_cur_fnr/_cur_lines*100 if _cur_lines else None
+                _cur_mc_pct=_cur_mc/_cur_lines*100 if _cur_lines else None
+                _prev_fnr_pct=_prev_fnr/_prev_lines*100 if _prev_lines else None
+                _prev_mc_pct=_prev_mc/_prev_lines*100 if _prev_lines else None
+                _cur_inc=_cur_fnr+_cur_mc
+                _prev_inc=_prev_fnr+_prev_mc
+
+                st.markdown(f"#### Actual vs {_history_snapshot.get('periodo','periodo anterior')}")
+                _hc1,_hc2,_hc3,_hc4=st.columns(4)
+                _line_delta=_cur_lines-_prev_lines
+                _line_pct=(_line_delta/_prev_lines*100) if _prev_lines else None
+                _hc1.metric(
+                    "Líneas",
+                    f"{_cur_lines:,.0f}",
+                    f"{_line_delta:+,.0f}" + (f" ({_line_pct:+.1f}%)" if _line_pct is not None else ""),
+                )
+                _fnr_pp=(_cur_fnr_pct-_prev_fnr_pct) if _cur_fnr_pct is not None and _prev_fnr_pct is not None else None
+                _mc_pp=(_cur_mc_pct-_prev_mc_pct) if _cur_mc_pct is not None and _prev_mc_pct is not None else None
+                _hc2.metric(
+                    "FNR",
+                    f"{_cur_fnr:,.0f}" + (f" · {_cur_fnr_pct:.2f}%" if _cur_fnr_pct is not None else ""),
+                    f"{_cur_fnr-_prev_fnr:+,.0f} inc." + (f" · {_fnr_pp:+.2f} pp" if _fnr_pp is not None else ""),
+                    delta_color="inverse",
+                )
+                _hc3.metric(
+                    "MC",
+                    f"{_cur_mc:,.0f}" + (f" · {_cur_mc_pct:.2f}%" if _cur_mc_pct is not None else ""),
+                    f"{_cur_mc-_prev_mc:+,.0f} inc." + (f" · {_mc_pp:+.2f} pp" if _mc_pp is not None else ""),
+                    delta_color="inverse",
+                )
+                _hc4.metric(
+                    "Incidencias totales",
+                    f"{_cur_inc:,.0f}",
+                    f"{_cur_inc-_prev_inc:+,.0f} vs anterior",
+                    delta_color="inverse",
+                )
+
+                _history_compare=monthly_picker_comparison(s,_history_snapshot.get("pickers",[]))
+                _hist_filter=st.selectbox(
+                    "Ver pickers",
+                    ["Todos","🔴 Más incidencias","🟢 Menos incidencias","📈 Subieron líneas","📉 Bajaron líneas","🔴 Mayor tasa de incidencias","🟢 Menor tasa de incidencias"],
+                    key="monthly_history_filter",
+                )
+                _history_view=_history_compare.copy()
+                if _hist_filter=="🔴 Más incidencias":
+                    _history_view=_history_view[_history_view["Δ incidencias"]>0]
+                elif _hist_filter=="🟢 Menos incidencias":
+                    _history_view=_history_view[_history_view["Δ incidencias"]<0]
+                elif _hist_filter=="📈 Subieron líneas":
+                    _history_view=_history_view[_history_view["Δ líneas"]>0]
+                elif _hist_filter=="📉 Bajaron líneas":
+                    _history_view=_history_view[_history_view["Δ líneas"]<0]
+                elif _hist_filter=="🔴 Mayor tasa de incidencias":
+                    _history_view=_history_view[_history_view["Δ Inc./1000"]>0]
+                elif _hist_filter=="🟢 Menor tasa de incidencias":
+                    _history_view=_history_view[_history_view["Δ Inc./1000"]<0]
+
+                _history_cols=[
+                    "Picker",
+                    "Líneas anterior","Líneas actual","Δ líneas","% Δ líneas",
+                    "FNR anterior","FNR actual","Δ FNR","FNR % anterior","FNR % actual","Δ FNR pp",
+                    "MC anterior","MC actual","Δ MC","MC % anterior","MC % actual","Δ MC pp",
+                    "Incidencias anterior","Incidencias actual","Δ incidencias",
+                    "Inc./1000 anterior","Inc./1000 actual","Δ Inc./1000",
+                    "Tendencia",
+                ]
+                st.dataframe(_history_view[_history_cols],use_container_width=True,hide_index=True)
+                st.caption("Inc./1000 líneas ayuda a separar el efecto de producir más o menos volumen: una persona puede tener más incidencias en cantidad, pero una tasa menor si también aumentaron mucho sus líneas.")
+
+                _history_export=io.BytesIO()
+                with pd.ExcelWriter(_history_export,engine="openpyxl") as _hist_writer:
+                    _history_compare.to_excel(_hist_writer,index=False,sheet_name="Comparativo pickers")
+                    pd.DataFrame([{
+                        "Periodo anterior":_history_snapshot.get("periodo",""),
+                        "Líneas anterior":_prev_lines,
+                        "Líneas actual":_cur_lines,
+                        "FNR anterior":_prev_fnr,
+                        "FNR actual":_cur_fnr,
+                        "MC anterior":_prev_mc,
+                        "MC actual":_cur_mc,
+                        "Incidencias anterior":_prev_inc,
+                        "Incidencias actual":_cur_inc,
+                    }]).to_excel(_hist_writer,index=False,sheet_name="Resumen")
+                st.download_button(
+                    "⬇️ Descargar comparativo histórico",
+                    _history_export.getvalue(),
+                    file_name=f"Comparativo_{re.sub(r'[^A-Za-z0-9_-]+','_',str(_history_snapshot.get('periodo','historico')))}_vs_actual.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="download_monthly_history_comparison",
+                )
+
         ctx,turns,sups,areas=global_context(context_identity)
         with st.container(border=True):
             st.markdown("**🎯 Contexto global de análisis**")
