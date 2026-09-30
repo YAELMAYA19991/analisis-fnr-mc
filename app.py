@@ -1554,134 +1554,205 @@ def _audit_item_key(sku="", product=""):
     return "PRODUCTO:"+product_key if product_key else ""
 
 
-def order_risk_analysis(audit_lines,picker_summary,fnr_inc,mc_inc):
-    """Ordena pedidos por señales históricas FNR/MC de picker y artículo.
+def order_risk_analysis(audit_lines,picker_summary,fnr_inc,mc_inc,prior_audits=None):
+    """Prioriza pedidos por coincidencias históricas concretas de picker y artículo.
 
-    La clasificación es preventiva: las tablas de producto contienen conteos
-    de incidencias, no el total vendido por SKU; por tanto no se presentan como
-    probabilidad de que un pedido futuro tenga una incidencia.
+    Reglas principales:
+    - Picker con más de 5 incidencias históricas FNR+MC.
+    - Artículo con al menos 5 FNR o al menos 5 MC.
+    - La coincidencia picker + artículo en el mismo renglón recibe el mayor peso.
+    El puntaje es una regla operativa de foco, no una probabilidad estadística.
     """
     lines=audit_lines.copy()
-    picker_rates={}
-    if picker_summary is not None and not picker_summary.empty:
-        ps=picker_summary.copy()
-        if "CATEGORIA" in ps.columns:
-            ps=ps[ps["CATEGORIA"].astype(str).str.strip().eq("Picker")]
-        for _,row in ps.iterrows():
+    prior_audits=prior_audits or []
+    PICKER_THRESHOLD=5
+    PICKER_EXTRA_THRESHOLD=10
+    ITEM_THRESHOLD=5
+
+    def _incident_amount(row):
+        value=pd.to_numeric(row.get("INCIDENCIAS",1),errors="coerce")
+        return 1.0 if pd.isna(value) or value<=0 else float(value)
+
+    def picker_counts(inc):
+        counts={}
+        if inc is None or inc.empty:
+            return counts
+        for _,row in inc.iterrows():
             key=person_key(row.get("PICKER",""))
             if key:
-                picker_rates[key]={
-                    "FNR_%":pd.to_numeric(row.get("FNR_%"),errors="coerce"),
-                    "MC_%":pd.to_numeric(row.get("MC_%"),errors="coerce"),
-                }
+                counts[key]=counts.get(key,0.0)+_incident_amount(row)
+        return counts
 
     def product_counts(inc):
         counts={}
         if inc is None or inc.empty:
             return counts
         for _,row in inc.iterrows():
-            keys={_audit_item_key(row.get("SKU",""),row.get("PRODUCTO","")),
-                  _audit_item_key("",row.get("PRODUCTO",""))}
+            keys={
+                _audit_item_key(row.get("SKU",""),row.get("PRODUCTO","")),
+                _audit_item_key("",row.get("PRODUCTO","")),
+            }
             keys.discard("")
-            amount=pd.to_numeric(row.get("INCIDENCIAS",1),errors="coerce")
-            amount=1.0 if pd.isna(amount) or amount<=0 else float(amount)
+            amount=_incident_amount(row)
             for key in keys:
                 counts[key]=counts.get(key,0.0)+amount
         return counts
 
+    def order_counts(inc):
+        counts={}
+        if inc is None or inc.empty or "ORDER_NUMBER" not in inc.columns:
+            return counts
+        for _,row in inc.iterrows():
+            key=norm(row.get("ORDER_NUMBER",""))
+            if key:
+                counts[key]=counts.get(key,0.0)+_incident_amount(row)
+        return counts
+
+    fnr_picker=picker_counts(fnr_inc)
+    mc_picker=picker_counts(mc_inc)
     fnr_products=product_counts(fnr_inc)
     mc_products=product_counts(mc_inc)
+    fnr_orders=order_counts(fnr_inc)
+    mc_orders=order_counts(mc_inc)
 
-    def high_item_cutoff(counts):
-        values=[float(v) for k,v in counts.items() if k.startswith("PRODUCTO:") and v>0]
-        if not values:
-            values=[float(v) for v in counts.values() if v>0]
-        if len(values)>=10:
-            return float(np.quantile(values,0.90))
-        if values and max(values)>=2:
-            return float(max(values))
-        return float("inf")
-
-    fnr_top=high_item_cutoff(fnr_products)
-    mc_top=high_item_cutoff(mc_products)
-
-    def classify(rate,target,item_count,top_cutoff):
-        rate=pd.to_numeric(rate,errors="coerce")
-        top_item=item_count>0 and item_count>=top_cutoff
-        if (pd.notna(rate) and rate>=target) or top_item:
-            return "Alta"
-        if (pd.notna(rate) and rate>=target*.8) or item_count>0:
-            return "Atención"
-        if pd.notna(rate):
-            return "Sin señal histórica"
-        return "Datos incompletos"
+    prior_by_order={}
+    for audit in prior_audits:
+        key=norm(audit.get("pedido",""))
+        if not key:
+            continue
+        previous=prior_by_order.get(key)
+        if previous is None or str(audit.get("fecha_auditoria",""))>=str(previous.get("fecha_auditoria","")):
+            prior_by_order[key]=audit
 
     rows=[]
     for _,row in lines.iterrows():
         _picker_value=row.get("Picker","")
         picker_name="" if pd.isna(_picker_value) else str(_picker_value).strip()
         picker_key=person_key(picker_name)
-        rates=picker_rates.get(picker_key,{})
-        fnr_rate=rates.get("FNR_%",np.nan)
-        mc_rate=rates.get("MC_%",np.nan)
+        picker_fnr=float(fnr_picker.get(picker_key,0.0))
+        picker_mc=float(mc_picker.get(picker_key,0.0))
+        picker_total=picker_fnr+picker_mc
+        picker_signal=picker_total>PICKER_THRESHOLD
+
         item_key=_audit_item_key(row.get("SKU",""),row.get("Artículo",""))
         product_key=_audit_item_key("",row.get("Artículo",""))
         fnr_count=float(fnr_products.get(product_key,fnr_products.get(item_key,0.0)))
         mc_count=float(mc_products.get(product_key,mc_products.get(item_key,0.0)))
-        fnr_level=classify(fnr_rate,FNR_OBJ,fnr_count,fnr_top)
-        mc_level=classify(mc_rate,MC_OBJ,mc_count,mc_top)
-        reasons=[]
-        if pd.notna(fnr_rate) and fnr_rate>=FNR_OBJ:
-            reasons.append(f"Picker sobre objetivo FNR ({fnr_rate:.2f}%)")
-        elif pd.notna(fnr_rate) and fnr_rate>=FNR_OBJ*.8:
-            reasons.append(f"Picker en prevención FNR ({fnr_rate:.2f}%)")
-        if pd.notna(mc_rate) and mc_rate>=MC_OBJ:
-            reasons.append(f"Picker sobre objetivo MC ({mc_rate:.2f}%)")
-        elif pd.notna(mc_rate) and mc_rate>=MC_OBJ*.8:
-            reasons.append(f"Picker en prevención MC ({mc_rate:.2f}%)")
-        if fnr_count:
-            reasons.append(f"Artículo con {fnr_count:g} incidencias FNR históricas")
-        if mc_count:
-            reasons.append(f"Artículo con {mc_count:g} incidencias MC históricas")
+        fnr_item_signal=fnr_count>=ITEM_THRESHOLD
+        mc_item_signal=mc_count>=ITEM_THRESHOLD
+        item_signal=fnr_item_signal or mc_item_signal
+        coincidence=picker_signal and item_signal
+
+        signal_parts=[]
+        if picker_signal:
+            signal_parts.append(f"Picker {picker_total:g} inc.")
+        if fnr_item_signal:
+            signal_parts.append(f"Artículo FNR {fnr_count:g}")
+        if mc_item_signal:
+            signal_parts.append(f"Artículo MC {mc_count:g}")
         rows.append({
-            "Riesgo FNR":fnr_level,"Riesgo MC":mc_level,
-            "Historial picker FNR %":fnr_rate,"Historial picker MC %":mc_rate,
-            "Historial artículo FNR":fnr_count,"Historial artículo MC":mc_count,
-            "Motivo de revisión":"; ".join(dict.fromkeys(reasons)) if reasons else "Sin señal histórica en el cruce disponible",
             "Picker relacionado":picker_name or "Sin asignar",
+            "Incidencias picker FNR":picker_fnr,
+            "Incidencias picker MC":picker_mc,
+            "Incidencias picker total":picker_total,
+            "Historial artículo FNR":fnr_count,
+            "Historial artículo MC":mc_count,
+            "Señal picker >5":bool(picker_signal),
+            "Señal artículo FNR ≥5":bool(fnr_item_signal),
+            "Señal artículo MC ≥5":bool(mc_item_signal),
+            "Coincidencia picker+artículo":bool(coincidence),
+            "Señales":" · ".join(signal_parts) if signal_parts else "Sin señal",
         })
     detail=pd.concat([lines.reset_index(drop=True),pd.DataFrame(rows)],axis=1)
 
-    level_order={"Alta":3,"Atención":2,"Datos incompletos":1,"Sin señal histórica":0}
-    def max_level(values):
-        vals=[str(v) for v in values if str(v) in level_order]
-        return max(vals,key=lambda value:level_order[value]) if vals else "Datos incompletos"
-
     summary_rows=[]
     for order_id,group in detail.groupby("Número de pedido",sort=False,dropna=False):
-        pickers=sorted({str(v).strip() for v in group["Picker relacionado"] if str(v).strip() and str(v).strip()!="Sin asignar"})
-        fnr_level=max_level(group["Riesgo FNR"])
-        mc_level=max_level(group["Riesgo MC"])
-        priority=max_level([fnr_level,mc_level])
-        reasons=list(dict.fromkeys(v for v in group["Motivo de revisión"].astype(str) if v and v!="Sin señal histórica en el cruce disponible"))
+        pickers=sorted({
+            str(v).strip() for v in group["Picker relacionado"]
+            if str(v).strip() and str(v).strip()!="Sin asignar"
+        })
+        picker_signal=bool(group["Señal picker >5"].any())
+        picker_extra=bool((pd.to_numeric(group["Incidencias picker total"],errors="coerce").fillna(0)>PICKER_EXTRA_THRESHOLD).any())
+        fnr_item_signal=bool(group["Señal artículo FNR ≥5"].any())
+        mc_item_signal=bool(group["Señal artículo MC ≥5"].any())
+        coincidence=bool(group["Coincidencia picker+artículo"].any())
+
+        risky_items=set()
+        for _,g_row in group.iterrows():
+            if bool(g_row.get("Señal artículo FNR ≥5")) or bool(g_row.get("Señal artículo MC ≥5")):
+                risky_items.add(_audit_item_key(g_row.get("SKU",""),g_row.get("Artículo","")) or str(g_row.get("Artículo","")))
+        risky_item_count=len(risky_items)
+
+        score=0
+        factors=[]
+        if picker_signal:
+            score+=2; factors.append("Picker >5 incidencias (+2)")
+        if picker_extra:
+            score+=1; factors.append("Picker >10 incidencias (+1)")
+        if fnr_item_signal:
+            score+=2; factors.append("Artículo ≥5 FNR (+2)")
+        if mc_item_signal:
+            score+=2; factors.append("Artículo ≥5 MC (+2)")
+        if coincidence:
+            score+=3; factors.append("Coincidencia picker + artículo (+3)")
+        if risky_item_count>=2:
+            score+=2; factors.append("2+ artículos de riesgo (+2)")
+        if fnr_item_signal and mc_item_signal:
+            score+=1; factors.append("Señales FNR y MC en el pedido (+1)")
+
+        order_key=norm(order_id)
+        prior=prior_by_order.get(order_key)
+        prior_bonus=False
+        if prior is not None:
+            current_total=float(fnr_orders.get(order_key,0.0))+float(mc_orders.get(order_key,0.0))
+            saved_total=float(pd.to_numeric(prior.get("fnr_al_guardar",0),errors="coerce") or 0)+float(pd.to_numeric(prior.get("mc_al_guardar",0),errors="coerce") or 0)
+            if current_total>saved_total:
+                score+=3
+                prior_bonus=True
+                factors.append("Auditado antes y luego sumó FNR/MC (+3)")
+
+        if score>=7:
+            priority="Foco alto"
+        elif score>=4:
+            priority="Revisar"
+        else:
+            priority="Sin foco"
+
+        # Muestra de control determinística: cerca de 5% de pedidos sin foco.
+        control_sample=False
+        if priority=="Sin foco":
+            digest=int(hashlib.sha256(str(order_id).encode("utf-8")).hexdigest()[:8],16)
+            control_sample=(digest%20==0)
+            if control_sample:
+                priority="Muestra control"
+                factors.append("Muestra aleatoria de control (~5%)")
+
         summary_rows.append({
             "Número de pedido":str(order_id),
             "Slot":str(group["Slot"].iloc[0]),
             "Estatus":", ".join(sorted({str(v).strip() for v in group["Estatus"] if str(v).strip()})) if "Estatus" in group else "",
             "Prioridad":priority,
-            "Riesgo FNR":fnr_level,"Riesgo MC":mc_level,
+            "Puntaje foco":int(score),
+            "Picker >5":picker_signal,
+            "Artículo FNR ≥5":fnr_item_signal,
+            "Artículo MC ≥5":mc_item_signal,
+            "Coincidencia picker+artículo":coincidence,
+            "Artículos de riesgo":int(risky_item_count),
+            "Auditoría previa con incidencia nueva":prior_bonus,
             "Pickers asignados":", ".join(pickers) if pickers else "Sin asignar",
             "Renglones":int(len(group)),
             "Renglones sin picker":int(group["Picker relacionado"].eq("Sin asignar").sum()),
-            "Motivos": " · ".join(reasons) if reasons else "Sin señal histórica en el cruce disponible",
+            "Factores":" · ".join(factors) if factors else "Sin señales de foco",
         })
     order_summary=pd.DataFrame(summary_rows)
     if not order_summary.empty:
+        level_order={"Foco alto":3,"Revisar":2,"Muestra control":1,"Sin foco":0}
         order_summary["_priority_sort"]=order_summary["Prioridad"].map(level_order).fillna(0)
-        order_summary=order_summary.sort_values(["_priority_sort","Slot","Número de pedido"],ascending=[False,True,True]).drop(columns="_priority_sort").reset_index(drop=True)
+        order_summary=order_summary.sort_values(
+            ["_priority_sort","Puntaje foco","Slot","Número de pedido"],
+            ascending=[False,False,True,True],
+        ).drop(columns="_priority_sort").reset_index(drop=True)
     return detail,order_summary
-
-
 
 def _dedupe_columns(df):
     """Elimina columnas duplicadas conservando la primera aparición.
@@ -2639,22 +2710,54 @@ if _tab_active(o):
                             if _eligible.empty:
                                 st.warning("No hay pedidos con slot hasta las 12:00 en este archivo.")
                             else:
-                                _audit_detail,_risk_summary=order_risk_analysis(_eligible,s,fnr,mc)
-                                _risk_order={"Alta":3,"Atención":2,"Datos incompletos":1,"Sin señal histórica":0}
-                                _risk_badges={"Alta":"🔴 Alta","Atención":"🟡 Atención","Datos incompletos":"⚪ Datos incompletos","Sin señal histórica":"🟢 Sin señal histórica"}
+                                _audit_detail,_risk_summary=order_risk_analysis(_eligible,s,fnr,mc,store.get("order_audits",[]))
+                                _risk_order={"Foco alto":3,"Revisar":2,"Muestra control":1,"Sin foco":0}
+                                _risk_badges={
+                                    "Foco alto":"🔴 Foco alto",
+                                    "Revisar":"🟡 Revisar",
+                                    "Muestra control":"🔵 Muestra control",
+                                    "Sin foco":"🟢 Sin foco",
+                                }
                                 _risk_summary["_risk_sort"]=_risk_summary["Prioridad"].map(_risk_order).fillna(0)
                                 _counts=_risk_summary["Prioridad"].value_counts()
                                 _k1,_k2,_k3,_k4=st.columns(4)
-                                _k1.metric("Pedidos a revisar",f"{len(_risk_summary):,}")
-                                _k2.metric("Prioridad alta",f"{int(_counts.get('Alta',0)):,}")
-                                _k3.metric("Atención",f"{int(_counts.get('Atención',0)):,}")
-                                _k4.metric("Pedidos sin picker",f"{int(_risk_summary['Pickers asignados'].eq('Sin asignar').sum()):,}")
-                                st.caption("La prioridad cruza las tasas históricas del picker (metas FNR <1.50% y MC <1.00%) con los conteos históricos de incidencias por artículo. Es una guía preventiva, no una probabilidad de incidencia. Verifica cada FNR en Backoffice.")
-                                _risk_display=_risk_summary.drop(columns="_risk_sort")
-                                for _risk_col in ["Prioridad","Riesgo FNR","Riesgo MC"]:
-                                    _risk_display[_risk_col]=_risk_display[_risk_col].map(lambda value:_risk_badges.get(str(value),str(value)))
-                                st.dataframe(_risk_display,use_container_width=True,hide_index=True)
-                                _order_options=_risk_summary["Número de pedido"].astype(str).tolist()
+                                _k1.metric("Pedidos hasta 12:00",f"{len(_risk_summary):,}")
+                                _k2.metric("Foco alto",f"{int(_counts.get('Foco alto',0)):,}")
+                                _k3.metric("Revisar",f"{int(_counts.get('Revisar',0)):,}")
+                                _k4.metric("Muestra control",f"{int(_counts.get('Muestra control',0)):,}")
+                                st.caption("Regla de foco: picker con más de 5 incidencias FNR+MC = +2; artículo con ≥5 FNR = +2; artículo con ≥5 MC = +2; si picker y artículo coinciden en el mismo renglón = +3 extra. Con 7+ puntos el pedido entra en Foco alto. El puntaje ordena la revisión, no representa una probabilidad.")
+
+                                _focus_mode=st.radio(
+                                    "Qué pedidos mostrar",
+                                    ["🔴 Solo foco alto","🔴🟡 Foco alto + revisar","🎯 Recomendados + muestra control","Todos"],
+                                    horizontal=True,
+                                    key="order_audit_focus_mode",
+                                )
+                                if _focus_mode=="🔴 Solo foco alto":
+                                    _risk_filtered=_risk_summary[_risk_summary["Prioridad"].eq("Foco alto")].copy()
+                                elif _focus_mode=="🔴🟡 Foco alto + revisar":
+                                    _risk_filtered=_risk_summary[_risk_summary["Prioridad"].isin(["Foco alto","Revisar"])].copy()
+                                elif _focus_mode=="🎯 Recomendados + muestra control":
+                                    _risk_filtered=_risk_summary[_risk_summary["Prioridad"].isin(["Foco alto","Revisar","Muestra control"])].copy()
+                                else:
+                                    _risk_filtered=_risk_summary.copy()
+
+                                _risk_display=_risk_filtered.drop(columns="_risk_sort",errors="ignore").copy()
+                                _display_cols=[
+                                    "Número de pedido","Slot","Prioridad","Puntaje foco",
+                                    "Picker >5","Artículo FNR ≥5","Artículo MC ≥5",
+                                    "Coincidencia picker+artículo","Artículos de riesgo",
+                                    "Pickers asignados","Factores",
+                                ]
+                                _display_cols=[col for col in _display_cols if col in _risk_display.columns]
+                                if _risk_display.empty:
+                                    st.success("No hay pedidos en este nivel de foco. Puedes cambiar el filtro para ver los demás.")
+                                else:
+                                    _risk_display["Prioridad"]=_risk_display["Prioridad"].map(lambda value:_risk_badges.get(str(value),str(value)))
+                                    st.dataframe(_risk_display[_display_cols],use_container_width=True,hide_index=True)
+
+                                _selection_source=_risk_filtered if not _risk_filtered.empty else _risk_summary
+                                _order_options=_selection_source["Número de pedido"].astype(str).tolist()
                                 _order=st.selectbox("Pedido a validar",_order_options,key="order_audit_selected")
                                 _lines=_audit_detail[_audit_detail["Número de pedido"].astype(str)==str(_order)].copy()
                                 _order_row=_risk_summary[_risk_summary["Número de pedido"].astype(str)==str(_order)].iloc[0]
@@ -2666,13 +2769,12 @@ if _tab_active(o):
                                 _k1,_k2,_k3,_k4=st.columns(4)
                                 _k1.metric("Pedido",str(_order))
                                 _k2.metric("Slot",_order_slot)
-                                _k3.metric("Prioridad",_risk_badges.get(str(_order_row["Prioridad"]),str(_order_row["Prioridad"])))
-                                _k4.metric("Pickers",str(_order_row["Pickers asignados"]))
-                                st.markdown(f"**Riesgo FNR:** {_order_row['Riesgo FNR']} · **Riesgo MC:** {_order_row['Riesgo MC']}  \n**Motivo:** {_order_row['Motivos']}")
+                                _k3.metric("Foco",_risk_badges.get(str(_order_row["Prioridad"]),str(_order_row["Prioridad"])))
+                                _k4.metric("Puntaje",int(_order_row.get("Puntaje foco",0)))
+                                st.markdown(f"**Picker(s):** {_order_row['Pickers asignados']}  \n**Factores:** {_order_row['Factores']}")
                                 st.caption(f"Renglones: {len(_lines):,} · Cantidad pedida: {_units:g} · Cantidad pickeada: {f'{_picked:g}' if pd.notna(_picked) else 'N/D'}")
-                                _preview=_lines[["SKU","Artículo","Picker relacionado","Cantidad pedida","Cantidad pickeada","Riesgo FNR","Riesgo MC"]].reset_index(drop=True)
-                                for _risk_col in ["Riesgo FNR","Riesgo MC"]:
-                                    _preview[_risk_col]=_preview[_risk_col].map(lambda value:_risk_badges.get(str(value),str(value)))
+                                _preview=_lines[["SKU","Artículo","Picker relacionado","Cantidad pedida","Cantidad pickeada","Señales","Coincidencia picker+artículo"]].reset_index(drop=True)
+                                _preview["Coincidencia picker+artículo"]=_preview["Coincidencia picker+artículo"].map(lambda value:"🎯 Sí" if bool(value) else "")
                                 st.dataframe(_preview,use_container_width=True,hide_index=True)
 
                                 st.markdown("### ✅ Validar y guardar auditoría")
@@ -2769,6 +2871,13 @@ if _tab_active(o):
                                             "fnr_al_guardar":_audit_fnr_count,
                                             "mc_al_guardar":_audit_mc_count,
                                             "prioridad_preventiva":str(_order_row.get("Prioridad","")),
+                                            "puntaje_foco":int(_order_row.get("Puntaje foco",0)),
+                                            "nivel_foco":str(_order_row.get("Prioridad","")),
+                                            "factores_foco":str(_order_row.get("Factores","")),
+                                            "picker_riesgo":bool(_order_row.get("Picker >5",False)),
+                                            "articulo_fnr_riesgo":bool(_order_row.get("Artículo FNR ≥5",False)),
+                                            "articulo_mc_riesgo":bool(_order_row.get("Artículo MC ≥5",False)),
+                                            "coincidencia_picker_articulo":bool(_order_row.get("Coincidencia picker+artículo",False)),
                                             "fuente_archivo":audit_upload.name,
                                         }
                                         store.setdefault("order_audits",[]).append(_audit_record)
@@ -2856,6 +2965,8 @@ if _tab_active(o):
                 "Picker":rec.get("picker",""),
                 "Auditó":rec.get("auditor",""),
                 "Resultado":rec.get("resultado",""),
+                "Nivel foco":rec.get("nivel_foco",rec.get("prioridad_preventiva","")),
+                "Puntaje foco":rec.get("puntaje_foco",""),
                 "Diferencias":rec.get("diferencias",0),
                 "FNR al guardar":rec.get("fnr_al_guardar",0),
                 "MC al guardar":rec.get("mc_al_guardar",0),
@@ -2878,6 +2989,39 @@ if _tab_active(o):
                         _audit_line_rows.append({"Pedido":_rec.get("pedido",""),"Fecha auditoría":_rec.get("fecha_auditoria",""),**_line})
                 pd.DataFrame(_audit_line_rows).to_excel(_audit_writer,index=False,sheet_name="Articulos auditados")
             st.download_button("⬇️ Exportar historial de auditorías",_audit_export.getvalue(),file_name="Historial_auditorias_pedidos.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",key="audit_history_export")
+
+            _latest_audits={}
+            for _rec in sorted(_saved_audits,key=lambda z:str(z.get("fecha_auditoria",""))):
+                if _rec.get("puntaje_foco") is not None:
+                    _latest_audits[str(_rec.get("pedido",""))]=_rec
+            if _latest_audits:
+                st.markdown("### 📈 Qué señales están acertando")
+                st.caption("Comparación descriptiva basada en la última auditoría de cada pedido. Se cuenta como incidencia posterior cuando el FNR+MC actual del pedido supera lo que tenía al momento de guardarlo. Sirve para aprender qué señales funcionan; no demuestra causalidad.")
+                _assoc_records=list(_latest_audits.values())
+                def _audit_has_new_incidence(rec):
+                    current=_current_order_incident_count(fnr,rec.get("pedido",""))+_current_order_incident_count(mc,rec.get("pedido",""))
+                    saved=float(pd.to_numeric(rec.get("fnr_al_guardar",0),errors="coerce") or 0)+float(pd.to_numeric(rec.get("mc_al_guardar",0),errors="coerce") or 0)
+                    return current>saved
+                _assoc_defs=[
+                    ("Picker >5",lambda r:bool(r.get("picker_riesgo",False))),
+                    ("Artículo ≥5 FNR/MC",lambda r:bool(r.get("articulo_fnr_riesgo",False) or r.get("articulo_mc_riesgo",False))),
+                    ("Picker + artículo",lambda r:bool(r.get("coincidencia_picker_articulo",False))),
+                    ("Sin señales",lambda r:not bool(r.get("picker_riesgo",False) or r.get("articulo_fnr_riesgo",False) or r.get("articulo_mc_riesgo",False))),
+                ]
+                _assoc_rows=[]
+                for _label,_rule in _assoc_defs:
+                    _subset=[rec for rec in _assoc_records if _rule(rec)]
+                    _hits=sum(1 for rec in _subset if _audit_has_new_incidence(rec))
+                    _n=len(_subset)
+                    _assoc_rows.append({
+                        "Señal":_label,
+                        "Pedidos auditados":_n,
+                        "Con incidencia posterior":_hits,
+                        "Tasa observada":round(_hits/_n*100,1) if _n else 0.0,
+                        "Lectura":"Referencia útil" if _n>=10 else ("Muestra pequeña" if _n else "Sin datos"),
+                    })
+                st.dataframe(pd.DataFrame(_assoc_rows),use_container_width=True,hide_index=True)
+                st.caption("Cuando acumulemos más auditorías, esta tabla permitirá ajustar los pesos del puntaje con evidencia real de la operación.")
         else:
             st.caption("Aún no hay pedidos auditados guardados.")
 
