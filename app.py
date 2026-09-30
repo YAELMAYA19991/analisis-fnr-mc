@@ -1705,7 +1705,9 @@ def order_risk_analysis(audit_lines,picker_summary,fnr_inc,mc_inc,prior_audits=N
         prior_bonus=False
         if prior is not None:
             current_total=float(fnr_orders.get(order_key,0.0))+float(mc_orders.get(order_key,0.0))
-            saved_total=float(pd.to_numeric(prior.get("fnr_al_guardar",0),errors="coerce") or 0)+float(pd.to_numeric(prior.get("mc_al_guardar",0),errors="coerce") or 0)
+            saved_fnr=pd.to_numeric(prior.get("fnr_al_guardar",0),errors="coerce")
+            saved_mc=pd.to_numeric(prior.get("mc_al_guardar",0),errors="coerce")
+            saved_total=(0.0 if pd.isna(saved_fnr) else float(saved_fnr))+(0.0 if pd.isna(saved_mc) else float(saved_mc))
             if current_total>saved_total:
                 score+=3
                 prior_bonus=True
@@ -3000,7 +3002,9 @@ if _tab_active(o):
                 _assoc_records=list(_latest_audits.values())
                 def _audit_has_new_incidence(rec):
                     current=_current_order_incident_count(fnr,rec.get("pedido",""))+_current_order_incident_count(mc,rec.get("pedido",""))
-                    saved=float(pd.to_numeric(rec.get("fnr_al_guardar",0),errors="coerce") or 0)+float(pd.to_numeric(rec.get("mc_al_guardar",0),errors="coerce") or 0)
+                    saved_fnr=pd.to_numeric(rec.get("fnr_al_guardar",0),errors="coerce")
+                    saved_mc=pd.to_numeric(rec.get("mc_al_guardar",0),errors="coerce")
+                    saved=(0.0 if pd.isna(saved_fnr) else float(saved_fnr))+(0.0 if pd.isna(saved_mc) else float(saved_mc))
                     return current>saved
                 _assoc_defs=[
                     ("Picker >5",lambda r:bool(r.get("picker_riesgo",False))),
