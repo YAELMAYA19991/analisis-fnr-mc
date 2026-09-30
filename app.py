@@ -1956,6 +1956,39 @@ def order_risk_analysis(audit_lines,picker_summary,fnr_inc,mc_inc,prior_audits=N
         if previous is None or str(audit.get("fecha_auditoria",""))>=str(previous.get("fecha_auditoria","")):
             prior_by_order[key]=audit
 
+    # Aprendizaje descriptivo: solo se activa con una muestra mínima.
+    # Usa incidencias posteriores a la auditoría como señal observada; no implica causalidad.
+    learning=[]
+    for order_key,audit in prior_by_order.items():
+        if not isinstance(audit,dict): continue
+        saved_fnr=pd.to_numeric(audit.get("fnr_al_guardar",0),errors="coerce")
+        saved_mc=pd.to_numeric(audit.get("mc_al_guardar",0),errors="coerce")
+        saved=(0.0 if pd.isna(saved_fnr) else float(saved_fnr))+(0.0 if pd.isna(saved_mc) else float(saved_mc))
+        current=float(fnr_orders.get(order_key,0.0))+float(mc_orders.get(order_key,0.0))
+        learning.append({
+            "hit":bool(current>saved),
+            "picker":bool(audit.get("picker_riesgo",False)),
+            "item":bool(audit.get("articulo_fnr_riesgo",False) or audit.get("articulo_mc_riesgo",False)),
+            "combo":bool(audit.get("coincidencia_picker_articulo",False)),
+        })
+
+    baseline=(sum(1 for z in learning if z["hit"])/len(learning)) if learning else None
+    def _learned_bonus(field):
+        subset=[z for z in learning if z.get(field)]
+        if len(subset)<10 or baseline is None:
+            return 0, len(subset), None
+        rate=sum(1 for z in subset if z["hit"])/len(subset)
+        uplift=rate-baseline
+        if rate>=baseline*1.8 and uplift>=0.15:
+            return 2,len(subset),rate
+        if rate>=baseline*1.3 and uplift>=0.08:
+            return 1,len(subset),rate
+        return 0,len(subset),rate
+
+    learned_picker,learn_n_picker,learn_rate_picker=_learned_bonus("picker")
+    learned_item,learn_n_item,learn_rate_item=_learned_bonus("item")
+    learned_combo,learn_n_combo,learn_rate_combo=_learned_bonus("combo")
+
     rows=[]
     for _,row in lines.iterrows():
         _picker_value=row.get("Picker","")
@@ -2032,6 +2065,17 @@ def order_risk_analysis(audit_lines,picker_summary,fnr_inc,mc_inc,prior_audits=N
         if fnr_item_signal and mc_item_signal:
             score+=1; factors.append("Señales FNR y MC en el pedido (+1)")
 
+        learned_total=0
+        if picker_signal and learned_picker:
+            score+=learned_picker; learned_total+=learned_picker
+            factors.append(f"Ajuste aprendido picker (+{learned_picker})")
+        if (fnr_item_signal or mc_item_signal) and learned_item:
+            score+=learned_item; learned_total+=learned_item
+            factors.append(f"Ajuste aprendido artículo (+{learned_item})")
+        if coincidence and learned_combo:
+            score+=learned_combo; learned_total+=learned_combo
+            factors.append(f"Ajuste aprendido coincidencia (+{learned_combo})")
+
         order_key=norm(order_id)
         prior=prior_by_order.get(order_key)
         prior_bonus=False
@@ -2073,6 +2117,7 @@ def order_risk_analysis(audit_lines,picker_summary,fnr_inc,mc_inc,prior_audits=N
             "Coincidencia picker+artículo":coincidence,
             "Artículos de riesgo":int(risky_item_count),
             "Auditoría previa con incidencia nueva":prior_bonus,
+            "Ajuste aprendido":int(learned_total),
             "Pickers asignados":", ".join(pickers) if pickers else "Sin asignar",
             "Renglones":int(len(group)),
             "Renglones sin picker":int(group["Picker relacionado"].eq("Sin asignar").sum()),
@@ -3243,6 +3288,11 @@ if _tab_active(o):
                                 _k3.metric("Revisar",f"{int(_counts.get('Revisar',0)):,}")
                                 _k4.metric("Muestra control",f"{int(_counts.get('Muestra control',0)):,}")
                                 st.caption("Regla de foco: picker con más de 5 incidencias FNR+MC = +2; artículo con ≥5 FNR = +2; artículo con ≥5 MC = +2; si picker y artículo coinciden en el mismo renglón = +3 extra. Con 7+ puntos el pedido entra en Foco alto. El puntaje ordena la revisión, no representa una probabilidad.")
+                                _learning_total=len({norm(a.get("pedido","")) for a in store.get("order_audits",[]) if str(a.get("pedido","")).strip()})
+                                if _learning_total>=10:
+                                    st.caption(f"Aprendizaje activo con {_learning_total} pedidos auditados: solo añade puntos cuando una señal tiene suficiente muestra y una tasa observada claramente superior a la referencia.")
+                                else:
+                                    st.caption(f"Aprendizaje aún en observación: {_learning_total}/10 pedidos auditados únicos para empezar a evaluar bonos estadísticos.")
 
                                 _focus_mode=st.radio(
                                     "Qué pedidos mostrar",
@@ -3263,7 +3313,7 @@ if _tab_active(o):
                                 _display_cols=[
                                     "Número de pedido","Slot","Prioridad","Puntaje foco",
                                     "Picker >5","Artículo FNR ≥5","Artículo MC ≥5",
-                                    "Coincidencia picker+artículo","Artículos de riesgo",
+                                    "Coincidencia picker+artículo","Artículos de riesgo","Ajuste aprendido",
                                     "Pickers asignados","Factores",
                                 ]
                                 _display_cols=[col for col in _display_cols if col in _risk_display.columns]
