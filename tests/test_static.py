@@ -35,5 +35,10 @@ class AppStaticTests(unittest.TestCase):
         self.assertIn('"order_audits"',self.text)
         self.assertIn('"monthly_history"',self.text)
 
+    def test_bulk_audit_pdf_present(self):
+        self.assertIn("def build_bulk_audit_pdf",self.text)
+        self.assertIn("Imprimir pedidos en lote",self.text)
+        self.assertIn("Descargar PDF de todos los pedidos",self.text)
+
 if __name__=="__main__":
     unittest.main()
