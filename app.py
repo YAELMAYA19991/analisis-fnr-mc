@@ -2676,7 +2676,7 @@ if _tab_active(o):
                                 st.dataframe(_preview,use_container_width=True,hide_index=True)
 
                                 st.markdown("### ✅ Validar y guardar auditoría")
-                                st.caption("Marca cada renglón después de comparar producto, SKU y cantidades. El resultado queda ligado al pedido para cruzarlo después con FNR y MC.")
+                                st.caption("Revisa el pedido completo una sola vez. Si todo está correcto, basta con una aprobación general. Si algo está mal o falta, marca solo ese renglón y escribe la corrección.")
                                 _existing_audit=next((a for a in reversed(store.get("order_audits",[]) or []) if str(a.get("pedido",""))==str(_order)),None)
                                 if _existing_audit:
                                     st.info(f"Última auditoría guardada: {_existing_audit.get('fecha_auditoria','')} · {_existing_audit.get('resultado','')}. Puedes registrar una nueva revisión sin borrar la anterior.")
@@ -2684,9 +2684,8 @@ if _tab_active(o):
                                 _audit_key=hashlib.sha256((str(_order)+"|"+hashlib.sha256(_audit_raw).hexdigest()).encode()).hexdigest()[:14]
                                 _editor_cols=["SKU","Artículo","Picker relacionado","Cantidad pedida","Cantidad pickeada"]
                                 _audit_editor=_lines[_editor_cols].reset_index(drop=True).copy()
-                                _audit_editor.insert(0,"Validado",False)
                                 _audit_editor["Diferencia encontrada"]=False
-                                _audit_editor["Observaciones"]=""
+                                _audit_editor["Corrección / observación"]=""
                                 _audit_editor=st.data_editor(
                                     _audit_editor,
                                     hide_index=True,
@@ -2739,16 +2738,21 @@ if _tab_active(o):
                                     )
                                     _audit_notes=st.text_area("Evidencia / observaciones generales",key="audit_notes_"+_audit_key)
 
-                                if st.button("💾 Marcar pedido como auditado y guardar",type="primary",key="audit_save_"+_audit_key):
-                                    _all_validated=bool(_audit_editor["Validado"].fillna(False).astype(bool).all())
+                                _audit_order_approved=st.checkbox(
+                                    "✅ Confirmo que revisé el pedido completo",
+                                    key="audit_order_approved_"+_audit_key,
+                                    help="Una sola aprobación valida el pedido completo. Usa la tabla únicamente para registrar diferencias o correcciones.",
+                                )
+
+                                if st.button("💾 Aprobar pedido y guardar auditoría",type="primary",key="audit_save_"+_audit_key):
                                     _has_difference=bool(_audit_editor["Diferencia encontrada"].fillna(False).astype(bool).any())
-                                    _line_notes=bool(_audit_editor["Observaciones"].fillna("").astype(str).str.strip().ne("").any())
-                                    if not _audit_responsable.strip():
+                                    _line_notes=bool(_audit_editor["Corrección / observación"].fillna("").astype(str).str.strip().ne("").any())
+                                    if not _audit_order_approved:
+                                        st.error("Confirma que revisaste el pedido completo antes de guardarlo.")
+                                    elif not _audit_responsable.strip():
                                         st.error("Indica quién realizó la auditoría.")
-                                    elif not _all_validated:
-                                        st.error("Marca todos los renglones como validados antes de guardar el pedido.")
                                     elif _has_difference and not (_audit_notes.strip() or _line_notes):
-                                        st.error("Encontraste una diferencia: agrega la evidencia u observación correspondiente.")
+                                        st.error("Encontraste una diferencia: escribe la corrección u observación correspondiente.")
                                     else:
                                         _audit_record={
                                             "id":hashlib.sha256((str(_order)+"|"+datetime.now().isoformat()).encode()).hexdigest()[:18],
@@ -2758,6 +2762,7 @@ if _tab_active(o):
                                             "picker":_audit_picker.strip(),
                                             "auditor":_audit_responsable.strip(),
                                             "resultado":_audit_resultado,
+                                            "pedido_validado":True,
                                             "observaciones":_audit_notes.strip(),
                                             "diferencias":int(_audit_editor["Diferencia encontrada"].fillna(False).astype(bool).sum()),
                                             "lineas":json.loads(_audit_editor.to_json(orient="records",force_ascii=False)),
@@ -2787,16 +2792,17 @@ if _tab_active(o):
                                     _ws["E2"]="Prioridad"; _ws["F2"]=_order_row["Prioridad"]
                                     _ws["A3"]="Picker(s)"; _ws["B3"]=_order_row["Pickers asignados"]
                                     _ws["C3"]="Fecha / hora de validación"; _ws["D3"]=""
+                                    _ws["E3"]="Pedido revisado completo"; _ws["F3"]="□ Sí"
                                     _ws["A4"]="Motivo"; _ws["B4"]=_order_row["Motivos"]
                                     _ws.merge_cells("B4:I4")
                                     _headers=6
-                                    _ws.cell(_headers,8,"Validado")
-                                    _ws.cell(_headers,9,"Observaciones")
+                                    _ws.cell(_headers,8,"Diferencia")
+                                    _ws.cell(_headers,9,"Corrección / observaciones")
                                     for _row in range(_headers+1,_headers+1+len(_preview)):
-                                        _ws.cell(_row,8,"□")
+                                        _ws.cell(_row,8,"")
                                         _ws.cell(_row,9,"")
                                     _footer=_headers+len(_preview)+2
-                                    _ws.cell(_footer,1,"Compara producto, SKU y cantidades. La prioridad se basa en patrones históricos FNR/MC.")
+                                    _ws.cell(_footer,1,"Revisa el pedido completo una sola vez. Si detectas una diferencia, anótala únicamente en el renglón correspondiente.")
                                     _ws.merge_cells(start_row=_footer,start_column=1,end_row=_footer,end_column=9)
                                     from openpyxl.styles import Font as _XLFont, PatternFill as _XLFill, Border as _XLBorder, Side as _XLSide, Alignment as _XLAlignment
                                     _ws["A1"].font=_XLFont(name="Arial",size=16,bold=True,color="FFFFFF")
@@ -2827,7 +2833,7 @@ if _tab_active(o):
                                     _ws.print_title_rows="1:6"
                                 _safe_order=re.sub(r"[^A-Za-z0-9_-]+","_",str(_order)).strip("_")[:40] or "pedido"
                                 st.download_button("⬇️ Descargar hoja de validación",_print_buffer.getvalue(),file_name=f"Validacion_pedido_{_safe_order}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",key=f"order_audit_download_{hashlib.md5(str(_order).encode()).hexdigest()}",type="primary")
-                                st.caption("La hoja conserva el picker de cada renglón y permite validar cantidades y artículos.")
+                                st.caption("La hoja conserva el picker de cada renglón y usa una sola aprobación para el pedido completo; las diferencias se anotan solo donde correspondan.")
             except Exception as _audit_error:
                 st.error(f"No pude leer el archivo de pedidos: {_audit_error}")
 
