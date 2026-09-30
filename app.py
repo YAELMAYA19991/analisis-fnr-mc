@@ -2297,11 +2297,11 @@ with st.container(border=True):
 
 st.divider()
 
-_tab_labels=["🏠 Bodega y turnos / áreas","👤 Pickers y supervisores","📅 Faltas y retardos","🛡️ Seguimiento","📌 Pendientes","🧰 Herramientas"]
+_tab_labels=["🏠 Bodega y turnos / áreas","📦 Auditoría de pedidos","👤 Pickers y supervisores","📅 Faltas y retardos","🛡️ Seguimiento","📌 Pendientes","🧰 Herramientas"]
 try:
-    a,b,i,h,j,x=st.tabs(_tab_labels,on_change="rerun",key="control_fnr_mc_tabs_v5")
+    a,o,b,i,h,j,x=st.tabs(_tab_labels,on_change="rerun",key="control_fnr_mc_tabs_v5")
 except TypeError:
-    a,b,i,h,j,x=st.tabs(_tab_labels)
+    a,o,b,i,h,j,x=st.tabs(_tab_labels)
 # Agrupa las secciones en una sola pestaña y conserva sus formularios y cálculos.
 e=a  # Turnos / Áreas comparte la pestaña de Bodega.
 g=b  # Supervisores comparte la pestaña de Pickers.
@@ -2402,6 +2402,137 @@ if _tab_active(a):
         pedidos_bodega=orders(datos_pedidos)
         st.dataframe(pedidos_bodega,use_container_width=True,hide_index=True)
         st.caption("PICKERS indica cuántos pickers aparecen en el mismo pedido.")
+
+if _tab_active(o):
+    with o:
+        st.subheader("📦 Auditoría de pedidos")
+        st.caption("Revisa qué lleva cada pedido y descarga una hoja individual para que el picker valide artículo, SKU y cantidad.")
+        st.info("Carga aquí el Excel o CSV que exportas desde Justo. Los pedidos se usan durante esta sesión y no se guardan en el historial de la app.")
+        audit_upload=st.file_uploader("Archivo de pedidos exportado desde Justo",type=["xlsx","xls","csv"],key="order_audit_upload")
+        if audit_upload is None:
+            st.markdown("**La hoja imprimible mostrará:** número de pedido, hora, SKU, artículo, cantidad, validación y observaciones.")
+            st.caption("Exporta desde Justo el detalle de pedidos y cárgalo aquí para comenzar.")
+        else:
+            try:
+                _audit_raw=audit_upload.getvalue()
+                if audit_upload.name.lower().endswith(".csv"):
+                    try:
+                        _audit_sheets={"Datos":pd.read_csv(io.BytesIO(_audit_raw),sep=None,engine="python",dtype=str,keep_default_na=False)}
+                    except UnicodeDecodeError:
+                        _audit_sheets={"Datos":pd.read_csv(io.BytesIO(_audit_raw),sep=None,engine="python",dtype=str,keep_default_na=False,encoding="latin-1")}
+                else:
+                    _audit_sheets=pd.read_excel(io.BytesIO(_audit_raw),sheet_name=None,dtype=str,keep_default_na=False)
+                _audit_sheets={str(k):v for k,v in _audit_sheets.items() if v is not None and not v.empty}
+                if not _audit_sheets:
+                    st.error("El archivo no contiene filas con datos.")
+                else:
+                    _sheet_name=st.selectbox("Hoja del archivo",list(_audit_sheets),key="order_audit_sheet") if len(_audit_sheets)>1 else next(iter(_audit_sheets))
+                    _audit_df=_audit_sheets[_sheet_name].copy()
+                    _audit_df.columns=[str(c).strip() for c in _audit_df.columns]
+                    _audit_cols=list(_audit_df.columns)
+                    _normalized_cols={norm(c):c for c in _audit_cols}
+                    def _audit_guess(aliases):
+                        for _alias in aliases:
+                            if norm(_alias) in _normalized_cols:
+                                return _normalized_cols[norm(_alias)]
+                        return "— Selecciona —"
+                    _fields=[
+                        ("pedido","Número de pedido",["numero_pedido","número de pedido","order_number","order_no","order_id","numero_orden","pedido","orden","order"]),
+                        ("hora","Hora del pedido",["hora_pedido","hora del pedido","order_time","created_at","created","fecha_hora","order_created_at","hora","time"]),
+                        ("sku","SKU",["sku","seller_sku","product_sku","codigo_sku","código sku","item_sku"]),
+                        ("articulo","Artículo",["articulo","artículo","producto","product_name","item_name","item","product","nombre_articulo"]),
+                        ("cantidad","Cantidad",["cantidad","quantity","qty","unidades","cant"]),
+                    ]
+                    with st.expander("⚙️ Confirmar columnas del archivo",expanded=True):
+                        st.caption("Confirma que cada campo corresponda a la columna indicada; los encabezados de Justo pueden variar.")
+                        _map_cols=st.columns(5)
+                        _mapping={}
+                        for _idx,(_key,_label,_aliases) in enumerate(_fields):
+                            with _map_cols[_idx]:
+                                _options=["— Selecciona —"]+_audit_cols
+                                _default=_audit_guess(_aliases)
+                                _mapping[_key]=st.selectbox(_label,_options,index=_options.index(_default),key=f"order_audit_map_{_key}")
+                    if any(_v=="— Selecciona —" for _v in _mapping.values()):
+                        st.warning("Selecciona una columna para número de pedido, hora, SKU, artículo y cantidad.")
+                        st.dataframe(_audit_df.head(10),use_container_width=True,hide_index=True)
+                    else:
+                        _audit_data=pd.DataFrame({
+                            "Número de pedido":_audit_df[_mapping["pedido"]].astype(str).str.strip(),
+                            "Hora del pedido":_audit_df[_mapping["hora"]].astype(str).str.strip(),
+                            "SKU":_audit_df[_mapping["sku"]].astype(str).str.strip(),
+                            "Artículo":_audit_df[_mapping["articulo"]].astype(str).str.strip(),
+                            "Cantidad":_audit_df[_mapping["cantidad"]].astype(str).str.strip(),
+                        })
+                        _audit_data=_audit_data[_audit_data["Número de pedido"].ne("") & _audit_data["Número de pedido"].str.casefold().ne("nan")]
+                        _audit_data=_audit_data[_audit_data["Artículo"].ne("") | _audit_data["SKU"].ne("")]
+                        if _audit_data.empty:
+                            st.error("No encontré filas con número de pedido y artículo/SKU. Revisa la hoja y las columnas elegidas.")
+                        else:
+                            _orders=_audit_data["Número de pedido"].drop_duplicates().tolist()
+                            _order=st.selectbox("Pedido a validar",_orders,key="order_audit_selected")
+                            _lines=_audit_data[_audit_data["Número de pedido"]==_order].copy()
+                            _times=[v for v in _lines["Hora del pedido"].drop_duplicates().tolist() if v and v.casefold()!="nan"]
+                            _order_time=_times[0] if _times else "Sin dato"
+                            _units=pd.to_numeric(_lines["Cantidad"].str.replace(",","",regex=False),errors="coerce").sum()
+                            _k1,_k2,_k3=st.columns(3)
+                            _k1.metric("Pedido",str(_order))
+                            _k2.metric("Artículos",f"{len(_lines):,}")
+                            _k3.metric("Unidades",f"{_units:g}" if pd.notna(_units) else "N/D")
+                            st.markdown(f"**Hora del pedido:** {_order_time}")
+                            _preview=_lines[["SKU","Artículo","Cantidad"]].reset_index(drop=True)
+                            st.dataframe(_preview,use_container_width=True,hide_index=True)
+
+                            _print_buffer=io.BytesIO()
+                            with pd.ExcelWriter(_print_buffer,engine="openpyxl") as _writer:
+                                _preview.to_excel(_writer,sheet_name="Validar pedido",index=False,startrow=5)
+                                _ws=_writer.sheets["Validar pedido"]
+                                _ws.merge_cells("A1:E1")
+                                _ws["A1"]="AUDITORÍA DE PEDIDO"
+                                _ws["A2"]="Número de pedido"; _ws["B2"]=str(_order)
+                                _ws["C2"]="Hora del pedido"; _ws["D2"]=_order_time
+                                _ws["A3"]="Picker"; _ws["B3"]=""
+                                _ws["C3"]="Fecha / hora de validación"; _ws["D3"]=""
+                                _headers=6
+                                _ws.cell(_headers,4,"Validado")
+                                _ws.cell(_headers,5,"Observaciones")
+                                for _row in range(_headers+1,_headers+1+len(_preview)):
+                                    _ws.cell(_row,4,"□")
+                                    _ws.cell(_row,5,"")
+                                _footer=_headers+len(_preview)+2
+                                _ws.cell(_footer,1,"Marca cada artículo después de comparar nombre, SKU y cantidad.")
+                                _ws.merge_cells(start_row=_footer,start_column=1,end_row=_footer,end_column=5)
+                                from openpyxl.styles import Font as _XLFont, PatternFill as _XLFill, Border as _XLBorder, Side as _XLSide, Alignment as _XLAlignment
+                                _ws["A1"].font=_XLFont(name="Arial",size=16,bold=True,color="FFFFFF")
+                                _ws["A1"].fill=_XLFill("solid",fgColor="BD2426")
+                                _ws["A1"].alignment=_XLAlignment(horizontal="center")
+                                _thin=_XLSide(style="thin",color="D9D9D9")
+                                for _cell in _ws[_headers]:
+                                    _cell.font=_XLFont(bold=True,color="FFFFFF")
+                                    _cell.fill=_XLFill("solid",fgColor="444654")
+                                    _cell.alignment=_XLAlignment(horizontal="center",vertical="center")
+                                for _row in _ws.iter_rows(min_row=2,max_row=_headers+len(_preview),min_col=1,max_col=5):
+                                    for _cell in _row:
+                                        _cell.border=_XLBorder(bottom=_thin)
+                                        _cell.alignment=_XLAlignment(vertical="center",wrap_text=True)
+                                for _col,_width in {"A":22,"B":45,"C":12,"D":14,"E":30}.items():
+                                    _ws.column_dimensions[_col].width=_width
+                                _ws.row_dimensions[1].height=28
+                                _ws.row_dimensions[_headers].height=24
+                                _ws.freeze_panes="A7"
+                                _ws.sheet_properties.pageSetUpPr.fitToPage=True
+                                _ws.page_setup.orientation="landscape"
+                                _ws.page_setup.paperSize=_ws.PAPERSIZE_LETTER
+                                _ws.page_setup.fitToWidth=1
+                                _ws.page_setup.fitToHeight=1
+                                _ws.page_margins.left=0.25; _ws.page_margins.right=0.25
+                                _ws.page_margins.top=0.4; _ws.page_margins.bottom=0.4
+                                _ws.print_area=f"A1:E{_footer}"
+                                _ws.print_title_rows="1:6"
+                            _safe_order=re.sub(r"[^A-Za-z0-9_-]+","_",str(_order)).strip("_")[:40] or "pedido"
+                            st.download_button("⬇️ Descargar hoja de validación para imprimir",_print_buffer.getvalue(),file_name=f"Validacion_pedido_{_safe_order}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",key=f"order_audit_download_{hashlib.md5(str(_order).encode()).hexdigest()}",type="primary")
+                            st.caption("Imprime la hoja del pedido seleccionado. Incluye espacio para marcar artículos, anotar diferencias y registrar quién lo validó.")
+            except Exception as _audit_error:
+                st.error(f"No pude leer el archivo de pedidos: {_audit_error}")
 
 if _tab_active(b):
     with b:
