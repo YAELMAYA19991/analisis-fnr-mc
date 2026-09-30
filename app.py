@@ -1364,6 +1364,7 @@ def parse_inc(df,tipo):
     """
     p=col(df,["picker","picker_nombre","email_picker","nombre","persona"])
     prod=col(df,["product","producto","item","articulo","artículo"])
+    sku=col(df,["sku","seller_sku","product_sku","codigo_sku","código sku","item_sku"])
     order=col(df,["order_number","order","pedido","numero_pedido","order_id"])
     ar=col(df,["department","departamento","area","depto"])
     sh=col(df,["turno","shift"]); fe=col(df,["date","fecha","created_at"])
@@ -1376,6 +1377,7 @@ def parse_inc(df,tipo):
         "PICKER":picker_values,
         "CORREO":df[em].fillna("").astype(str).str.strip() if em else "",
         "PRODUCTO":df[prod].astype(str).str.strip() if prod else "Sin producto",
+        "SKU":df[sku].fillna("").astype(str).str.strip() if sku else "",
         "ORDER_NUMBER":df[order].astype(str).str.strip() if order else "",
         "AREA":df[ar].astype(str).str.strip() if ar else "No especificada",
         "TURNO":df[sh].astype(str).str.strip() if sh else "No especificado",
@@ -1541,6 +1543,142 @@ def products(inc,picker=None):
 def orders(inc,picker=None):
     x=inc if not picker or picker=="Todos" else inc[inc.PICKER==picker]
     return x.groupby("ORDER_NUMBER",as_index=False).agg(INCIDENCIAS=("INCIDENCIAS","sum"),PICKERS=("PICKER","nunique"),PRODUCTOS=("PRODUCTO","nunique")).sort_values(["INCIDENCIAS","PICKERS"],ascending=False)
+
+
+def _audit_item_key(sku="", product=""):
+    sku_text="" if pd.isna(sku) else str(sku).strip()
+    if sku_text and sku_text.casefold() not in {"nan","none","<na>"}:
+        return "SKU:"+re.sub(r"[^a-z0-9]", "", sku_text.casefold())
+    product_key=norm(product)
+    return "PRODUCTO:"+product_key if product_key else ""
+
+
+def order_risk_analysis(audit_lines,picker_summary,fnr_inc,mc_inc):
+    """Ordena pedidos por señales históricas FNR/MC de picker y artículo.
+
+    La clasificación es preventiva: las tablas de producto contienen conteos
+    de incidencias, no el total vendido por SKU; por tanto no se presentan como
+    probabilidad de que un pedido futuro tenga una incidencia.
+    """
+    lines=audit_lines.copy()
+    picker_rates={}
+    if picker_summary is not None and not picker_summary.empty:
+        ps=picker_summary.copy()
+        if "CATEGORIA" in ps.columns:
+            ps=ps[ps["CATEGORIA"].astype(str).str.strip().eq("Picker")]
+        for _,row in ps.iterrows():
+            key=person_key(row.get("PICKER",""))
+            if key:
+                picker_rates[key]={
+                    "FNR_%":pd.to_numeric(row.get("FNR_%"),errors="coerce"),
+                    "MC_%":pd.to_numeric(row.get("MC_%"),errors="coerce"),
+                }
+
+    def product_counts(inc):
+        counts={}
+        if inc is None or inc.empty:
+            return counts
+        for _,row in inc.iterrows():
+            keys={_audit_item_key(row.get("SKU",""),row.get("PRODUCTO","")),
+                  _audit_item_key("",row.get("PRODUCTO",""))}
+            keys.discard("")
+            amount=pd.to_numeric(row.get("INCIDENCIAS",1),errors="coerce")
+            amount=1.0 if pd.isna(amount) or amount<=0 else float(amount)
+            for key in keys:
+                counts[key]=counts.get(key,0.0)+amount
+        return counts
+
+    fnr_products=product_counts(fnr_inc)
+    mc_products=product_counts(mc_inc)
+
+    def high_item_cutoff(counts):
+        values=[float(v) for k,v in counts.items() if k.startswith("PRODUCTO:") and v>0]
+        if not values:
+            values=[float(v) for v in counts.values() if v>0]
+        if len(values)>=10:
+            return float(np.quantile(values,0.90))
+        if values and max(values)>=2:
+            return float(max(values))
+        return float("inf")
+
+    fnr_top=high_item_cutoff(fnr_products)
+    mc_top=high_item_cutoff(mc_products)
+
+    def classify(rate,target,item_count,top_cutoff):
+        rate=pd.to_numeric(rate,errors="coerce")
+        top_item=item_count>0 and item_count>=top_cutoff
+        if (pd.notna(rate) and rate>=target) or top_item:
+            return "Alta"
+        if (pd.notna(rate) and rate>=target*.8) or item_count>0:
+            return "Atención"
+        if pd.notna(rate):
+            return "Sin señal histórica"
+        return "Datos incompletos"
+
+    rows=[]
+    for _,row in lines.iterrows():
+        _picker_value=row.get("Picker","")
+        picker_name="" if pd.isna(_picker_value) else str(_picker_value).strip()
+        picker_key=person_key(picker_name)
+        rates=picker_rates.get(picker_key,{})
+        fnr_rate=rates.get("FNR_%",np.nan)
+        mc_rate=rates.get("MC_%",np.nan)
+        item_key=_audit_item_key(row.get("SKU",""),row.get("Artículo",""))
+        product_key=_audit_item_key("",row.get("Artículo",""))
+        fnr_count=float(fnr_products.get(product_key,fnr_products.get(item_key,0.0)))
+        mc_count=float(mc_products.get(product_key,mc_products.get(item_key,0.0)))
+        fnr_level=classify(fnr_rate,FNR_OBJ,fnr_count,fnr_top)
+        mc_level=classify(mc_rate,MC_OBJ,mc_count,mc_top)
+        reasons=[]
+        if pd.notna(fnr_rate) and fnr_rate>=FNR_OBJ:
+            reasons.append(f"Picker sobre objetivo FNR ({fnr_rate:.2f}%)")
+        elif pd.notna(fnr_rate) and fnr_rate>=FNR_OBJ*.8:
+            reasons.append(f"Picker en prevención FNR ({fnr_rate:.2f}%)")
+        if pd.notna(mc_rate) and mc_rate>=MC_OBJ:
+            reasons.append(f"Picker sobre objetivo MC ({mc_rate:.2f}%)")
+        elif pd.notna(mc_rate) and mc_rate>=MC_OBJ*.8:
+            reasons.append(f"Picker en prevención MC ({mc_rate:.2f}%)")
+        if fnr_count:
+            reasons.append(f"Artículo con {fnr_count:g} incidencias FNR históricas")
+        if mc_count:
+            reasons.append(f"Artículo con {mc_count:g} incidencias MC históricas")
+        rows.append({
+            "Riesgo FNR":fnr_level,"Riesgo MC":mc_level,
+            "Historial picker FNR %":fnr_rate,"Historial picker MC %":mc_rate,
+            "Historial artículo FNR":fnr_count,"Historial artículo MC":mc_count,
+            "Motivo de revisión":"; ".join(dict.fromkeys(reasons)) if reasons else "Sin señal histórica en el cruce disponible",
+            "Picker relacionado":picker_name or "Sin asignar",
+        })
+    detail=pd.concat([lines.reset_index(drop=True),pd.DataFrame(rows)],axis=1)
+
+    level_order={"Alta":3,"Atención":2,"Datos incompletos":1,"Sin señal histórica":0}
+    def max_level(values):
+        vals=[str(v) for v in values if str(v) in level_order]
+        return max(vals,key=lambda value:level_order[value]) if vals else "Datos incompletos"
+
+    summary_rows=[]
+    for order_id,group in detail.groupby("Número de pedido",sort=False,dropna=False):
+        pickers=sorted({str(v).strip() for v in group["Picker relacionado"] if str(v).strip() and str(v).strip()!="Sin asignar"})
+        fnr_level=max_level(group["Riesgo FNR"])
+        mc_level=max_level(group["Riesgo MC"])
+        priority=max_level([fnr_level,mc_level])
+        reasons=list(dict.fromkeys(v for v in group["Motivo de revisión"].astype(str) if v and v!="Sin señal histórica en el cruce disponible"))
+        summary_rows.append({
+            "Número de pedido":str(order_id),
+            "Slot":str(group["Slot"].iloc[0]),
+            "Estatus":", ".join(sorted({str(v).strip() for v in group["Estatus"] if str(v).strip()})) if "Estatus" in group else "",
+            "Prioridad":priority,
+            "Riesgo FNR":fnr_level,"Riesgo MC":mc_level,
+            "Pickers asignados":", ".join(pickers) if pickers else "Sin asignar",
+            "Renglones":int(len(group)),
+            "Renglones sin picker":int(group["Picker relacionado"].eq("Sin asignar").sum()),
+            "Motivos": " · ".join(reasons) if reasons else "Sin señal histórica en el cruce disponible",
+        })
+    order_summary=pd.DataFrame(summary_rows)
+    if not order_summary.empty:
+        order_summary["_priority_sort"]=order_summary["Prioridad"].map(level_order).fillna(0)
+        order_summary=order_summary.sort_values(["_priority_sort","Slot","Número de pedido"],ascending=[False,True,True]).drop(columns="_priority_sort").reset_index(drop=True)
+    return detail,order_summary
 
 
 
@@ -2406,12 +2544,12 @@ if _tab_active(a):
 if _tab_active(o):
     with o:
         st.subheader("📦 Auditoría de pedidos")
-        st.caption("Revisa qué lleva cada pedido y descarga una hoja individual para que el picker valide artículo, SKU y cantidad.")
-        st.info("Carga aquí el Excel o CSV que exportas desde Justo. Los pedidos se usan durante esta sesión y no se guardan en el historial de la app.")
-        audit_upload=st.file_uploader("Archivo de pedidos exportado desde Justo",type=["xlsx","xls","csv"],key="order_audit_upload")
+        st.caption("Prioriza pedidos para revisión y descarga una hoja de validación por pedido.")
+        st.info("Solo se analizarán pedidos con slot hasta las 12:00 inclusive. Los pedidos posteriores se omiten. El archivo se usa durante esta sesión y no se guarda en el historial.")
+        audit_upload=st.file_uploader("Archivo de picking de MFC",type=["xlsx","xls","csv"],key="order_audit_upload")
         if audit_upload is None:
-            st.markdown("**La hoja imprimible mostrará:** número de pedido, hora, SKU, artículo, cantidad, validación y observaciones.")
-            st.caption("Exporta desde Justo el detalle de pedidos y cárgalo aquí para comenzar.")
+            st.markdown("**Campos que se usan:** pedido, slot, SKU, producto, cantidad y picker asignado.")
+            st.caption("La prioridad preventiva combina el historial FNR/MC del picker y las incidencias históricas del producto. No requiere datos del cliente.")
         else:
             try:
                 _audit_raw=audit_upload.getvalue()
@@ -2435,102 +2573,159 @@ if _tab_active(o):
                         for _alias in aliases:
                             if norm(_alias) in _normalized_cols:
                                 return _normalized_cols[norm(_alias)]
-                        return "— Selecciona —"
+                        return "— Sin columna —"
                     _fields=[
-                        ("pedido","Número de pedido",["numero_pedido","número de pedido","order_number","order_no","order_id","numero_orden","pedido","orden","order"]),
-                        ("hora","Hora del pedido",["hora_pedido","hora del pedido","order_time","created_at","created","fecha_hora","order_created_at","hora","time"]),
+                        ("pedido","Pedido",["orden","order","numero_pedido","número de pedido","order_number","order_no","order_id","numero_orden","pedido"]),
+                        ("slot","Slot / hora",["slot","horario","hora entrega","hora de entrega","delivery slot","time slot","hora pedido","hora del pedido","order_time","created_at","created","fecha_hora","order_created_at","hora","time"]),
                         ("sku","SKU",["sku","seller_sku","product_sku","codigo_sku","código sku","item_sku"]),
-                        ("articulo","Artículo",["articulo","artículo","producto","product_name","item_name","item","product","nombre_articulo"]),
-                        ("cantidad","Cantidad",["cantidad","quantity","qty","unidades","cant"]),
+                        ("articulo","Producto",["producto","product","articulo","artículo","product_name","item_name","item","nombre_articulo"]),
+                        ("cantidad_pedida","Cantidad pedida",["qty pedido","qtypedido","cantidad pedida","cantidad solicitada","quantity ordered","qty_ordered","quantity","qty","cantidad","unidades","cant"]),
+                        ("picker","Picker asignado",["picker","picker asignado","picker_name","nombre picker","pickeador"]),
+                        ("cantidad_pickeada","Cantidad pickeada",["qty picked","qtypicked","cantidad pickeada","cantidad preparada","quantity picked"]),
+                        ("estatus","Estatus del pedido",["estatus orden","order status","estatus","status"]),
                     ]
                     with st.expander("⚙️ Confirmar columnas del archivo",expanded=True):
-                        st.caption("Confirma que cada campo corresponda a la columna indicada; los encabezados de Justo pueden variar.")
-                        _map_cols=st.columns(5)
+                        st.caption("Revisa los campos detectados. Los opcionales ayudan a explicar y validar cada pedido.")
                         _mapping={}
-                        for _idx,(_key,_label,_aliases) in enumerate(_fields):
-                            with _map_cols[_idx]:
-                                _options=["— Selecciona —"]+_audit_cols
-                                _default=_audit_guess(_aliases)
-                                _mapping[_key]=st.selectbox(_label,_options,index=_options.index(_default),key=f"order_audit_map_{_key}")
-                    if any(_v=="— Selecciona —" for _v in _mapping.values()):
-                        st.warning("Selecciona una columna para número de pedido, hora, SKU, artículo y cantidad.")
+                        _required_keys={"pedido","slot","sku","articulo","cantidad_pedida"}
+                        _required_fields=[item for item in _fields if item[0] in _required_keys]
+                        _optional_fields=[item for item in _fields if item[0] not in _required_keys]
+                        for _label_group,_field_group in [("Datos necesarios",_required_fields),("Datos opcionales",_optional_fields)]:
+                            st.markdown(f"**{_label_group}**")
+                            _map_cols=st.columns(5 if _label_group=="Datos necesarios" else 3)
+                            for _idx,(_key,_label,_aliases) in enumerate(_field_group):
+                                with _map_cols[_idx%len(_map_cols)]:
+                                    _options=["— Sin columna —"]+_audit_cols
+                                    _default=_audit_guess(_aliases)
+                                    _mapping[_key]=st.selectbox(_label,_options,index=_options.index(_default),key=f"order_audit_map_{_key}")
+                    if any(_mapping.get(_k)=="— Sin columna —" for _k in _required_keys):
+                        st.warning("Selecciona pedido, slot/hora, SKU, producto y cantidad pedida para continuar.")
                         st.dataframe(_audit_df.head(10),use_container_width=True,hide_index=True)
                     else:
                         _audit_data=pd.DataFrame({
                             "Número de pedido":_audit_df[_mapping["pedido"]].astype(str).str.strip(),
-                            "Hora del pedido":_audit_df[_mapping["hora"]].astype(str).str.strip(),
+                            "Slot":_audit_df[_mapping["slot"]].astype(str).str.strip(),
                             "SKU":_audit_df[_mapping["sku"]].astype(str).str.strip(),
                             "Artículo":_audit_df[_mapping["articulo"]].astype(str).str.strip(),
-                            "Cantidad":_audit_df[_mapping["cantidad"]].astype(str).str.strip(),
+                            "Cantidad pedida":_audit_df[_mapping["cantidad_pedida"]].astype(str).str.strip(),
+                            "Cantidad pickeada":_audit_df[_mapping["cantidad_pickeada"]].astype(str).str.strip() if _mapping["cantidad_pickeada"]!="— Sin columna —" else "",
+                            "Picker":_audit_df[_mapping["picker"]].astype(str).str.strip() if _mapping["picker"]!="— Sin columna —" else "",
+                            "Estatus":_audit_df[_mapping["estatus"]].astype(str).str.strip() if _mapping["estatus"]!="— Sin columna —" else "",
                         })
                         _audit_data=_audit_data[_audit_data["Número de pedido"].ne("") & _audit_data["Número de pedido"].str.casefold().ne("nan")]
                         _audit_data=_audit_data[_audit_data["Artículo"].ne("") | _audit_data["SKU"].ne("")]
                         if _audit_data.empty:
                             st.error("No encontré filas con número de pedido y artículo/SKU. Revisa la hoja y las columnas elegidas.")
                         else:
-                            _orders=_audit_data["Número de pedido"].drop_duplicates().tolist()
-                            _order=st.selectbox("Pedido a validar",_orders,key="order_audit_selected")
-                            _lines=_audit_data[_audit_data["Número de pedido"]==_order].copy()
-                            _times=[v for v in _lines["Hora del pedido"].drop_duplicates().tolist() if v and v.casefold()!="nan"]
-                            _order_time=_times[0] if _times else "Sin dato"
-                            _units=pd.to_numeric(_lines["Cantidad"].str.replace(",","",regex=False),errors="coerce").sum()
-                            _k1,_k2,_k3=st.columns(3)
-                            _k1.metric("Pedido",str(_order))
-                            _k2.metric("Artículos",f"{len(_lines):,}")
-                            _k3.metric("Unidades",f"{_units:g}" if pd.notna(_units) else "N/D")
-                            st.markdown(f"**Hora del pedido:** {_order_time}")
-                            _preview=_lines[["SKU","Artículo","Cantidad"]].reset_index(drop=True)
-                            st.dataframe(_preview,use_container_width=True,hide_index=True)
+                            def _slot_minutes(value):
+                                _match=re.search(r"(?<!\d)(\d{1,2}):(\d{2})(?!\d)",str(value or ""))
+                                if not _match: return np.nan
+                                _hour,_minute=int(_match.group(1)),int(_match.group(2))
+                                return _hour*60+_minute if 0<=_hour<=23 and 0<=_minute<=59 else np.nan
+                            _audit_data["_slot_min"]=_audit_data["Slot"].map(_slot_minutes)
+                            _slot_stats=_audit_data.groupby("Número de pedido",as_index=False).agg(
+                                _slot_missing=("_slot_min",lambda values:bool(values.isna().any())),
+                                _slot_max=("_slot_min","max"),
+                                _slot_min=("_slot_min","min"),
+                            )
+                            _included_orders=set(_slot_stats.loc[(~_slot_stats["_slot_missing"]) & (_slot_stats["_slot_max"]<=12*60),"Número de pedido"])
+                            _after_noon_orders=int((~_slot_stats["_slot_missing"] & (_slot_stats["_slot_max"]>12*60)).sum())
+                            _bad_time_orders=int(_slot_stats["_slot_missing"].sum())
+                            _eligible=_audit_data[_audit_data["Número de pedido"].isin(_included_orders)].drop(columns="_slot_min").copy()
+                            _line_count=len(_eligible)
+                            _order_count=len(_included_orders)
+                            st.caption(f"Incluidos: {_order_count:,} pedidos y {_line_count:,} renglones hasta las 12:00 · Omitidos después de las 12:00: {_after_noon_orders:,} pedidos · Sin horario legible: {_bad_time_orders:,} pedidos.")
+                            if _eligible.empty:
+                                st.warning("No hay pedidos con slot hasta las 12:00 en este archivo.")
+                            else:
+                                _audit_detail,_risk_summary=order_risk_analysis(_eligible,s,fnr,mc)
+                                _risk_order={"Alta":3,"Atención":2,"Datos incompletos":1,"Sin señal histórica":0}
+                                _risk_badges={"Alta":"🔴 Alta","Atención":"🟡 Atención","Datos incompletos":"⚪ Datos incompletos","Sin señal histórica":"🟢 Sin señal histórica"}
+                                _risk_summary["_risk_sort"]=_risk_summary["Prioridad"].map(_risk_order).fillna(0)
+                                _counts=_risk_summary["Prioridad"].value_counts()
+                                _k1,_k2,_k3,_k4=st.columns(4)
+                                _k1.metric("Pedidos a revisar",f"{len(_risk_summary):,}")
+                                _k2.metric("Prioridad alta",f"{int(_counts.get('Alta',0)):,}")
+                                _k3.metric("Atención",f"{int(_counts.get('Atención',0)):,}")
+                                _k4.metric("Pedidos sin picker",f"{int(_risk_summary['Pickers asignados'].eq('Sin asignar').sum()):,}")
+                                st.caption("La prioridad cruza las tasas históricas del picker (metas FNR <1.50% y MC <1.00%) con los conteos históricos de incidencias por artículo. Es una guía preventiva, no una probabilidad de incidencia. Verifica cada FNR en Backoffice.")
+                                _risk_display=_risk_summary.drop(columns="_risk_sort")
+                                for _risk_col in ["Prioridad","Riesgo FNR","Riesgo MC"]:
+                                    _risk_display[_risk_col]=_risk_display[_risk_col].map(lambda value:_risk_badges.get(str(value),str(value)))
+                                st.dataframe(_risk_display,use_container_width=True,hide_index=True)
+                                _order_options=_risk_summary["Número de pedido"].astype(str).tolist()
+                                _order=st.selectbox("Pedido a validar",_order_options,key="order_audit_selected")
+                                _lines=_audit_detail[_audit_detail["Número de pedido"].astype(str)==str(_order)].copy()
+                                _order_row=_risk_summary[_risk_summary["Número de pedido"].astype(str)==str(_order)].iloc[0]
+                                _slot_values=[v for v in _lines["Slot"].drop_duplicates().astype(str).tolist() if v and v.casefold()!="nan"]
+                                _order_slot="–".join(_slot_values) if _slot_values else "Sin dato"
+                                _units=pd.to_numeric(_lines["Cantidad pedida"].str.replace(",","",regex=False),errors="coerce").sum()
+                                _picked_values=pd.to_numeric(_lines["Cantidad pickeada"].str.replace(",","",regex=False),errors="coerce")
+                                _picked=_picked_values.sum() if _picked_values.notna().any() else np.nan
+                                _k1,_k2,_k3,_k4=st.columns(4)
+                                _k1.metric("Pedido",str(_order))
+                                _k2.metric("Slot",_order_slot)
+                                _k3.metric("Prioridad",_risk_badges.get(str(_order_row["Prioridad"]),str(_order_row["Prioridad"])))
+                                _k4.metric("Pickers",str(_order_row["Pickers asignados"]))
+                                st.markdown(f"**Riesgo FNR:** {_order_row['Riesgo FNR']} · **Riesgo MC:** {_order_row['Riesgo MC']}  \n**Motivo:** {_order_row['Motivos']}")
+                                st.caption(f"Renglones: {len(_lines):,} · Cantidad pedida: {_units:g} · Cantidad pickeada: {f'{_picked:g}' if pd.notna(_picked) else 'N/D'}")
+                                _preview=_lines[["SKU","Artículo","Picker relacionado","Cantidad pedida","Cantidad pickeada","Riesgo FNR","Riesgo MC"]].reset_index(drop=True)
+                                for _risk_col in ["Riesgo FNR","Riesgo MC"]:
+                                    _preview[_risk_col]=_preview[_risk_col].map(lambda value:_risk_badges.get(str(value),str(value)))
+                                st.dataframe(_preview,use_container_width=True,hide_index=True)
 
-                            _print_buffer=io.BytesIO()
-                            with pd.ExcelWriter(_print_buffer,engine="openpyxl") as _writer:
-                                _preview.to_excel(_writer,sheet_name="Validar pedido",index=False,startrow=5)
-                                _ws=_writer.sheets["Validar pedido"]
-                                _ws.merge_cells("A1:E1")
-                                _ws["A1"]="AUDITORÍA DE PEDIDO"
-                                _ws["A2"]="Número de pedido"; _ws["B2"]=str(_order)
-                                _ws["C2"]="Hora del pedido"; _ws["D2"]=_order_time
-                                _ws["A3"]="Picker"; _ws["B3"]=""
-                                _ws["C3"]="Fecha / hora de validación"; _ws["D3"]=""
-                                _headers=6
-                                _ws.cell(_headers,4,"Validado")
-                                _ws.cell(_headers,5,"Observaciones")
-                                for _row in range(_headers+1,_headers+1+len(_preview)):
-                                    _ws.cell(_row,4,"□")
-                                    _ws.cell(_row,5,"")
-                                _footer=_headers+len(_preview)+2
-                                _ws.cell(_footer,1,"Marca cada artículo después de comparar nombre, SKU y cantidad.")
-                                _ws.merge_cells(start_row=_footer,start_column=1,end_row=_footer,end_column=5)
-                                from openpyxl.styles import Font as _XLFont, PatternFill as _XLFill, Border as _XLBorder, Side as _XLSide, Alignment as _XLAlignment
-                                _ws["A1"].font=_XLFont(name="Arial",size=16,bold=True,color="FFFFFF")
-                                _ws["A1"].fill=_XLFill("solid",fgColor="BD2426")
-                                _ws["A1"].alignment=_XLAlignment(horizontal="center")
-                                _thin=_XLSide(style="thin",color="D9D9D9")
-                                for _cell in _ws[_headers]:
-                                    _cell.font=_XLFont(bold=True,color="FFFFFF")
-                                    _cell.fill=_XLFill("solid",fgColor="444654")
-                                    _cell.alignment=_XLAlignment(horizontal="center",vertical="center")
-                                for _row in _ws.iter_rows(min_row=2,max_row=_headers+len(_preview),min_col=1,max_col=5):
-                                    for _cell in _row:
-                                        _cell.border=_XLBorder(bottom=_thin)
-                                        _cell.alignment=_XLAlignment(vertical="center",wrap_text=True)
-                                for _col,_width in {"A":22,"B":45,"C":12,"D":14,"E":30}.items():
-                                    _ws.column_dimensions[_col].width=_width
-                                _ws.row_dimensions[1].height=28
-                                _ws.row_dimensions[_headers].height=24
-                                _ws.freeze_panes="A7"
-                                _ws.sheet_properties.pageSetUpPr.fitToPage=True
-                                _ws.page_setup.orientation="landscape"
-                                _ws.page_setup.paperSize=_ws.PAPERSIZE_LETTER
-                                _ws.page_setup.fitToWidth=1
-                                _ws.page_setup.fitToHeight=1
-                                _ws.page_margins.left=0.25; _ws.page_margins.right=0.25
-                                _ws.page_margins.top=0.4; _ws.page_margins.bottom=0.4
-                                _ws.print_area=f"A1:E{_footer}"
-                                _ws.print_title_rows="1:6"
-                            _safe_order=re.sub(r"[^A-Za-z0-9_-]+","_",str(_order)).strip("_")[:40] or "pedido"
-                            st.download_button("⬇️ Descargar hoja de validación para imprimir",_print_buffer.getvalue(),file_name=f"Validacion_pedido_{_safe_order}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",key=f"order_audit_download_{hashlib.md5(str(_order).encode()).hexdigest()}",type="primary")
-                            st.caption("Imprime la hoja del pedido seleccionado. Incluye espacio para marcar artículos, anotar diferencias y registrar quién lo validó.")
+                                _print_buffer=io.BytesIO()
+                                with pd.ExcelWriter(_print_buffer,engine="openpyxl") as _writer:
+                                    _preview.to_excel(_writer,sheet_name="Validar pedido",index=False,startrow=5)
+                                    _ws=_writer.sheets["Validar pedido"]
+                                    _ws.merge_cells("A1:I1")
+                                    _ws["A1"]="AUDITORÍA DE PEDIDO"
+                                    _ws["A2"]="Número de pedido"; _ws["B2"]=str(_order)
+                                    _ws["C2"]="Slot"; _ws["D2"]=_order_slot
+                                    _ws["E2"]="Prioridad"; _ws["F2"]=_order_row["Prioridad"]
+                                    _ws["A3"]="Picker(s)"; _ws["B3"]=_order_row["Pickers asignados"]
+                                    _ws["C3"]="Fecha / hora de validación"; _ws["D3"]=""
+                                    _ws["A4"]="Motivo"; _ws["B4"]=_order_row["Motivos"]
+                                    _ws.merge_cells("B4:I4")
+                                    _headers=6
+                                    _ws.cell(_headers,8,"Validado")
+                                    _ws.cell(_headers,9,"Observaciones")
+                                    for _row in range(_headers+1,_headers+1+len(_preview)):
+                                        _ws.cell(_row,8,"□")
+                                        _ws.cell(_row,9,"")
+                                    _footer=_headers+len(_preview)+2
+                                    _ws.cell(_footer,1,"Compara producto, SKU y cantidades. La prioridad se basa en patrones históricos FNR/MC.")
+                                    _ws.merge_cells(start_row=_footer,start_column=1,end_row=_footer,end_column=9)
+                                    from openpyxl.styles import Font as _XLFont, PatternFill as _XLFill, Border as _XLBorder, Side as _XLSide, Alignment as _XLAlignment
+                                    _ws["A1"].font=_XLFont(name="Arial",size=16,bold=True,color="FFFFFF")
+                                    _ws["A1"].fill=_XLFill("solid",fgColor="BD2426")
+                                    _ws["A1"].alignment=_XLAlignment(horizontal="center")
+                                    _thin=_XLSide(style="thin",color="D9D9D9")
+                                    for _cell in _ws[_headers]:
+                                        _cell.font=_XLFont(bold=True,color="FFFFFF")
+                                        _cell.fill=_XLFill("solid",fgColor="444654")
+                                        _cell.alignment=_XLAlignment(horizontal="center",vertical="center",wrap_text=True)
+                                    for _row in _ws.iter_rows(min_row=2,max_row=_headers+len(_preview),min_col=1,max_col=9):
+                                        for _cell in _row:
+                                            _cell.border=_XLBorder(bottom=_thin)
+                                            _cell.alignment=_XLAlignment(vertical="center",wrap_text=True)
+                                    for _col,_width in {"A":18,"B":38,"C":24,"D":14,"E":14,"F":14,"G":14,"H":12,"I":28}.items():
+                                        _ws.column_dimensions[_col].width=_width
+                                    _ws.row_dimensions[1].height=28
+                                    _ws.row_dimensions[_headers].height=32
+                                    _ws.freeze_panes="A7"
+                                    _ws.sheet_properties.pageSetUpPr.fitToPage=True
+                                    _ws.page_setup.orientation="landscape"
+                                    _ws.page_setup.paperSize=_ws.PAPERSIZE_LETTER
+                                    _ws.page_setup.fitToWidth=1
+                                    _ws.page_setup.fitToHeight=0
+                                    _ws.page_margins.left=0.25; _ws.page_margins.right=0.25
+                                    _ws.page_margins.top=0.4; _ws.page_margins.bottom=0.4
+                                    _ws.print_area=f"A1:I{_footer}"
+                                    _ws.print_title_rows="1:6"
+                                _safe_order=re.sub(r"[^A-Za-z0-9_-]+","_",str(_order)).strip("_")[:40] or "pedido"
+                                st.download_button("⬇️ Descargar hoja de validación",_print_buffer.getvalue(),file_name=f"Validacion_pedido_{_safe_order}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",key=f"order_audit_download_{hashlib.md5(str(_order).encode()).hexdigest()}",type="primary")
+                                st.caption("La hoja conserva el picker de cada renglón y permite validar cantidades y artículos.")
             except Exception as _audit_error:
                 st.error(f"No pude leer el archivo de pedidos: {_audit_error}")
 
