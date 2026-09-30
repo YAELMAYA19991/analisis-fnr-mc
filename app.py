@@ -612,7 +612,7 @@ def load_store():
     if cloud_data is not None:
         data=json.loads(cloud_data.decode("utf-8"))
         if not isinstance(data,dict): raise RuntimeError("El expediente guardado en la nube no contiene un objeto JSON válido.")
-        for key,value in {"pickers":{},"feedback_rows":[],"recursos_formatos":[],"procesos":[],"excluded_orders":[],"master_overrides":{},"master_excluded":[],"seguimientos_documentos":[],"supervisores":[],"upload_meta":{},"attendance_summary":None,"attendance_meta":{},"attendance_links":{}}.items(): data.setdefault(key,value)
+        for key,value in {"pickers":{},"feedback_rows":[],"recursos_formatos":[],"procesos":[],"excluded_orders":[],"master_overrides":{},"master_excluded":[],"seguimientos_documentos":[],"supervisores":[],"upload_meta":{},"attendance_summary":None,"attendance_meta":{},"attendance_links":{},"order_audits":[]}.items(): data.setdefault(key,value)
         try:
             with open(STORE_FILE,"wb") as f: f.write(json.dumps(data,ensure_ascii=False,indent=2).encode("utf-8"))
         except OSError: pass
@@ -638,11 +638,12 @@ def load_store():
                 data.setdefault("attendance_summary", None)
                 data.setdefault("attendance_meta", {})
                 data.setdefault("attendance_links", {})
+                data.setdefault("order_audits", [])
                 if path != STORE_FILE or cloud_enabled(): save_store(data)
                 return data
             except Exception:
                 continue
-    data={"pickers": {}, "feedback_rows": [], "recursos_formatos": [], "procesos": [], "excluded_orders": [], "master_overrides": {}, "master_excluded": [], "seguimientos_documentos": [], "supervisores": [], "upload_meta": {}, "attendance_summary": None, "attendance_meta": {}, "attendance_links": {}}
+    data={"pickers": {}, "feedback_rows": [], "recursos_formatos": [], "procesos": [], "excluded_orders": [], "master_overrides": {}, "master_excluded": [], "seguimientos_documentos": [], "supervisores": [], "upload_meta": {}, "attendance_summary": None, "attendance_meta": {}, "attendance_links": {}, "order_audits": []}
     if cloud_enabled(): save_store(data)
     return data
 
@@ -2545,7 +2546,7 @@ if _tab_active(o):
     with o:
         st.subheader("📦 Auditoría de pedidos")
         st.caption("Prioriza pedidos para revisión y descarga una hoja de validación por pedido.")
-        st.info("Solo se analizarán pedidos con slot hasta las 12:00 inclusive. Los pedidos posteriores se omiten. El archivo se usa durante esta sesión y no se guarda en el historial.")
+        st.info("Solo se analizarán pedidos con slot hasta las 12:00 inclusive. Los pedidos posteriores se omiten. El archivo se usa durante esta sesión; las auditorías que guardes sí permanecen en el historial y respaldo configurado.")
         audit_upload=st.file_uploader("Archivo de picking de MFC",type=["xlsx","xls","csv"],key="order_audit_upload")
         if audit_upload is None:
             st.markdown("**Campos que se usan:** pedido, slot, SKU, producto, cantidad y picker asignado.")
@@ -2674,6 +2675,107 @@ if _tab_active(o):
                                     _preview[_risk_col]=_preview[_risk_col].map(lambda value:_risk_badges.get(str(value),str(value)))
                                 st.dataframe(_preview,use_container_width=True,hide_index=True)
 
+                                st.markdown("### ✅ Validar y guardar auditoría")
+                                st.caption("Marca cada renglón después de comparar producto, SKU y cantidades. El resultado queda ligado al pedido para cruzarlo después con FNR y MC.")
+                                _existing_audit=next((a for a in reversed(store.get("order_audits",[]) or []) if str(a.get("pedido",""))==str(_order)),None)
+                                if _existing_audit:
+                                    st.info(f"Última auditoría guardada: {_existing_audit.get('fecha_auditoria','')} · {_existing_audit.get('resultado','')}. Puedes registrar una nueva revisión sin borrar la anterior.")
+
+                                _audit_key=hashlib.sha256((str(_order)+"|"+hashlib.sha256(_audit_raw).hexdigest()).encode()).hexdigest()[:14]
+                                _editor_cols=["SKU","Artículo","Picker relacionado","Cantidad pedida","Cantidad pickeada"]
+                                _audit_editor=_lines[_editor_cols].reset_index(drop=True).copy()
+                                _audit_editor.insert(0,"Validado",False)
+                                _audit_editor["Diferencia encontrada"]=False
+                                _audit_editor["Observaciones"]=""
+                                _audit_editor=st.data_editor(
+                                    _audit_editor,
+                                    hide_index=True,
+                                    use_container_width=True,
+                                    num_rows="fixed",
+                                    disabled=_editor_cols,
+                                    key="audit_editor_"+_audit_key,
+                                )
+
+                                def _audit_order_incidents(source,order):
+                                    if source is None or source.empty or "ORDER_NUMBER" not in source.columns:
+                                        return pd.DataFrame()
+                                    _mask=source["ORDER_NUMBER"].astype(str).str.strip().map(norm)==norm(order)
+                                    return source.loc[_mask].copy()
+
+                                _audit_fnr=_audit_order_incidents(fnr,_order)
+                                _audit_mc=_audit_order_incidents(mc,_order)
+                                def _audit_incident_count(frame):
+                                    if frame.empty: return 0
+                                    if "INCIDENCIAS" in frame.columns:
+                                        return int(pd.to_numeric(frame["INCIDENCIAS"],errors="coerce").fillna(0).sum())
+                                    return int(len(frame))
+                                _audit_fnr_count=_audit_incident_count(_audit_fnr)
+                                _audit_mc_count=_audit_incident_count(_audit_mc)
+
+                                st.markdown("#### 🔎 Cruce del pedido con FNR y Mala Calidad")
+                                _cross1,_cross2=st.columns(2)
+                                _cross1.metric("FNR vinculadas",_audit_fnr_count)
+                                _cross2.metric("MC vinculadas",_audit_mc_count)
+                                if _audit_fnr_count or _audit_mc_count:
+                                    st.warning("Este pedido aparece en FNR y/o MC. La coincidencia sirve como evidencia para investigar, pero no determina por sí sola si el origen fue pickeo u operación.")
+                                    for _audit_type,_audit_frame in (("FNR",_audit_fnr),("MC",_audit_mc)):
+                                        if not _audit_frame.empty:
+                                            _show_cols=[col for col in ["ORDER_NUMBER","PRODUCTO","PICKER","AREA","INCIDENCIAS"] if col in _audit_frame.columns]
+                                            with st.expander(f"Ver {_audit_type} relacionados ({len(_audit_frame):,} registros)"):
+                                                st.dataframe(_audit_frame[_show_cols],use_container_width=True,hide_index=True)
+                                else:
+                                    st.caption("No hay coincidencias para este pedido en los archivos FNR/MC actualmente cargados.")
+
+                                _audit_form1,_audit_form2=st.columns(2)
+                                with _audit_form1:
+                                    _audit_picker_default=str(_order_row.get("Pickers asignados",""))
+                                    _audit_picker=st.text_input("Picker(s) relacionado(s)",value="" if _audit_picker_default=="Sin asignar" else _audit_picker_default,key="audit_picker_"+_audit_key)
+                                    _audit_responsable=st.text_input("Persona que realizó la auditoría",key="audit_responsable_"+_audit_key)
+                                with _audit_form2:
+                                    _audit_resultado=st.selectbox(
+                                        "Conclusión final",
+                                        ["Pendiente de determinar","Pedido correcto","Posible error de operación","Posible error de pickeo","Otra incidencia"],
+                                        key="audit_resultado_"+_audit_key,
+                                    )
+                                    _audit_notes=st.text_area("Evidencia / observaciones generales",key="audit_notes_"+_audit_key)
+
+                                if st.button("💾 Marcar pedido como auditado y guardar",type="primary",key="audit_save_"+_audit_key):
+                                    _all_validated=bool(_audit_editor["Validado"].fillna(False).astype(bool).all())
+                                    _has_difference=bool(_audit_editor["Diferencia encontrada"].fillna(False).astype(bool).any())
+                                    _line_notes=bool(_audit_editor["Observaciones"].fillna("").astype(str).str.strip().ne("").any())
+                                    if not _audit_responsable.strip():
+                                        st.error("Indica quién realizó la auditoría.")
+                                    elif not _all_validated:
+                                        st.error("Marca todos los renglones como validados antes de guardar el pedido.")
+                                    elif _has_difference and not (_audit_notes.strip() or _line_notes):
+                                        st.error("Encontraste una diferencia: agrega la evidencia u observación correspondiente.")
+                                    else:
+                                        _audit_record={
+                                            "id":hashlib.sha256((str(_order)+"|"+datetime.now().isoformat()).encode()).hexdigest()[:18],
+                                            "pedido":str(_order),
+                                            "slot":str(_order_slot),
+                                            "fecha_auditoria":datetime.now().isoformat(timespec="seconds"),
+                                            "picker":_audit_picker.strip(),
+                                            "auditor":_audit_responsable.strip(),
+                                            "resultado":_audit_resultado,
+                                            "observaciones":_audit_notes.strip(),
+                                            "diferencias":int(_audit_editor["Diferencia encontrada"].fillna(False).astype(bool).sum()),
+                                            "lineas":json.loads(_audit_editor.to_json(orient="records",force_ascii=False)),
+                                            "fnr_al_guardar":_audit_fnr_count,
+                                            "mc_al_guardar":_audit_mc_count,
+                                            "prioridad_preventiva":str(_order_row.get("Prioridad","")),
+                                            "fuente_archivo":audit_upload.name,
+                                        }
+                                        store.setdefault("order_audits",[]).append(_audit_record)
+                                        try:
+                                            save_store(store)
+                                        except Exception as _audit_save_error:
+                                            if store.get("order_audits") and store["order_audits"][-1].get("id")==_audit_record["id"]:
+                                                store["order_audits"].pop()
+                                            st.error(f"No se pudo confirmar el guardado: {_audit_save_error}")
+                                        else:
+                                            st.success("Pedido marcado como auditado. El registro quedó guardado para compararlo con FNR y MC.")
+
                                 _print_buffer=io.BytesIO()
                                 with pd.ExcelWriter(_print_buffer,engine="openpyxl") as _writer:
                                     _preview.to_excel(_writer,sheet_name="Validar pedido",index=False,startrow=5)
@@ -2728,6 +2830,50 @@ if _tab_active(o):
                                 st.caption("La hoja conserva el picker de cada renglón y permite validar cantidades y artículos.")
             except Exception as _audit_error:
                 st.error(f"No pude leer el archivo de pedidos: {_audit_error}")
+
+        st.divider()
+        st.subheader("📚 Historial de pedidos auditados")
+        _saved_audits=store.get("order_audits",[]) or []
+        if _saved_audits:
+            def _current_order_incident_count(source,order):
+                if source is None or source.empty or "ORDER_NUMBER" not in source.columns:
+                    return 0
+                _rows=source[source["ORDER_NUMBER"].astype(str).str.strip().map(norm)==norm(order)]
+                if _rows.empty: return 0
+                if "INCIDENCIAS" in _rows.columns:
+                    return int(pd.to_numeric(_rows["INCIDENCIAS"],errors="coerce").fillna(0).sum())
+                return int(len(_rows))
+            _audit_history=pd.DataFrame([{
+                "Pedido":rec.get("pedido",""),
+                "Slot":rec.get("slot",rec.get("hora_pedido","")),
+                "Fecha auditoría":rec.get("fecha_auditoria",""),
+                "Picker":rec.get("picker",""),
+                "Auditó":rec.get("auditor",""),
+                "Resultado":rec.get("resultado",""),
+                "Diferencias":rec.get("diferencias",0),
+                "FNR al guardar":rec.get("fnr_al_guardar",0),
+                "MC al guardar":rec.get("mc_al_guardar",0),
+                "Observaciones":rec.get("observaciones",""),
+            } for rec in _saved_audits])
+            _audit_history["FNR actual"]=_audit_history["Pedido"].map(lambda order:_current_order_incident_count(fnr,order))
+            _audit_history["MC actual"]=_audit_history["Pedido"].map(lambda order:_current_order_incident_count(mc,order))
+            _audit_history=_audit_history.sort_values("Fecha auditoría",ascending=False)
+            _audit_search=st.text_input("Buscar pedido auditado",key="audit_history_search")
+            if _audit_search.strip():
+                _audit_history=_audit_history[_audit_history["Pedido"].astype(str).str.contains(re.escape(_audit_search.strip()),case=False,na=False)]
+            st.dataframe(_audit_history,use_container_width=True,hide_index=True)
+            st.caption("FNR/MC actual se recalcula con los archivos operativos que estén cargados ahora; así puedes comparar la auditoría previa contra incidencias que aparezcan después.")
+            _audit_export=io.BytesIO()
+            with pd.ExcelWriter(_audit_export,engine="openpyxl") as _audit_writer:
+                _audit_history.to_excel(_audit_writer,index=False,sheet_name="Auditorias")
+                _audit_line_rows=[]
+                for _rec in _saved_audits:
+                    for _line in _rec.get("lineas",[]) or []:
+                        _audit_line_rows.append({"Pedido":_rec.get("pedido",""),"Fecha auditoría":_rec.get("fecha_auditoria",""),**_line})
+                pd.DataFrame(_audit_line_rows).to_excel(_audit_writer,index=False,sheet_name="Articulos auditados")
+            st.download_button("⬇️ Exportar historial de auditorías",_audit_export.getvalue(),file_name="Historial_auditorias_pedidos.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",key="audit_history_export")
+        else:
+            st.caption("Aún no hay pedidos auditados guardados.")
 
 if _tab_active(b):
     with b:
