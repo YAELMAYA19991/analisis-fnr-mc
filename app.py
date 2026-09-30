@@ -2886,35 +2886,36 @@ if isinstance(s,pd.DataFrame) and "PICKER" in s.columns:
             if not any(x["PICKER"]==_candidate["PICKER"] and x["CATEGORIA"]==_candidate["CATEGORIA"] for x in _bucket): _bucket.append(_candidate)
 app_people_names=sorted({z["PICKER"] for _bucket in app_people_by_name.values() for z in _bucket},key=lambda z:z.upper())
 
-st.subheader("🔳 Generador de códigos QR")
-with st.container(border=True):
-    _qr_select_col,_qr_preview_col=st.columns([1.5,1])
-    with _qr_select_col:
-        _qr_codes=[f"CYN-PCABA-U{_n}" for _n in range(1,31)]
-        _qr_selection=st.selectbox("Código rápido · pickers U1–U30",["Escribir enlace o texto"]+_qr_codes,key="qr_generator_selection")
-        if _qr_selection=="Escribir enlace o texto":
-            _qr_content=st.text_input("Enlace o texto",placeholder="Pega un enlace o escribe texto",key="qr_generator_content")
-        else:
-            _qr_content=_qr_selection
-            st.caption(f" Código seleccionado: **{_qr_content}**")
-    with _qr_preview_col:
-        if _qr_content.strip():
-            try:
-                _qr_code=qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M,box_size=8,border=4)
-                _qr_code.add_data(_qr_content.strip())
-                _qr_code.make(fit=True)
-                _qr_image=_qr_code.make_image(fill_color="black",back_color="white").convert("RGB")
-                _qr_buffer=io.BytesIO()
-                _qr_image.save(_qr_buffer,format="PNG")
-                _qr_bytes=_qr_buffer.getvalue()
-                st.image(_qr_bytes,caption="Vista previa",width=145)
-                _qr_filename=re.sub(r"[^A-Za-z0-9_-]+","_",_qr_content.strip()).strip("_")[:60] or "codigo_qr"
-                st.download_button("⬇️ Descargar QR",_qr_bytes,file_name=f"{_qr_filename}.png",mime="image/png",key="download_generated_qr")
-            except Exception as _qr_error:
-                st.error(f"No se pudo generar el QR: {_qr_error}")
-        else:
-            st.caption("Selecciona CYN-PCABA-U1–U30 para generar el QR al instante.")
-
+with st.expander("🔳 Generador de códigos QR",expanded=False):
+    st.caption("Genera códigos CYN-PCABA-U1–U30 o un QR personalizado sin ocupar espacio en la portada.")
+    with st.container(border=True):
+        _qr_select_col,_qr_preview_col=st.columns([1.5,1])
+        with _qr_select_col:
+            _qr_codes=[f"CYN-PCABA-U{_n}" for _n in range(1,31)]
+            _qr_selection=st.selectbox("Código rápido · pickers U1–U30",["Escribir enlace o texto"]+_qr_codes,key="qr_generator_selection")
+            if _qr_selection=="Escribir enlace o texto":
+                _qr_content=st.text_input("Enlace o texto",placeholder="Pega un enlace o escribe texto",key="qr_generator_content")
+            else:
+                _qr_content=_qr_selection
+                st.caption(f" Código seleccionado: **{_qr_content}**")
+        with _qr_preview_col:
+            if _qr_content.strip():
+                try:
+                    _qr_code=qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M,box_size=8,border=4)
+                    _qr_code.add_data(_qr_content.strip())
+                    _qr_code.make(fit=True)
+                    _qr_image=_qr_code.make_image(fill_color="black",back_color="white").convert("RGB")
+                    _qr_buffer=io.BytesIO()
+                    _qr_image.save(_qr_buffer,format="PNG")
+                    _qr_bytes=_qr_buffer.getvalue()
+                    st.image(_qr_bytes,caption="Vista previa",width=145)
+                    _qr_filename=re.sub(r"[^A-Za-z0-9_-]+","_",_qr_content.strip()).strip("_")[:60] or "codigo_qr"
+                    st.download_button("⬇️ Descargar QR",_qr_bytes,file_name=f"{_qr_filename}.png",mime="image/png",key="download_generated_qr")
+                except Exception as _qr_error:
+                    st.error(f"No se pudo generar el QR: {_qr_error}")
+            else:
+                st.caption("Selecciona CYN-PCABA-U1–U30 para generar el QR al instante.")
+    
 st.divider()
 
 _tab_labels=["🏠 Bodega y turnos / áreas","📦 Auditoría de pedidos","👤 Pickers y supervisores","📅 Faltas y retardos","🛡️ Seguimiento","📌 Pendientes","🧰 Herramientas"]
