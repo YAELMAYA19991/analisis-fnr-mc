@@ -2942,7 +2942,12 @@ if _tab_active(a):
         with st.expander("📊 Histórico · comparar con mes anterior",expanded=False):
             st.caption("Sube los mismos 3 Excel operativos del periodo anterior. La plantilla actual se usa para identificar a los mismos pickers. Al guardar el histórico, ya no tendrás que volver a subirlo para comparar.")
             _monthly_history=store.get("monthly_history",{}) or {}
-            _history_options=["➕ Cargar nuevo periodo"]+sorted(_monthly_history.keys(),reverse=True)
+            _history_saved_keys=sorted(
+                _monthly_history.keys(),
+                key=lambda key:str((_monthly_history.get(key,{}) or {}).get("period_key",key)),
+                reverse=True,
+            )
+            _history_options=["➕ Cargar nuevo periodo"]+_history_saved_keys
             _history_choice=st.selectbox("Comparar contra",_history_options,key="monthly_history_choice")
             _history_snapshot=None
 
@@ -2981,6 +2986,7 @@ if _tab_active(a):
                         if st.button("💾 Guardar / actualizar este histórico",type="primary",key="save_monthly_history"):
                             _clean_label=_hist_label.strip() or _default_hist_label
                             _history_snapshot["periodo"]=_clean_label
+                            _history_snapshot["period_key"]=f"{_prev_year:04d}-{_prev_month:02d}"
                             store.setdefault("monthly_history",{})[_clean_label]=_history_snapshot
                             save_store(store)
                             st.success(f"Histórico {_clean_label} guardado.")
@@ -2991,7 +2997,12 @@ if _tab_active(a):
             else:
                 _history_snapshot=_monthly_history.get(_history_choice)
                 if _history_snapshot:
-                    st.caption(f"Histórico guardado: {_history_snapshot.get('guardado','')}")
+                    st.caption(f"Histórico guardado: {_history_snapshot.get('guardado','')} · Clave: {_history_snapshot.get('period_key','Sin clave cronológica')}")
+                    if st.button("🗑️ Eliminar este histórico",key="delete_monthly_history"):
+                        store.setdefault("monthly_history",{}).pop(_history_choice,None)
+                        save_store(store)
+                        st.success("Histórico eliminado.")
+                        st.rerun()
 
             if _history_snapshot:
                 _prev_tot=_history_snapshot.get("totales",{}) or {}
