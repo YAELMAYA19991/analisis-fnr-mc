@@ -5,7 +5,7 @@
 # ================================================================
 
 
-import io, re, json, os, smtplib, ssl, zipfile, hashlib, urllib.request, urllib.error, urllib.parse
+import io, re, json, os, smtplib, ssl, zipfile, hashlib, urllib.request, urllib.error, urllib.parse, html
 from difflib import SequenceMatcher
 from datetime import datetime
 from email.message import EmailMessage
@@ -259,6 +259,12 @@ PERSIST_FILES = {
     "plantilla_personal": os.path.join(PERSIST_DIR, "master_pickers.xlsx"),
 }
 CLOUD_STORE_KEY="state/picker_seguimiento.json"
+STORE_SHARDS={
+    "pickers":("state/pickers.json",os.path.join(PERSIST_DIR,"pickers.json"),{}),
+    "order_audits":("state/order_audits.json",os.path.join(PERSIST_DIR,"order_audits.json"),[]),
+    "monthly_history":("state/monthly_history.json",os.path.join(PERSIST_DIR,"monthly_history.json"),{}),
+    "powerbi_krs_history":("state/powerbi_krs_history.json",os.path.join(PERSIST_DIR,"powerbi_krs_history.json"),[]),
+}
 _CLOUD_BUCKET_CHECKED=False
 
 def cloud_config():
@@ -605,81 +611,205 @@ def migrate_local_assets_to_cloud(store):
     if changed: save_store(store)
     return moved,missing
 
-def load_store():
-    """Carga el expediente persistente y migra el JSON antiguo si existe."""
+def _json_atomic_write(path,value):
+    os.makedirs(os.path.dirname(path) or ".",exist_ok=True)
+    payload=json.dumps(value,ensure_ascii=False,indent=2).encode("utf-8")
+    tmp=path+".tmp"
+    with open(tmp,"wb") as f: f.write(payload)
+    os.replace(tmp,path)
+    return payload
+
+def _json_local_read(path,default):
+    try:
+        with open(path,"r",encoding="utf-8") as f:
+            value=json.load(f)
+        return value
+    except Exception:
+        return default.copy() if isinstance(default,dict) else list(default) if isinstance(default,list) else default
+
+def _cloud_json_read(key,default):
+    if not cloud_enabled():
+        return default.copy() if isinstance(default,dict) else list(default) if isinstance(default,list) else default
+    raw=cloud_download(key,missing_ok=True)
+    if raw is None:
+        return default.copy() if isinstance(default,dict) else list(default) if isinstance(default,list) else default
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return default.copy() if isinstance(default,dict) else list(default) if isinstance(default,list) else default
+
+def _unique_records(records):
+    out=[]; seen=set()
+    for item in records or []:
+        if not isinstance(item,dict):
+            marker=json.dumps(item,ensure_ascii=False,sort_keys=True,default=str)
+        else:
+            marker=str(item.get("id") or item.get("fecha_auditoria") or item.get("fecha") or "")+"|"+json.dumps(item,ensure_ascii=False,sort_keys=True,default=str)
+        if marker in seen: continue
+        seen.add(marker); out.append(item)
+    return out
+
+def _merge_picker_store(remote,local):
+    result=dict(remote or {})
+    for person,lrec in (local or {}).items():
+        if person not in result or not isinstance(result.get(person),dict) or not isinstance(lrec,dict):
+            result[person]=lrec
+            continue
+        merged=dict(result[person])
+        for key,value in lrec.items():
+            if key in {"comentarios","acciones","documentos"}:
+                merged[key]=_unique_records(list(merged.get(key,[]) or [])+list(value or []))
+            else:
+                merged[key]=value
+        result[person]=merged
+    return result
+
+def _merge_store_states(remote,local):
+    """Fusión conservadora si dos sesiones guardan casi al mismo tiempo."""
+    merged=dict(remote or {})
+    merged.update({k:v for k,v in (local or {}).items() if k not in STORE_SHARDS})
+    merged["pickers"]=_merge_picker_store((remote or {}).get("pickers",{}),(local or {}).get("pickers",{}))
+
+    remote_audits=(remote or {}).get("order_audits",[]) or []
+    local_audits=(local or {}).get("order_audits",[]) or []
+    by_id={}
+    for item in remote_audits+local_audits:
+        if not isinstance(item,dict): continue
+        key=str(item.get("id") or (str(item.get("pedido",""))+"|"+str(item.get("fecha_auditoria",""))))
+        by_id[key]=item
+    merged["order_audits"]=list(by_id.values())
+
+    hist=dict((remote or {}).get("monthly_history",{}) or {})
+    hist.update((local or {}).get("monthly_history",{}) or {})
+    merged["monthly_history"]=hist
+
+    pbi={}
+    for item in list((remote or {}).get("powerbi_krs_history",[]) or [])+list((local or {}).get("powerbi_krs_history",[]) or []):
+        if not isinstance(item,dict): continue
+        key=(str(item.get("fecha","")),str(item.get("periodo","")),str(item.get("tienda","")))
+        old=pbi.get(key)
+        if old is None or str(item.get("cargado",""))>=str(old.get("cargado","")):
+            pbi[key]=item
+    merged["powerbi_krs_history"]=sorted(pbi.values(),key=lambda item:(str(item.get("fecha","")),str(item.get("cargado",""))))
+    return merged
+
+def _load_store_from_sources():
     ensure_persist_dir()
-    cloud_data=cloud_download(CLOUD_STORE_KEY,missing_ok=True) if cloud_enabled() else None
-    if cloud_data is not None:
-        data=json.loads(cloud_data.decode("utf-8"))
-        if not isinstance(data,dict): raise RuntimeError("El expediente guardado en la nube no contiene un objeto JSON válido.")
-        for key,value in {"pickers":{},"feedback_rows":[],"recursos_formatos":[],"procesos":[],"excluded_orders":[],"master_overrides":{},"master_excluded":[],"seguimientos_documentos":[],"supervisores":[],"upload_meta":{},"attendance_summary":None,"attendance_meta":{},"attendance_links":{},"order_audits":[],"monthly_history":{}}.items(): data.setdefault(key,value)
-        try:
-            with open(STORE_FILE,"wb") as f: f.write(json.dumps(data,ensure_ascii=False,indent=2).encode("utf-8"))
+    cloud_main=_cloud_json_read(CLOUD_STORE_KEY,{}) if cloud_enabled() else {}
+    if cloud_main:
+        data=cloud_main if isinstance(cloud_main,dict) else {}
+    else:
+        data={}
+        for path in [STORE_FILE,LEGACY_STORE_FILE]:
+            if os.path.exists(path):
+                candidate=_json_local_read(path,{})
+                if isinstance(candidate,dict):
+                    data=candidate
+                    break
+
+    defaults={
+        "pickers":{},"feedback_rows":[],"recursos_formatos":[],"procesos":[],
+        "excluded_orders":[],"master_overrides":{},"master_excluded":[],
+        "seguimientos_documentos":[],"supervisores":[],"upload_meta":{},
+        "attendance_summary":None,"attendance_meta":{},"attendance_links":{},
+        "order_audits":[],"monthly_history":{},"powerbi_krs_history":[],
+        "_revision":0,
+    }
+    for key,value in defaults.items():
+        data.setdefault(key,value.copy() if isinstance(value,dict) else list(value) if isinstance(value,list) else value)
+
+    # Los shards nuevos prevalecen; si aún no existen se conserva el dato legacy
+    # que venía dentro del JSON principal.
+    for field,(cloud_key,local_path,default) in STORE_SHARDS.items():
+        shard=None
+        if cloud_enabled():
+            raw=cloud_download(cloud_key,missing_ok=True)
+            if raw is not None:
+                try: shard=json.loads(raw.decode("utf-8"))
+                except Exception: shard=None
+        if shard is None and os.path.exists(local_path):
+            shard=_json_local_read(local_path,default)
+        if shard is not None:
+            data[field]=shard
+
+    # Mantener copia local útil para recuperación.
+    main_local={k:v for k,v in data.items() if k not in STORE_SHARDS}
+    try: _json_atomic_write(STORE_FILE,main_local)
+    except OSError: pass
+    for field,(_,local_path,_) in STORE_SHARDS.items():
+        try: _json_atomic_write(local_path,data.get(field))
         except OSError: pass
-        return data
-    candidates=[STORE_FILE, LEGACY_STORE_FILE]
-    for path in candidates:
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    data=json.load(f)
-                if not isinstance(data, dict):
-                    continue
-                data.setdefault("pickers", {})
-                data.setdefault("feedback_rows", [])
-                data.setdefault("recursos_formatos", [])
-                data.setdefault("procesos", [])
-                data.setdefault("excluded_orders", [])
-                data.setdefault("master_overrides", {})
-                data.setdefault("master_excluded", [])
-                data.setdefault("seguimientos_documentos", [])
-                data.setdefault("supervisores", [])
-                data.setdefault("upload_meta", {})
-                data.setdefault("attendance_summary", None)
-                data.setdefault("attendance_meta", {})
-                data.setdefault("attendance_links", {})
-                data.setdefault("order_audits", [])
-                data.setdefault("monthly_history", {})
-                if path != STORE_FILE or cloud_enabled(): save_store(data)
-                return data
-            except Exception:
-                continue
-    data={"pickers": {}, "feedback_rows": [], "recursos_formatos": [], "procesos": [], "excluded_orders": [], "master_overrides": {}, "master_excluded": [], "seguimientos_documentos": [], "supervisores": [], "upload_meta": {}, "attendance_summary": None, "attendance_meta": {}, "attendance_links": {}, "order_audits": [], "monthly_history": {}}
-    if cloud_enabled(): save_store(data)
     return data
 
+def load_store():
+    """Carga el estado una sola vez por sesión para evitar GETs a nube en cada rerun."""
+    if "_persistent_store" not in st.session_state:
+        st.session_state["_persistent_store"]=_load_store_from_sources()
+    return st.session_state["_persistent_store"]
+
 def save_store(store):
-    """Guarda el estado y registra cuándo se confirmó el último respaldo en nube."""
+    """Guarda solo cuando hay cambios y usa shards para los bloques que más crecen."""
     ensure_persist_dir()
-    payload=json.dumps(store,ensure_ascii=False,indent=2).encode("utf-8")
+    store.setdefault("_revision",0)
+
+    # Si otra sesión escribió desde nuestra última lectura, fusionar lo append-only
+    # antes de publicar para reducir pérdidas por escrituras concurrentes.
+    if cloud_enabled():
+        remote_main=_cloud_json_read(CLOUD_STORE_KEY,{})
+        remote_revision=int(pd.to_numeric(remote_main.get("_revision",0),errors="coerce") or 0) if isinstance(remote_main,dict) else 0
+        local_revision=int(pd.to_numeric(store.get("_revision",0),errors="coerce") or 0)
+        if remote_revision>local_revision:
+            remote=dict(remote_main)
+            for field,(cloud_key,_,default) in STORE_SHARDS.items():
+                remote[field]=_cloud_json_read(cloud_key,default)
+            merged=_merge_store_states(remote,store)
+            store.clear(); store.update(merged)
+            local_revision=remote_revision
+        store["_revision"]=max(local_revision,remote_revision)+1
+
+    main_data={k:v for k,v in store.items() if k not in STORE_SHARDS}
+    main_payload=json.dumps(main_data,ensure_ascii=False,indent=2).encode("utf-8")
+
+    # No escribir si ni el principal ni ningún shard cambió.
+    changed_main=True
     try:
-        with open(STORE_FILE,"rb") as f:
-            if f.read()==payload: return
+        with open(STORE_FILE,"rb") as f: changed_main=(f.read()!=main_payload)
     except OSError:
         pass
+    changed_shards=[]
+    for field,(_,local_path,_) in STORE_SHARDS.items():
+        payload=json.dumps(store.get(field),ensure_ascii=False,indent=2).encode("utf-8")
+        same=False
+        try:
+            with open(local_path,"rb") as f: same=(f.read()==payload)
+        except OSError:
+            pass
+        if not same: changed_shards.append((field,payload,local_path))
 
-    def write_local(data):
-        tmp=STORE_FILE+".tmp"
-        with open(tmp,"wb") as f: f.write(data)
-        os.replace(tmp,STORE_FILE)
+    if not cloud_enabled() and not changed_main and not changed_shards:
+        return
+
+    if changed_main:
+        _json_atomic_write(STORE_FILE,main_data)
+    for field,payload,local_path in changed_shards:
+        _json_atomic_write(local_path,store.get(field))
 
     if cloud_enabled():
         previous_backup=store.get("cloud_backup_at")
         backup_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        # Conserva el cambio local aunque falle la red; la fecha solo avanza
-        # cuando el servidor confirma el respaldo.
-        write_local(payload)
         store["cloud_backup_at"]=backup_at
-        cloud_payload=json.dumps(store,ensure_ascii=False,indent=2).encode("utf-8")
+        main_data={k:v for k,v in store.items() if k not in STORE_SHARDS}
+        main_payload=json.dumps(main_data,ensure_ascii=False,indent=2).encode("utf-8")
         try:
-            cloud_upload(CLOUD_STORE_KEY,cloud_payload,"application/json")
+            if changed_main or previous_backup!=backup_at:
+                cloud_upload(CLOUD_STORE_KEY,main_payload,"application/json")
+            for field,payload,_ in changed_shards:
+                cloud_upload(STORE_SHARDS[field][0],payload,"application/json")
         except Exception:
             if previous_backup is None: store.pop("cloud_backup_at",None)
             else: store["cloud_backup_at"]=previous_backup
             raise
-        write_local(cloud_payload)
-    else:
-        write_local(payload)
+        _json_atomic_write(STORE_FILE,{k:v for k,v in store.items() if k not in STORE_SHARDS})
 
 def parse_powerbi_krs_excel(data, filename=""):
     """Extrae On Time, FNR y Mala Calidad de la hoja exportada desde Power BI."""
@@ -2120,6 +2250,8 @@ store.setdefault("upload_meta", {})
 store.setdefault("attendance_summary", None)
 store.setdefault("attendance_meta", {})
 store.setdefault("attendance_links", {})
+store.setdefault("order_audits", [])
+store.setdefault("monthly_history", {})
 store.setdefault("powerbi_krs_history", [])
 if normalize_saved_followup_categories(store):
     save_store(store)
@@ -2151,10 +2283,21 @@ with st.sidebar:
     uf=persist_uploaded_once(uf_upload,"detalle_fnr")
     um=persist_uploaded_once(um_upload,"detalle_mc")
     up=persist_uploaded_once(up_upload,"plantilla_personal")
+    _upload_meta_changed=False
     for _key,_upload,_label in [("base_picker",ub_upload,"Pickers/Líneas"),("detalle_fnr",uf_upload,"FNR"),("detalle_mc",um_upload,"Mala Calidad"),("plantilla_personal",up_upload,"Plantilla consolidada")]:
-        if _upload is not None:
-            store.setdefault("upload_meta",{})[_key]={"fecha":datetime.now().strftime("%Y-%m-%d %H:%M:%S"),"archivo":str(getattr(_upload,"name",_label))}
-    save_store(store)
+        if _upload is None: continue
+        _bytes=_upload.getvalue()
+        _fingerprint=hashlib.sha256(_bytes).hexdigest()
+        _old_meta=(store.get("upload_meta",{}) or {}).get(_key,{}) or {}
+        if _old_meta.get("huella")!=_fingerprint:
+            store.setdefault("upload_meta",{})[_key]={
+                "fecha":datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "archivo":str(getattr(_upload,"name",_label)),
+                "huella":_fingerprint,
+            }
+            _upload_meta_changed=True
+    if _upload_meta_changed:
+        save_store(store)
     if cloud_enabled():
         _backup_at=str(store.get("cloud_backup_at","")).strip()
         if _backup_at:
@@ -2188,10 +2331,13 @@ with st.sidebar:
     saved_excluded="\n".join(str(x) for x in store.get("excluded_orders",[]) if str(x).strip())
     ex=st.text_area("Pedidos operativos a excluir (uno por línea)",value=saved_excluded,key="pedidos_excluidos_persistentes")
     excluded={x.strip() for x in ex.splitlines() if x.strip()}
-    # Guardar automáticamente preferencias y exclusiones.
-    store["periodo"]=periodo.strip() or datetime.now().strftime("%Y-%m")
-    store["excluded_orders"]=sorted(excluded)
-    save_store(store)
+    # Guardar preferencias solo cuando cambien; evita escrituras a nube en cada interacción.
+    _new_periodo=periodo.strip() or datetime.now().strftime("%Y-%m")
+    _new_excluded=sorted(excluded)
+    if store.get("periodo")!=_new_periodo or list(store.get("excluded_orders",[]))!=_new_excluded:
+        store["periodo"]=_new_periodo
+        store["excluded_orders"]=_new_excluded
+        save_store(store)
 
 # Indicadores compactos de Power BI: siempre visibles en portada, fuera de las pestañas.
 with st.container(border=True):
@@ -2322,12 +2468,18 @@ cross_status=pd.concat([
 master_match=base.get("_MASTER_MATCH",pd.Series(False,index=base.index)).copy()
 base_display=base.drop(columns=["_MASTER_MATCH"],errors="ignore")
 s=s.drop(columns=["_MASTER_MATCH"],errors="ignore")
-# Registrar automáticamente pickers vistos en la operación, sin alterar su estado histórico.
+# Registrar automáticamente pickers vistos en la operación solo si aparecen por primera vez.
+_picker_registry_changed=False
 for _idx,_row in base.iterrows():
     _p=str(_row.get("PICKER","")).strip()
     _src=str(_row.get("_SOURCE_PICKER","")).strip()
-    if _p: picker_record(store, _p, aliases=[_src] if _src else [])
-save_store(store)
+    if not _p: continue
+    _before=set((store.get("pickers",{}) or {}).keys())
+    picker_record(store,_p,aliases=[_src] if _src else [])
+    if set((store.get("pickers",{}) or {}).keys())!=_before:
+        _picker_registry_changed=True
+if _picker_registry_changed:
+    save_store(store)
 
 if roster is not None:
     match_series=base.get("_MASTER_MATCH",pd.Series(False,index=base.index)).fillna(False).astype(bool)
