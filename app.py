@@ -135,30 +135,47 @@ def _attendance_start_hour(value):
     except Exception:
         return text[:5]
 
-def _attendance_shift(start):
-    """Clasificación de turnos indicada para los reportes de Coyoacán."""
+def _attendance_shift(start,config=None):
+    """Clasifica horario usando reglas configurables."""
     if not start: return "Sin dato"
     try: hour=int(str(start).split(":",1)[0])
     except Exception: return "Sin dato"
-    if hour in {6,7,8,9,10}: return "Mañana"
-    if hour==11: return "Intermedio"
-    if hour in {13,14}: return "Tarde"
-    if hour==22: return "Nocturno"
+    rules=config or {
+        "Mañana":[6,7,8,9,10],
+        "Intermedio":[11],
+        "Tarde":[13,14],
+        "Nocturno":[22],
+    }
+    for label,hours in rules.items():
+        try:
+            if hour in {int(x) for x in hours}: return str(label)
+        except Exception:
+            continue
     return "Otro horario"
 
+def _attendance_roster_shift(value,config=None):
+    text=str(value or "").strip()
+    folded=norm(text)
+    if "manana" in folded: return "Mañana"
+    if "inter" in folded: return "Intermedio"
+    if "tarde" in folded: return "Tarde"
+    if "noct" in folded: return "Nocturno"
+    start=_attendance_start_hour(value)
+    return _attendance_shift(start,config) if start else "Sin turno"
 def _attendance_person_key(identifier, lastname, firstname):
     """Usa el CURP solo durante el cruce; el CURP no se guarda en el resumen."""
     value=str(identifier or "").strip().upper()
     if value and value not in {"NAN","NONE","NAT"}: return "id:"+value
     return "nombre:"+(token_key(f"{lastname} {firstname}") or person_key(f"{lastname} {firstname}"))
 
-def build_attendance_summary(absence_bytes, tardy_bytes, absence_name="Faltas", tardy_name="Retardos"):
-    """Cruza ambos reportes por CURP (temporalmente) y entrega solo datos agregados."""
+def build_attendance_summary(absence_bytes,tardy_bytes,absence_name="Faltas",tardy_name="Retardos",roster_rows=None,shift_config=None):
+    """Cruza faltas/retardos y completa turno/supervisor/área desde plantilla."""
     absent=_attendance_find_sheet(absence_bytes,["apellidos","nombre","fecha"],"faltas")
     tardy=_attendance_find_sheet(tardy_bytes,["apellidos","nombre","fecha","hora_inicio_turno","minutos_de_atraso"],"retardos")
     people={}
     event_rows=[]
     date_values=[]
+    roster_df=roster_rows.copy() if isinstance(roster_rows,pd.DataFrame) else pd.DataFrame(roster_rows or [])
 
     def row_person(row):
         _last=row.get("apellidos",""); _first=row.get("nombre","")
@@ -169,10 +186,18 @@ def build_attendance_summary(absence_bytes, tardy_bytes, absence_name="Faltas", 
         if pd.isna(_identifier): _identifier=""
         return _attendance_person_key(_identifier,lastname,firstname),display
 
+    def ensure_person(key,name):
+        item=people.setdefault(key,{
+            "nombre":name,"faltas":0,"retardos":0,"minutos_atraso":0,
+            "turnos":{},"cargos":set(),"turno_plantilla":"","supervisor":"","area":"",
+        })
+        if not item.get("nombre"): item["nombre"]=name
+        return item
+
     for _,row in absent.iterrows():
         key,name=row_person(row)
         if not name: continue
-        item=people.setdefault(key,{"nombre":name,"faltas":0,"retardos":0,"minutos_atraso":0,"turnos":{},"cargos":set()})
+        item=ensure_person(key,name)
         item["faltas"]+=1
         _cargo=row.get("cargo",""); cargo="" if pd.isna(_cargo) else str(_cargo).strip()
         if cargo and cargo.lower() not in {"nan","none"}: item["cargos"].add(cargo)
@@ -182,12 +207,12 @@ def build_attendance_summary(absence_bytes, tardy_bytes, absence_name="Faltas", 
     for _,row in tardy.iterrows():
         key,name=row_person(row)
         if not name: continue
-        item=people.setdefault(key,{"nombre":name,"faltas":0,"retardos":0,"minutos_atraso":0,"turnos":{},"cargos":set()})
+        item=ensure_person(key,name)
         item["retardos"]+=1
         minutes=_attendance_minutes(row.get("minutos_de_atraso",0))
         item["minutos_atraso"]+=minutes
         start=_attendance_start_hour(row.get("hora_inicio_turno",""))
-        shift=_attendance_shift(start)
+        shift=_attendance_shift(start,shift_config)
         item["turnos"][shift]=item["turnos"].get(shift,0)+1
         event_rows.append({"turno":shift,"persona_key":key,"minutos":minutes})
         _cargo=row.get("cargo",""); cargo="" if pd.isna(_cargo) else str(_cargo).strip()
@@ -195,22 +220,39 @@ def build_attendance_summary(absence_bytes, tardy_bytes, absence_name="Faltas", 
         date=pd.to_datetime(row.get("fecha"),errors="coerce")
         if not pd.isna(date): date_values.append(date.strftime("%Y-%m-%d"))
 
+    # Completar contexto desde la plantilla usando el mismo resolvedor conservador.
+    if not roster_df.empty:
+        for item in people.values():
+            rr=_match_master_row(str(item.get("nombre","")).replace(","," "),roster_df,"")
+            if rr is None: continue
+            raw_shift=rr.get("TURNO_MAESTRO",rr.get("TURNO",""))
+            item["turno_plantilla"]=_attendance_roster_shift(raw_shift,shift_config)
+            item["supervisor"]=str(rr.get("SUPERVISOR","")).strip()
+            item["area"]=str(rr.get("AREA_MAESTRO",rr.get("AREA_BASE",""))).strip()
+
     person_rows=[]
     absent_by_shift={}
     for key,item in people.items():
         turns=item["turnos"]
-        if turns:
+        template_shift=str(item.get("turno_plantilla","")).strip()
+        if template_shift and template_shift not in {"Sin turno","Sin dato","Otro horario"}:
+            usual=template_shift
+        elif turns:
             max_count=max(turns.values())
             leading=sorted([shift for shift,count in turns.items() if count==max_count])
             usual=leading[0] if len(leading)==1 else "Varios turnos"
-            varies=len(turns)>1
         else:
-            usual="Sin turno"; varies=False
+            usual="Sin turno"
+        observed={z for z in turns if z not in {"Sin dato","Otro horario"}}
+        varies=len(observed)>1 or (bool(template_shift) and bool(observed) and any(z!=template_shift for z in observed))
         person_rows.append({
             "Persona":item["nombre"],
             "Turno habitual":usual,
+            "Turno plantilla":template_shift or "Sin dato",
             "Turnos observados":", ".join(sorted(turns)) if turns else "Sin dato",
             "Turno variable":bool(varies),
+            "Supervisor":item.get("supervisor",""),
+            "Área":item.get("area",""),
             "Faltas":int(item["faltas"]),
             "Retardos":int(item["retardos"]),
             "Minutos acumulados":int(item["minutos_atraso"]),
@@ -712,6 +754,7 @@ def _load_store_from_sources():
         "excluded_orders":[],"master_overrides":{},"master_excluded":[],
         "seguimientos_documentos":[],"supervisores":[],"upload_meta":{},
         "attendance_summary":None,"attendance_meta":{},"attendance_links":{},
+        "attendance_shift_config":{"Mañana":[6,7,8,9,10],"Intermedio":[11],"Tarde":[13,14],"Nocturno":[22]},
         "order_audits":[],"monthly_history":{},"powerbi_krs_history":[],
         "_revision":0,
     }
@@ -1619,66 +1662,79 @@ def prepare_history_frames(base_data,fnr_data,mc_data,roster,personnel_config_js
     return _dedupe_columns(hist_base),_dedupe_columns(hist_fnr),_dedupe_columns(hist_mc)
 
 def summary(base,fnr,mc):
-    keys=["CATEGORIA","PICKER"]
-    b=base.copy()
-    if "CATEGORIA" not in b:
-        matched=b.get("_MASTER_MATCH",pd.Series(False,index=b.index)).fillna(False).astype(bool)
-        manual=b.get("_MANUAL_MATCH",pd.Series(False,index=b.index)).fillna(False).astype(bool)
-        b["CATEGORIA"]=np.where(matched|manual,"Picker","Sin registrar")
-    b["PICKER"]=b.get("PICKER",pd.Series("Sin registrar",index=b.index)).fillna("").astype(str).str.strip()
-    b.loc[b["PICKER"].eq(""),"PICKER"]="Sin registrar"
-    for field in ["LINEAS","PEDIDOS"]:
-        if field not in b: b[field]=0
-
-    # Incluye personal que aparece en FNR/MC aunque no tenga registro en la base
-    # de líneas. Su tasa queda N/D cuando no existe denominador real.
-    meta=[b]
-    for inc in [fnr,mc]:
-        if inc is None or inc.empty: continue
-        q=inc.copy()
+    """Resumen por identidad canónica: correo cuando existe, nombre solo como fallback."""
+    def prepare(frame,is_incident=False):
+        if frame is None or frame.empty:
+            return pd.DataFrame()
+        q=frame.copy()
         if "CATEGORIA" not in q:
-            matched=q.get("_EMAIL_MATCH",q.get("_TEMPLATE_MATCH",pd.Series(False,index=q.index))).fillna(False).astype(bool)
+            if is_incident:
+                matched=q.get("_EMAIL_MATCH",q.get("_TEMPLATE_MATCH",pd.Series(False,index=q.index))).fillna(False).astype(bool)
+            else:
+                matched=q.get("_MASTER_MATCH",pd.Series(False,index=q.index)).fillna(False).astype(bool) | q.get("_MANUAL_MATCH",pd.Series(False,index=q.index)).fillna(False).astype(bool)
             q["CATEGORIA"]=np.where(matched,"Picker","Sin registrar")
         q["PICKER"]=q.get("PICKER",pd.Series("Sin registrar",index=q.index)).fillna("").astype(str).str.strip()
         q.loc[q["PICKER"].eq(""),"PICKER"]="Sin registrar"
+        q["CORREO"]=q.get("CORREO",pd.Series("",index=q.index)).fillna("").astype(str).str.strip()
+        q["CORREO_KEY"]=q["CORREO"].map(email_key)
+        q["_PERSON_KEY"]=q.apply(person_context_key,axis=1)
+        return q
+
+    b=prepare(base,False)
+    for field in ["LINEAS","PEDIDOS"]:
+        if field not in b: b[field]=0.0
+        b[field]=pd.to_numeric(b[field],errors="coerce").fillna(0.0)
+
+    fi=prepare(fnr,True)
+    mi=prepare(mc,True)
+    meta=[b]
+    for q in [fi,mi]:
+        if q.empty: continue
+        q=q.copy()
         q["LINEAS"]=0.0; q["PEDIDOS"]=0.0
         q["AREA_BASE"]=q.get("AREA_BASE",q.get("AREA",pd.Series("No especificada",index=q.index)))
         q["SUPERVISOR"]=q.get("SUPERVISOR",q.get("SUPERVISOR_REF",pd.Series("No asignado",index=q.index)))
         meta.append(q)
+
     meta_df=pd.concat(meta,ignore_index=True,sort=False)
-    for field in ["LINEAS","PEDIDOS"]:
-        meta_df[field]=pd.to_numeric(meta_df.get(field,0),errors="coerce").fillna(0)
-    metadata_fields=[c for c in ["TURNO","SUPERVISOR","AREA_BASE","CORREO"] if c in meta_df.columns]
+    keys=["CATEGORIA","_PERSON_KEY"]
+    metadata_fields=[col for col in ["PICKER","CORREO","CORREO_KEY","TURNO","SUPERVISOR","AREA_BASE"] if col in meta_df.columns]
     agg={"LINEAS":"sum","PEDIDOS":"sum"}
-    agg.update({c:lambda values: next((str(v).strip() for v in values if str(v).strip() and str(v).strip().lower() not in {"nan","none"}),"") for c in metadata_fields})
+    def _first_value(values):
+        return next((str(v).strip() for v in values if str(v).strip() and str(v).strip().lower() not in {"nan","none"}),"")
+    agg.update({field:_first_value for field in metadata_fields})
     for flag in ["_EXCLUDED_PERSONNEL","_MASTER_MATCH","_MANUAL_MATCH"]:
         if flag in meta_df.columns:
             meta_df[flag]=meta_df[flag].astype("boolean").fillna(False).astype(bool)
             agg[flag]="any"
     if "_SOURCE_PICKER" in meta_df.columns:
-        agg["_SOURCE_PICKER"]=lambda values: next((str(v).strip() for v in values if str(v).strip() and str(v).strip().lower() not in {"nan","none"}),"")
+        agg["_SOURCE_PICKER"]=_first_value
     s=meta_df.groupby(keys,as_index=False,dropna=False).agg(agg)
-    f=(fnr.groupby(keys,as_index=False,dropna=False).INCIDENCIAS.sum().rename(columns={"INCIDENCIAS":"FNR"})
-       if fnr is not None and not fnr.empty else pd.DataFrame(columns=keys+["FNR"]))
-    m=(mc.groupby(keys,as_index=False,dropna=False).INCIDENCIAS.sum().rename(columns={"INCIDENCIAS":"MC"})
-       if mc is not None and not mc.empty else pd.DataFrame(columns=keys+["MC"]))
+
+    if not fi.empty:
+        f=fi.groupby(keys,as_index=False,dropna=False).INCIDENCIAS.sum().rename(columns={"INCIDENCIAS":"FNR"})
+    else:
+        f=pd.DataFrame(columns=keys+["FNR"])
+    if not mi.empty:
+        m=mi.groupby(keys,as_index=False,dropna=False).INCIDENCIAS.sum().rename(columns={"INCIDENCIAS":"MC"})
+    else:
+        m=pd.DataFrame(columns=keys+["MC"])
+
     s=s.merge(f,on=keys,how="outer").merge(m,on=keys,how="outer")
     s[["FNR","MC"]]=s[["FNR","MC"]].fillna(0)
-    # Asegurar columnas numéricas y evitar pd.NA + round() incompatibles con algunas versiones de pandas
-    s["LINEAS"]=pd.to_numeric(s["LINEAS"],errors="coerce").fillna(0.0)
-    s["FNR"]=pd.to_numeric(s["FNR"],errors="coerce").fillna(0.0)
-    s["MC"]=pd.to_numeric(s["MC"],errors="coerce").fillna(0.0)
-    den=s["LINEAS"].where(s["LINEAS"].ne(0), float("nan"))
+    for field in ["LINEAS","PEDIDOS","FNR","MC"]:
+        s[field]=pd.to_numeric(s.get(field,0),errors="coerce").fillna(0.0)
+    den=s["LINEAS"].where(s["LINEAS"].ne(0),float("nan"))
     s["FNR_%"]=pd.to_numeric(s["FNR"].div(den)*100,errors="coerce").round(2)
     s["MC_%"]=pd.to_numeric(s["MC"].div(den)*100,errors="coerce").round(2)
-    def sem(r):
-        if (pd.notna(r["FNR_%"]) and r["FNR_%"]>=FNR_OBJ) or (pd.notna(r["MC_%"]) and r["MC_%"]>=MC_OBJ):
+    def sem(row):
+        if (pd.notna(row["FNR_%"]) and row["FNR_%"]>=FNR_OBJ) or (pd.notna(row["MC_%"]) and row["MC_%"]>=MC_OBJ):
             return "🔴 FUERA DE OBJETIVO"
-        if (pd.notna(r["FNR_%"]) and r["FNR_%"]>=1.20) or (pd.notna(r["MC_%"]) and r["MC_%"]>=0.80):
+        if (pd.notna(row["FNR_%"]) and row["FNR_%"]>=1.20) or (pd.notna(row["MC_%"]) and row["MC_%"]>=0.80):
             return "🟡 PREVENTIVO"
         return "🟢 EN OBJETIVO"
     s["ESTADO"]=s.apply(sem,axis=1)
-    return s
+    return s.drop(columns=["_PERSON_KEY"],errors="ignore")
 
 def monthly_history_snapshot(label,summary_df,source_files=None):
     """Convierte un resumen mensual en un snapshot JSON pequeño y persistente."""
@@ -2250,6 +2306,7 @@ store.setdefault("upload_meta", {})
 store.setdefault("attendance_summary", None)
 store.setdefault("attendance_meta", {})
 store.setdefault("attendance_links", {})
+store.setdefault("attendance_shift_config",{"Mañana":[6,7,8,9,10],"Intermedio":[11],"Tarde":[13,14],"Nocturno":[22]})
 store.setdefault("order_audits", [])
 store.setdefault("monthly_history", {})
 store.setdefault("powerbi_krs_history", [])
@@ -2325,7 +2382,7 @@ with st.sidebar:
             st.caption("El ZIP se prepara solo cuando solicitas el respaldo.")
         else:
             st.info("Aún no hay versiones en el historial. Se registra una versión al cargar cada Excel.")
-    st.caption("Los 3 Excel operativos se cruzan con la PLANTILLA CONSOLIDADA usando CORREO como única llave. La plantilla aporta el nombre asociado, turno, supervisor y área. El nombre no se usa para hacer coincidencias entre archivos.")
+    st.caption("Los 3 Excel operativos se cruzan con la PLANTILLA CONSOLIDADA usando CORREO como llave principal. Si falta el correo, la app intenta una resolución conservadora por código/nombre y deja pendientes los casos ambiguos.")
     st.divider()
     periodo=st.text_input("Periodo",value=str(store.get("periodo",datetime.now().strftime("%Y-%m"))),key="periodo_persistente")
     saved_excluded="\n".join(str(x) for x in store.get("excluded_orders",[]) if str(x).strip())
@@ -2493,7 +2550,7 @@ if roster is not None:
         if unmatched:
             st.caption(f"Pendientes de asociar en esta base: {unmatched} registros.")
         email_match=int(base.get("_MASTER_MATCH",pd.Series(False,index=base.index)).fillna(False).astype(bool).sum())
-        st.caption(f"🔑 Cruce de identidad: CORREO primero · {email_match} registros identificados")
+        st.caption(f"🔑 Cruce de identidad: CORREO primero; código/nombre solo como respaldo conservador · {email_match} registros identificados")
 
 # Retira columnas técnicas antes de mostrar/exportar.
 base=base.drop(columns=["_MASTER_MATCH"],errors="ignore")
@@ -2625,14 +2682,15 @@ def apply_context(df, ctx, include_turn=True, identity_df=None):
         ctx.get("supervisor","Todos"),ctx.get("area","Todos"))
 
 def select_summary_people(df,summary_df):
-    """Filtra por categoría y nombre para conservar aparte Sin registrar."""
+    """Filtra registros por identidad estable (correo; nombre solo para no registrados)."""
     if df is None or df.empty or summary_df is None or summary_df.empty:
         return df.iloc[0:0].copy() if isinstance(df,pd.DataFrame) else pd.DataFrame()
-    if "CATEGORIA" not in df.columns or "CATEGORIA" not in summary_df.columns:
-        return df[df["PICKER"].isin(summary_df["PICKER"])].copy()
-    allowed=set(zip(summary_df["CATEGORIA"].astype(str),summary_df["PICKER"].astype(str)))
-    mask=df.apply(lambda r:(str(r.get("CATEGORIA","Picker")),str(r.get("PICKER",""))) in allowed,axis=1)
-    return df.loc[mask].copy()
+    allowed_df=summary_df.copy()
+    source=df.copy()
+    allowed_df["_PERSON_KEY"]=allowed_df.apply(person_context_key,axis=1)
+    source["_PERSON_KEY"]=source.apply(person_context_key,axis=1)
+    allowed=set(allowed_df["_PERSON_KEY"].astype(str))
+    return source[source["_PERSON_KEY"].astype(str).isin(allowed)].drop(columns=["_PERSON_KEY"],errors="ignore").copy()
 
 def context_reference(df, ctx, identity_df=None):
     """Base de comparación: supervisor/área de la plantilla, todos los turnos."""
@@ -3767,7 +3825,7 @@ if _tab_active(g):
         render_context_banner(ctx,sup_data,reference,"Contexto heredado")
         if not sup_data.empty:
             sup_summary=(sup_data.groupby("SUPERVISOR",as_index=False)
-                .agg(PICKERS=("PICKER","nunique"),LINEAS=("LINEAS","sum"),FNR=("FNR","sum"),MC=("MC","sum"))
+                .agg(PICKERS=("CORREO_KEY","nunique"),LINEAS=("LINEAS","sum"),FNR=("FNR","sum"),MC=("MC","sum"))
                 .sort_values("FNR",ascending=False))
             sup_summary["FNR %"]=safe_pct(sup_summary["FNR"],sup_summary["LINEAS"])
             sup_summary["MC %"]=safe_pct(sup_summary["MC"],sup_summary["LINEAS"])
@@ -3781,7 +3839,26 @@ if _tab_active(g):
 if _tab_active(i):
     with i:
         st.subheader("📅 Faltas y retardos")
-        st.caption("Carga los dos reportes para ver incidencias por persona y turno. Los turnos se agrupan así: mañana 06:00–10:00, intermedio 11:00, tarde 13:00–14:00 y nocturno 22:00.")
+        st.caption("Carga los dos reportes para ver incidencias por persona y turno. Si una falta no trae turno, se completa desde la plantilla consolidada.")
+        _shift_cfg=store.get("attendance_shift_config",{}) or {"Mañana":[6,7,8,9,10],"Intermedio":[11],"Tarde":[13,14],"Nocturno":[22]}
+        with st.expander("⚙️ Configurar horarios de turno",expanded=False):
+            _sc1,_sc2,_sc3,_sc4=st.columns(4)
+            with _sc1: _morning=st.text_input("Mañana",value=",".join(map(str,_shift_cfg.get("Mañana",[6,7,8,9,10]))),key="shift_cfg_morning")
+            with _sc2: _middle=st.text_input("Intermedio",value=",".join(map(str,_shift_cfg.get("Intermedio",[11]))),key="shift_cfg_middle")
+            with _sc3: _afternoon=st.text_input("Tarde",value=",".join(map(str,_shift_cfg.get("Tarde",[13,14]))),key="shift_cfg_afternoon")
+            with _sc4: _night=st.text_input("Nocturno",value=",".join(map(str,_shift_cfg.get("Nocturno",[22]))),key="shift_cfg_night")
+            if st.button("Guardar horarios",key="save_shift_config"):
+                try:
+                    def _hours(text):
+                        return sorted({int(x.strip()) for x in str(text).split(",") if x.strip() and 0<=int(x.strip())<=23})
+                    _new_cfg={"Mañana":_hours(_morning),"Intermedio":_hours(_middle),"Tarde":_hours(_afternoon),"Nocturno":_hours(_night)}
+                    if not all(_new_cfg.values()): raise ValueError("Cada turno debe tener al menos una hora.")
+                    store["attendance_shift_config"]=_new_cfg
+                    save_store(store)
+                    st.success("Horarios guardados.")
+                    st.rerun()
+                except Exception:
+                    st.error("Usa horas de 0 a 23 separadas por comas, por ejemplo: 6,7,8,9.")
         with st.container(border=True):
             u_abs,u_late=st.columns(2)
             with u_abs:
@@ -3792,12 +3869,22 @@ if _tab_active(i):
 
         if attendance_absence_upload is not None and attendance_tardy_upload is not None:
             _abs_bytes=attendance_absence_upload.getvalue(); _late_bytes=attendance_tardy_upload.getvalue()
-            _fingerprint=hashlib.sha256(_abs_bytes+b"\0"+_late_bytes).hexdigest()
+            _att_context=json.dumps({
+                "shift":store.get("attendance_shift_config",{}),
+                "roster":[
+                    {"p":str(r.get("PICKER","")),"c":str(r.get("CORREO","")),"t":str(r.get("TURNO_MAESTRO","")),"s":str(r.get("SUPERVISOR","")),"a":str(r.get("AREA_MAESTRO",""))}
+                    for _,r in roster.iterrows()
+                ] if isinstance(roster,pd.DataFrame) else [],
+            },ensure_ascii=False,sort_keys=True).encode("utf-8")
+            _fingerprint=hashlib.sha256(_abs_bytes+b"\0"+_late_bytes+b"\0"+_att_context).hexdigest()
             _old_meta=store.get("attendance_meta",{}) or {}
             if _fingerprint!=_old_meta.get("fingerprint"):
                 try:
                     with st.spinner("Leyendo y cruzando los reportes…"):
-                        _attendance_new=build_attendance_summary(_abs_bytes,_late_bytes,attendance_absence_upload.name,attendance_tardy_upload.name)
+                        _attendance_new=build_attendance_summary(
+                            _abs_bytes,_late_bytes,attendance_absence_upload.name,attendance_tardy_upload.name,
+                            roster_rows=roster,shift_config=store.get("attendance_shift_config")
+                        )
                     _attendance_new["fingerprint"]=_fingerprint
                     store["attendance_summary"]=_attendance_new
                     store["attendance_meta"]={"fingerprint":_fingerprint,"faltas":_safe_filename(attendance_absence_upload.name),"retardos":_safe_filename(attendance_tardy_upload.name),"fecha_carga":_attendance_new["fecha_carga"]}
