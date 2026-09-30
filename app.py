@@ -1408,39 +1408,36 @@ def effective_roster(roster, store):
         r=pd.concat([r[has_email].drop_duplicates("_EMAIL_KEY",keep="last"), r[~has_email].drop_duplicates("_KEY",keep="last")],ignore_index=True)
     return r
 
-def canonicalize_incidents(inc, base):
-    """Asocia FNR/MC a la persona canónica usando exclusivamente CORREO.
-
-    El nombre que viene en el archivo operativo es descriptivo; el nombre
-    definitivo se toma de la plantilla consolidada mediante el correo.
-    """
+def canonicalize_incidents(inc,base):
+    """Asocia FNR/MC por correo de forma vectorizada; fallback conservador solo en pendientes."""
     if inc is None or inc.empty:
         return inc
     out=inc.copy()
-    base_email={}
-    for _,r in base.iterrows():
-        ek=email_key(r.get("CORREO",""))
-        if ek:
-            base_email[ek]=r
-    result=[]
-    matched=[]
-    canonical_email=[]
-    for _,row in out.iterrows():
-        ek=email_key(row.get("CORREO",""))
-        rr=base_email.get(ek) if ek else None
-        if rr is None:
-            rr=_match_master_row(row.get("PICKER",""),base,row.get("CORREO",""))
-        if rr is not None:
-            result.append(str(rr.get("PICKER", row.get("PICKER",""))).strip())
-            canonical_email.append(str(rr.get("CORREO",row.get("CORREO",""))).strip())
-            matched.append(True)
-        else:
-            result.append(str(row.get("PICKER","")).strip())
-            canonical_email.append(str(row.get("CORREO","")).strip())
-            matched.append(False)
-    out["PICKER"]=result
-    out["CORREO"]=canonical_email
-    out["_EMAIL_MATCH"]=matched
+    roster=base.copy()
+    roster["_EMAIL_KEY"]=roster.get("CORREO",pd.Series("",index=roster.index)).map(email_key)
+    roster=roster[roster["_EMAIL_KEY"].astype(str).str.strip().ne("")].drop_duplicates("_EMAIL_KEY")
+    name_map=dict(zip(roster["_EMAIL_KEY"],roster["PICKER"].astype(str).str.strip()))
+    email_map=dict(zip(roster["_EMAIL_KEY"],roster["CORREO"].astype(str).str.strip()))
+
+    out["_EMAIL_KEY"]=out.get("CORREO",pd.Series("",index=out.index)).map(email_key)
+    mapped_name=out["_EMAIL_KEY"].map(name_map)
+    mapped_email=out["_EMAIL_KEY"].map(email_map)
+    matched=mapped_name.notna()
+
+    out.loc[matched,"PICKER"]=mapped_name.loc[matched]
+    out.loc[matched,"CORREO"]=mapped_email.loc[matched]
+
+    unresolved=out.index[~matched]
+    for idx in unresolved:
+        row=out.loc[idx]
+        rr=_match_master_row(row.get("PICKER",""),base,row.get("CORREO",""))
+        if rr is None: continue
+        out.at[idx,"PICKER"]=str(rr.get("PICKER",row.get("PICKER",""))).strip()
+        out.at[idx,"CORREO"]=str(rr.get("CORREO",row.get("CORREO",""))).strip()
+        matched.at[idx]=True
+
+    out["_EMAIL_MATCH"]=matched.astype(bool)
+    out.drop(columns=["_EMAIL_KEY"],errors="ignore",inplace=True)
     return out
 
 def template_roster_from_upload(data):
@@ -1563,50 +1560,51 @@ def parse_inc(df,tipo):
     return x
 
 def attach(inc,base):
-    """Adjunta contexto operativo ya resuelto por CORREO.
-
-    El turno y el área que llegan a FNR/MC se copian desde la base, la cual
-    previamente fue asociada a la plantilla por correo.
-    """
+    """Adjunta turno/área/supervisor por correo usando merge vectorizado."""
     if inc is None or inc.empty:
         return inc
     base=_dedupe_columns(base)
-    ref_cols=[c for c in ["PICKER","LINEAS","PEDIDOS","TURNO","AREA_BASE","SUPERVISOR","CORREO","_EXCLUDED_PERSONNEL"] if c in base.columns]
+    ref_cols=[col for col in ["PICKER","TURNO","AREA_BASE","SUPERVISOR","CORREO","_EXCLUDED_PERSONNEL"] if col in base.columns]
     ref=base[ref_cols].copy()
-    ref["_EMAIL_KEY"]=ref.get("CORREO",pd.Series([""]*len(ref),index=ref.index)).map(email_key)
-    ref=ref[ref["_EMAIL_KEY"].astype(str).str.strip().ne("")].drop_duplicates("_EMAIL_KEY").set_index("_EMAIL_KEY")
+    ref["_EMAIL_KEY"]=ref.get("CORREO",pd.Series("",index=ref.index)).map(email_key)
+    ref=ref[ref["_EMAIL_KEY"].astype(str).str.strip().ne("")].drop_duplicates("_EMAIL_KEY")
+    rename={
+        "PICKER":"_REF_PICKER","TURNO":"_REF_TURNO","AREA_BASE":"_REF_AREA",
+        "SUPERVISOR":"_REF_SUPERVISOR","CORREO":"_REF_CORREO",
+        "_EXCLUDED_PERSONNEL":"_REF_EXCLUDED",
+    }
+    ref=ref.rename(columns=rename)
+
     y=inc.copy()
-    y["_EMAIL_KEY"]=y.get("CORREO",pd.Series([""]*len(y),index=y.index)).map(email_key)
-    y["_TEMPLATE_MATCH"]=False
-    y["TURNO_REF"]=y.get("TURNO",pd.Series(["No especificado"]*len(y),index=y.index)).astype(str).str.strip()
-    y["AREA_REF"]=y.get("AREA",pd.Series(["No especificada"]*len(y),index=y.index)).astype(str).str.strip()
-    for i,row in y.iterrows():
-        ek=row.get("_EMAIL_KEY","")
-        if ek and ek in ref.index:
-            rr=ref.loc[ek]
-            y.at[i,"PICKER"]=str(rr.get("PICKER",row.get("PICKER",""))).strip()
-            y.at[i,"CORREO"]=str(rr.get("CORREO",row.get("CORREO",""))).strip()
-            turno=str(rr.get("TURNO","")).strip()
-            area=str(rr.get("AREA_BASE","")).strip()
-            sup=str(rr.get("SUPERVISOR","")).strip()
-            if turno and turno not in {"nan","None","No especificado"}:
-                y.at[i,"TURNO"]=turno
-                y.at[i,"TURNO_REF"]=turno
-            else:
-                y.at[i,"TURNO_REF"]=str(row.get("TURNO","No especificado")).strip() or "No especificado"
-            if area and area not in {"nan","None","No especificada"}:
-                y.at[i,"AREA"]=area
-                y.at[i,"AREA_REF"]=area
-            if sup:
-                y.at[i,"SUPERVISOR_REF"]=sup
-            y.at[i,"_TEMPLATE_MATCH"]=True
-            if "_EXCLUDED_PERSONNEL" in ref.columns:
-                y.at[i,"_EXCLUDED_PERSONNEL"]=bool(rr.get("_EXCLUDED_PERSONNEL",False))
-    matched=(y.get("_EMAIL_MATCH",y.get("_TEMPLATE_MATCH",pd.Series(False,index=y.index)))
-             .fillna(False).astype(bool))
-    y["CATEGORIA"]=np.where(matched,"Picker","Sin registrar")
-    y.drop(columns=["_EMAIL_KEY"],errors="ignore",inplace=True)
-    return y
+    y["_EMAIL_KEY"]=y.get("CORREO",pd.Series("",index=y.index)).map(email_key)
+    y["_ORIG_INDEX"]=np.arange(len(y))
+    y["TURNO_REF"]=y.get("TURNO",pd.Series("No especificado",index=y.index)).fillna("No especificado").astype(str).str.strip()
+    y["AREA_REF"]=y.get("AREA",pd.Series("No especificada",index=y.index)).fillna("No especificada").astype(str).str.strip()
+    y=y.merge(ref,on="_EMAIL_KEY",how="left",sort=False)
+    y=y.sort_values("_ORIG_INDEX").reset_index(drop=True)
+
+    matched=y.get("_REF_PICKER",pd.Series(pd.NA,index=y.index)).notna()
+    y["_TEMPLATE_MATCH"]=matched
+    if matched.any():
+        y.loc[matched,"PICKER"]=y.loc[matched,"_REF_PICKER"].astype(str).str.strip()
+        y.loc[matched,"CORREO"]=y.loc[matched,"_REF_CORREO"].astype(str).str.strip()
+        good_turn=matched & y["_REF_TURNO"].fillna("").astype(str).str.strip().ne("") & ~y["_REF_TURNO"].fillna("").astype(str).isin(["No especificado","nan","None"])
+        y.loc[good_turn,"TURNO"]=y.loc[good_turn,"_REF_TURNO"].astype(str).str.strip()
+        y.loc[good_turn,"TURNO_REF"]=y.loc[good_turn,"_REF_TURNO"].astype(str).str.strip()
+        good_area=matched & y["_REF_AREA"].fillna("").astype(str).str.strip().ne("") & ~y["_REF_AREA"].fillna("").astype(str).isin(["No especificada","nan","None"])
+        y.loc[good_area,"AREA"]=y.loc[good_area,"_REF_AREA"].astype(str).str.strip()
+        y.loc[good_area,"AREA_REF"]=y.loc[good_area,"_REF_AREA"].astype(str).str.strip()
+        good_sup=matched & y["_REF_SUPERVISOR"].fillna("").astype(str).str.strip().ne("")
+        y.loc[good_sup,"SUPERVISOR_REF"]=y.loc[good_sup,"_REF_SUPERVISOR"].astype(str).str.strip()
+        if "_REF_EXCLUDED" in y.columns:
+            y["_EXCLUDED_PERSONNEL"]=y["_REF_EXCLUDED"].fillna(False).astype(bool)
+
+    source_match=y.get("_EMAIL_MATCH",pd.Series(False,index=y.index)).fillna(False).astype(bool)
+    y["CATEGORIA"]=np.where(source_match|matched,"Picker","Sin registrar")
+    return y.drop(columns=[
+        "_EMAIL_KEY","_ORIG_INDEX","_REF_PICKER","_REF_TURNO","_REF_AREA",
+        "_REF_SUPERVISOR","_REF_CORREO","_REF_EXCLUDED",
+    ],errors="ignore")
 
 @st.cache_data(show_spinner="Procesando los Excel por primera vez…",max_entries=2,ttl=1800)
 def prepare_source_frames(base_data,fnr_data,mc_data,roster_data,personnel_config_json):
@@ -1661,6 +1659,7 @@ def prepare_history_frames(base_data,fnr_data,mc_data,roster,personnel_config_js
     hist_mc["CORREO_KEY"]=hist_mc.get("CORREO",pd.Series("",index=hist_mc.index)).map(email_key)
     return _dedupe_columns(hist_base),_dedupe_columns(hist_fnr),_dedupe_columns(hist_mc)
 
+@st.cache_data(show_spinner=False,max_entries=8,ttl=1800)
 def summary(base,fnr,mc):
     """Resumen por identidad canónica: correo cuando existe, nombre solo como fallback."""
     def prepare(frame,is_incident=False):
@@ -1766,6 +1765,7 @@ def monthly_history_snapshot(label,summary_df,source_files=None):
     }
     return snapshot
 
+@st.cache_data(show_spinner=False,max_entries=12,ttl=1800)
 def monthly_picker_comparison(current_summary,previous_rows):
     """Compara producción e incidencias por identidad canónica entre dos periodos."""
     def rollup(frame,suffix):
@@ -2220,6 +2220,11 @@ def _secret(name, default=""):
     except Exception:
         return str(os.getenv(name, default) or default)
 
+def _h(value):
+    """Texto seguro para interpolar dentro de HTML renderizado por Streamlit."""
+    return html.escape(str(value if value is not None else ""),quote=True)
+
+
 def send_followup_email(subject, body, recipients, attachment_bytes=None, attachment_name="seguimiento.pdf"):
     recipients=[x.strip() for x in re.split(r"[,;]",str(recipients or "")) if x.strip()]
     host=_secret("SMTP_HOST").strip(); user=_secret("SMTP_USER").strip(); password=_secret("SMTP_PASSWORD")
@@ -2241,13 +2246,15 @@ def send_followup_email(subject, body, recipients, attachment_bytes=None, attach
         else:
             with smtplib.SMTP(host,port,timeout=30) as smtp:
                 smtp.ehlo()
-                if smtp.has_extn("starttls"):
-                    smtp.starttls(context=context); smtp.ehlo()
+                if not smtp.has_extn("starttls"):
+                    return False,"Correo no enviado: el servidor SMTP no ofrece STARTTLS; por seguridad no se enviaron credenciales sin cifrado."
+                smtp.starttls(context=context); smtp.ehlo()
                 smtp.login(user,password); smtp.send_message(msg)
         return True,"Copia enviada correctamente a: "+", ".join(recipients)
     except Exception as exc:
         return False,f"No fue posible enviar la copia. Revisa el servidor y los datos SMTP. Detalle: {exc}"
 
+@st.cache_data(show_spinner="Preparando Excel…",max_entries=4,ttl=1800)
 def export(summary,fnr,mc,picker,roster=None):
     """Genera el Excel de salida sin romper el dashboard si algún dato viene irregular."""
     b=io.BytesIO()
@@ -2710,8 +2717,8 @@ def render_context_banner(ctx, selected_df, reference_df, label="Contexto de an�
     pct=(sel_p/ref_p*100) if ref_p else 0
     count_text=f"{sel_p:,} pickers · {sel_u:,} sin registrar en base e incidencias" if sel_u else f"{sel_p:,} pickers"
     st.markdown(
-        f"<div class='context-banner'><div class='context-title'>🎯 {label}: {scope}</div>"
-        f"<div class='context-detail'>{count_text} · {pct:.1f}% del universo de comparación · Las demás pestañas utilizan este mismo contexto.</div></div>",
+        f"<div class='context-banner'><div class='context-title'>🎯 {_h(label)}: {_h(scope)}</div>"
+        f"<div class='context-detail'>{_h(count_text)} · {pct:.1f}% del universo de comparación · Las demás pestañas utilizan este mismo contexto.</div></div>",
         unsafe_allow_html=True)
 
 def render_soft_kpis(cards):
@@ -2866,10 +2873,7 @@ with st.container(border=True):
 st.divider()
 
 _tab_labels=["🏠 Bodega y turnos / áreas","📦 Auditoría de pedidos","👤 Pickers y supervisores","📅 Faltas y retardos","🛡️ Seguimiento","📌 Pendientes","🧰 Herramientas"]
-try:
-    a,o,b,i,h,j,x=st.tabs(_tab_labels,on_change="rerun",key="control_fnr_mc_tabs_v5")
-except TypeError:
-    a,o,b,i,h,j,x=st.tabs(_tab_labels)
+a,o,b,i,h,j,x=st.tabs(_tab_labels,on_change="rerun",key="control_fnr_mc_tabs_v6")
 # Agrupa las secciones en una sola pestaña y conserva sus formularios y cálculos.
 e=a  # Turnos / Áreas comparte la pestaña de Bodega.
 g=b  # Supervisores comparte la pestaña de Pickers.
@@ -3020,6 +3024,7 @@ if _tab_active(a):
                 ]
                 st.dataframe(_history_view[_history_cols],use_container_width=True,hide_index=True)
                 st.caption("Inc./1000 líneas ayuda a separar el efecto de producir más o menos volumen: una persona puede tener más incidencias en cantidad, pero una tasa menor si también aumentaron mucho sus líneas.")
+                st.info("Para comparar totales de líneas/FNR/MC, procura que ambos Excel cubran periodos equivalentes. Si el mes actual aún está parcial, usa principalmente FNR %, MC % e incidencias por 1,000 líneas.")
 
                 _history_export=io.BytesIO()
                 with pd.ExcelWriter(_history_export,engine="openpyxl") as _hist_writer:
@@ -3559,7 +3564,7 @@ if _tab_active(b):
             st.info("Escribe parte del nombre o selecciona un picker para consultar su ficha completa.")
         else:
             r=s[s.PICKER==sp].iloc[0]
-            st.markdown(f"<div class='justo-card'><div class='justo-kicker'>Ficha de picker</div><div class='justo-title'>{sp}</div><div class='justo-muted'>Turno: {r.TURNO} · Supervisor: {r.SUPERVISOR} · Área: {r.AREA_BASE} · Usuario: {r.CORREO}</div></div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='justo-card'><div class='justo-kicker'>Ficha de picker</div><div class='justo-title'>{_h(sp)}</div><div class='justo-muted'>Turno: {_h(r.TURNO)} · Supervisor: {_h(r.SUPERVISOR)} · Área: {_h(r.AREA_BASE)} · Usuario: {_h(r.CORREO)}</div></div>", unsafe_allow_html=True)
             q=st.columns(4)
             q[0].metric("Líneas",f"{r.LINEAS:,.0f}")
             q[1].metric("FNR",f"{r.FNR:,.0f}",f"{r['FNR_%']:.2f}%")
@@ -4149,7 +4154,7 @@ if _tab_active(h):
             r=s[s.PICKER==seguimiento_picker].iloc[0]
             rec=picker_record(store,seguimiento_picker,aliases=[str(r.get("_SOURCE_PICKER",""))])
             acciones=rec.get("acciones",[]) or []; documentos=rec.get("documentos",[]) or []
-            st.markdown(f"<div class='justo-card'><div class='justo-kicker'>Expediente</div><div class='justo-title'>{seguimiento_picker}</div><div class='justo-muted'>Turno: {r.TURNO} · Supervisor: {r.SUPERVISOR} · Área: {r.AREA_BASE}</div></div>",unsafe_allow_html=True)
+            st.markdown(f"<div class='justo-card'><div class='justo-kicker'>Expediente</div><div class='justo-title'>{_h(seguimiento_picker)}</div><div class='justo-muted'>Turno: {_h(r.TURNO)} · Supervisor: {_h(r.SUPERVISOR)} · Área: {_h(r.AREA_BASE)}</div></div>",unsafe_allow_html=True)
             k1,k2,k3,k4,k5=st.columns(5)
             categorias_picker=[normalize_followup_category(z.get("accion","")) for z in acciones]
             categorias_picker += [normalize_followup_category(z.get("tipo","")) for z in documentos]
@@ -4364,7 +4369,7 @@ if _tab_active(j):
                 for idx,proc in enumerate(items):
                     with cols[idx%3]:
                         priority=proc.get("prioridad","Media")
-                        st.markdown(f"<div class='justo-card'><div class='justo-kicker'>{priority}</div><div class='justo-title'>{proc.get('titulo','Sin título')}</div><div class='justo-muted'>Responsable: {proc.get('responsable') or 'Sin asignar'} · Fecha: {proc.get('fecha_objetivo') or 'Sin fecha'}</div></div>",unsafe_allow_html=True)
+                        st.markdown(f"<div class='justo-card'><div class='justo-kicker'>{_h(priority)}</div><div class='justo-title'>{_h(proc.get('titulo','Sin título'))}</div><div class='justo-muted'>Responsable: {_h(proc.get('responsable') or 'Sin asignar')} · Fecha: {_h(proc.get('fecha_objetivo') or 'Sin fecha')}</div></div>",unsafe_allow_html=True)
                         if proc.get("objetivo"): st.write(proc["objetivo"])
                         if proc.get("pasos"):
                             with st.expander("Ver instrucciones"):
