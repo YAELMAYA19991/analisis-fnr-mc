@@ -40,5 +40,11 @@ class AppStaticTests(unittest.TestCase):
         self.assertIn("Imprimir pedidos en lote",self.text)
         self.assertIn("Descargar PDF de todos los pedidos",self.text)
 
+    def test_hourly_critical_audit_selection(self):
+        self.assertIn("Candidato crítico",self.text)
+        self.assertIn("Ranking crítico hora",self.text)
+        self.assertIn("Puntaje alarma",self.text)
+        self.assertIn("Solo los más alarmantes por hora",self.text)
+
 if __name__=="__main__":
     unittest.main()
