@@ -2209,7 +2209,7 @@ def build_bulk_audit_pdf(audit_detail,risk_summary,selected_orders,source_name="
              Paragraph("<b>Prioridad</b>",small),Paragraph(html.escape(priority),small_bold),
              Paragraph("<b>Puntaje</b>",small),Paragraph(str(score),center)],
             [Paragraph("<b>Picker(s)</b>",small),Paragraph(html.escape(pickers),small),
-             Paragraph("<b>Pedido revisado completo</b>",small),Paragraph("[ ] Sí",center),
+             Paragraph("<b>Revisión completa</b>",small),Paragraph("[ ] Sí",center),
              Paragraph("<b>Resultado</b>",small),Paragraph("[ ] Correcto   [ ] Diferencia",small),
              Paragraph("<b>Auditor</b>",small),Paragraph("________________",small)],
         ]
@@ -2267,11 +2267,6 @@ def build_bulk_audit_pdf(audit_detail,risk_summary,selected_orders,source_name="
         story.append(Spacer(1,2*mm))
         story.append(Paragraph(
             "<b>Observaciones generales:</b> ________________________________________________________________________________________________",
-            small,
-        ))
-        story.append(Spacer(1,1.5*mm))
-        story.append(Paragraph(
-            "__________________________________________________________________________________________________________________________",
             small,
         ))
         if pos<total_orders:
