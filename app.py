@@ -14,6 +14,12 @@ import pandas as pd
 import streamlit as st
 import qrcode
 from zoneinfo import ZoneInfo
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
 
 st.set_page_config(page_title="Control FNR & Mala Calidad", page_icon="🥑", layout="wide", initial_sidebar_state="expanded")
 
@@ -2133,6 +2139,154 @@ def order_risk_analysis(audit_lines,picker_summary,fnr_inc,mc_inc,prior_audits=N
         ).drop(columns="_priority_sort").reset_index(drop=True)
     return detail,order_summary
 
+@st.cache_data(show_spinner="Preparando paquete de auditoría…",max_entries=6,ttl=900)
+def build_bulk_audit_pdf(audit_detail,risk_summary,selected_orders,source_name=""):
+    """Genera un solo PDF imprimible con una sección por pedido seleccionado."""
+    selected_orders=[str(x) for x in selected_orders if str(x).strip()]
+    if not selected_orders:
+        return b""
+
+    detail=audit_detail.copy()
+    summary=risk_summary.copy()
+    detail["Número de pedido"]=detail["Número de pedido"].astype(str)
+    summary["Número de pedido"]=summary["Número de pedido"].astype(str)
+    summary=summary[summary["Número de pedido"].isin(selected_orders)].copy()
+    order_rank={order:i for i,order in enumerate(selected_orders)}
+    summary["_packet_order"]=summary["Número de pedido"].map(order_rank).fillna(999999)
+    summary=summary.sort_values(["_packet_order","Puntaje foco"],ascending=[True,False])
+
+    out=io.BytesIO()
+    doc=SimpleDocTemplate(
+        out,
+        pagesize=landscape(A4),
+        leftMargin=9*mm,rightMargin=9*mm,topMargin=8*mm,bottomMargin=8*mm,
+        title="Paquete de auditoría de pedidos",
+        author="Control FNR & Mala Calidad - Coyoacán",
+    )
+    styles=getSampleStyleSheet()
+    title_style=ParagraphStyle(
+        "AuditTitle",parent=styles["Heading1"],fontName="Helvetica-Bold",
+        fontSize=15,leading=17,spaceAfter=4,textColor=colors.HexColor("#272936"),
+    )
+    small=ParagraphStyle(
+        "AuditSmall",parent=styles["BodyText"],fontName="Helvetica",
+        fontSize=7.6,leading=9.2,spaceAfter=0,
+    )
+    small_bold=ParagraphStyle(
+        "AuditSmallBold",parent=small,fontName="Helvetica-Bold",
+    )
+    tiny=ParagraphStyle(
+        "AuditTiny",parent=styles["BodyText"],fontName="Helvetica",
+        fontSize=6.8,leading=8.1,spaceAfter=0,
+    )
+    center=ParagraphStyle(
+        "AuditCenter",parent=small,alignment=TA_CENTER,fontName="Helvetica-Bold",
+    )
+
+    story=[]
+    total_orders=len(summary)
+    generated=datetime.now(ZoneInfo("America/Mexico_City")).strftime("%Y-%m-%d %H:%M")
+
+    for pos,(_,order_row) in enumerate(summary.iterrows(),start=1):
+        order=str(order_row.get("Número de pedido",""))
+        lines=detail[detail["Número de pedido"].eq(order)].copy()
+        slot=str(order_row.get("Slot","") or "")
+        priority=str(order_row.get("Prioridad","") or "")
+        score=int(pd.to_numeric(order_row.get("Puntaje foco",0),errors="coerce") or 0)
+        pickers=str(order_row.get("Pickers asignados","Sin asignar") or "Sin asignar")
+        factors=str(order_row.get("Factores","Sin señales de foco") or "Sin señales de foco")
+
+        story.append(Paragraph(f"AUDITORÍA DE PEDIDO - {html.escape(order)}",title_style))
+        story.append(Paragraph(
+            f"Paquete {pos} de {total_orders} | Generado: {generated} | Archivo: {html.escape(str(source_name or 'Sin nombre'))}",
+            tiny,
+        ))
+        story.append(Spacer(1,2*mm))
+
+        header_data=[
+            [Paragraph("<b>Pedido</b>",small),Paragraph(html.escape(order),small_bold),
+             Paragraph("<b>Slot</b>",small),Paragraph(html.escape(slot),small_bold),
+             Paragraph("<b>Prioridad</b>",small),Paragraph(html.escape(priority),small_bold),
+             Paragraph("<b>Puntaje</b>",small),Paragraph(str(score),center)],
+            [Paragraph("<b>Picker(s)</b>",small),Paragraph(html.escape(pickers),small),
+             Paragraph("<b>Pedido revisado completo</b>",small),Paragraph("[ ] Sí",center),
+             Paragraph("<b>Resultado</b>",small),Paragraph("[ ] Correcto   [ ] Diferencia",small),
+             Paragraph("<b>Auditor</b>",small),Paragraph("________________",small)],
+        ]
+        header=Table(header_data,colWidths=[18*mm,42*mm,14*mm,28*mm,18*mm,32*mm,15*mm,28*mm])
+        header.setStyle(TableStyle([
+            ("GRID",(0,0),(-1,-1),0.45,colors.HexColor("#b8bcc4")),
+            ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#f3f4f6")),
+            ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+            ("LEFTPADDING",(0,0),(-1,-1),3),
+            ("RIGHTPADDING",(0,0),(-1,-1),3),
+            ("TOPPADDING",(0,0),(-1,-1),3),
+            ("BOTTOMPADDING",(0,0),(-1,-1),3),
+        ]))
+        story.append(header)
+        story.append(Spacer(1,1.8*mm))
+        story.append(Paragraph(f"<b>Factores de foco:</b> {html.escape(factors)}",tiny))
+        story.append(Spacer(1,1.8*mm))
+
+        table_rows=[[
+            Paragraph("<b>SKU</b>",tiny),
+            Paragraph("<b>Artículo</b>",tiny),
+            Paragraph("<b>Picker</b>",tiny),
+            Paragraph("<b>Pedida</b>",tiny),
+            Paragraph("<b>Pickeada</b>",tiny),
+            Paragraph("<b>Diferencia</b>",tiny),
+            Paragraph("<b>Corrección / observación</b>",tiny),
+        ]]
+        for _,line in lines.iterrows():
+            table_rows.append([
+                Paragraph(html.escape(str(line.get("SKU",""))),tiny),
+                Paragraph(html.escape(str(line.get("Artículo",""))),tiny),
+                Paragraph(html.escape(str(line.get("Picker relacionado",line.get("Picker","")))),tiny),
+                Paragraph(html.escape(str(line.get("Cantidad pedida",""))),center),
+                Paragraph(html.escape(str(line.get("Cantidad pickeada",""))),center),
+                Paragraph("[ ]",center),
+                Paragraph("________________________________",tiny),
+            ])
+
+        item_table=Table(
+            table_rows,
+            colWidths=[28*mm,73*mm,45*mm,18*mm,20*mm,20*mm,62*mm],
+            repeatRows=1,
+            splitByRow=1,
+        )
+        item_table.setStyle(TableStyle([
+            ("GRID",(0,0),(-1,-1),0.35,colors.HexColor("#c7c9ce")),
+            ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#e9ecef")),
+            ("VALIGN",(0,0),(-1,-1),"TOP"),
+            ("LEFTPADDING",(0,0),(-1,-1),2.5),
+            ("RIGHTPADDING",(0,0),(-1,-1),2.5),
+            ("TOPPADDING",(0,0),(-1,-1),2.4),
+            ("BOTTOMPADDING",(0,0),(-1,-1),2.4),
+        ]))
+        story.append(item_table)
+        story.append(Spacer(1,2*mm))
+        story.append(Paragraph(
+            "<b>Observaciones generales:</b> ________________________________________________________________________________________________",
+            small,
+        ))
+        story.append(Spacer(1,1.5*mm))
+        story.append(Paragraph(
+            "__________________________________________________________________________________________________________________________",
+            small,
+        ))
+        if pos<total_orders:
+            story.append(PageBreak())
+
+    def _page_number(canvas,doc_obj):
+        canvas.saveState()
+        canvas.setFont("Helvetica",6.5)
+        canvas.setFillColor(colors.HexColor("#6f7480"))
+        canvas.drawRightString(landscape(A4)[0]-9*mm,4.5*mm,f"Página {doc_obj.page}")
+        canvas.restoreState()
+
+    doc.build(story,onFirstPage=_page_number,onLaterPages=_page_number)
+    return out.getvalue()
+
 def _dedupe_columns(df):
     """Elimina columnas duplicadas conservando la primera aparición.
     Evita que pandas convierta df["columna"] en DataFrame y rompa filtros/booleanos.
@@ -3334,6 +3488,56 @@ if _tab_active(o):
                                 else:
                                     _risk_display["Prioridad"]=_risk_display["Prioridad"].map(lambda value:_risk_badges.get(str(value),str(value)))
                                     st.dataframe(_risk_display[_display_cols],use_container_width=True,hide_index=True)
+
+                                with st.container(border=True):
+                                    st.markdown("### 🖨️ Imprimir pedidos en lote")
+                                    st.caption("Genera un solo PDF con todos los pedidos seleccionados. Ya no necesitas descargar una hoja por pedido.")
+                                    _packet_mode=st.selectbox(
+                                        "Pedidos que incluirá el paquete",
+                                        ["🔴 Solo Foco alto","🔴🟡 Foco alto + Revisar","🎯 Recomendados + muestra control","👁️ Los que estoy viendo"],
+                                        key="bulk_audit_packet_mode",
+                                    )
+                                    if _packet_mode=="🔴 Solo Foco alto":
+                                        _packet_summary=_risk_summary[_risk_summary["Prioridad"].eq("Foco alto")].copy()
+                                    elif _packet_mode=="🔴🟡 Foco alto + Revisar":
+                                        _packet_summary=_risk_summary[_risk_summary["Prioridad"].isin(["Foco alto","Revisar"])].copy()
+                                    elif _packet_mode=="🎯 Recomendados + muestra control":
+                                        _packet_summary=_risk_summary[_risk_summary["Prioridad"].isin(["Foco alto","Revisar","Muestra control"])].copy()
+                                    else:
+                                        _packet_summary=_risk_filtered.copy()
+
+                                    _packet_orders=_packet_summary["Número de pedido"].astype(str).tolist()
+                                    _packet_rows=int(_audit_detail["Número de pedido"].astype(str).isin(_packet_orders).sum()) if _packet_orders else 0
+                                    _pc1,_pc2=st.columns(2)
+                                    _pc1.metric("Pedidos en el PDF",f"{len(_packet_orders):,}")
+                                    _pc2.metric("Renglones a imprimir",f"{_packet_rows:,}")
+                                    st.caption("El PDF deja cada pedido separado, con sus artículos, picker, cantidades, prioridad, puntaje y espacio para marcar diferencias/correcciones.")
+
+                                    _packet_signature=hashlib.sha256(
+                                        (hashlib.sha256(_audit_raw).hexdigest()+"|"+"|".join(_packet_orders)).encode("utf-8")
+                                    ).hexdigest()[:18] if _packet_orders else ""
+                                    if _packet_orders and st.button("🧾 Preparar PDF masivo",type="primary",key="prepare_bulk_audit_pdf"):
+                                        with st.spinner("Armando todas las hojas de auditoría…"):
+                                            st.session_state["_bulk_audit_pdf_bytes"]=build_bulk_audit_pdf(
+                                                _audit_detail,_risk_summary,_packet_orders,audit_upload.name
+                                            )
+                                            st.session_state["_bulk_audit_pdf_signature"]=_packet_signature
+                                            st.session_state["_bulk_audit_pdf_name"]=f"Paquete_auditoria_{datetime.now(ZoneInfo('America/Mexico_City')).strftime('%Y%m%d_%H%M')}.pdf"
+                                    if (
+                                        _packet_orders
+                                        and st.session_state.get("_bulk_audit_pdf_bytes")
+                                        and st.session_state.get("_bulk_audit_pdf_signature")==_packet_signature
+                                    ):
+                                        st.download_button(
+                                            "⬇️ Descargar PDF de todos los pedidos",
+                                            st.session_state["_bulk_audit_pdf_bytes"],
+                                            file_name=st.session_state.get("_bulk_audit_pdf_name","Paquete_auditoria.pdf"),
+                                            mime="application/pdf",
+                                            key="download_bulk_audit_pdf",
+                                            use_container_width=True,
+                                        )
+                                    elif not _packet_orders:
+                                        st.info("No hay pedidos en este nivel de foco.")
 
                                 _selection_source=_risk_filtered if not _risk_filtered.empty else _risk_summary
                                 _order_options=_selection_source["Número de pedido"].astype(str).tolist()
