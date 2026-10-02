@@ -3655,17 +3655,68 @@ if _tab_active(o):
                                 _slot_max=("_slot_min","max"),
                                 _slot_min=("_slot_min","min"),
                             )
-                            _included_orders=set(_slot_stats.loc[(~_slot_stats["_slot_missing"]) & (_slot_stats["_slot_max"]<=12*60),"Número de pedido"])
-                            _after_noon_orders=int((~_slot_stats["_slot_missing"] & (_slot_stats["_slot_max"]>12*60)).sum())
+                            # Separa por SLOT del Excel, no por hora de inicio del otro equipo.
+                            _included_orders=set(_slot_stats.loc[~_slot_stats["_slot_missing"],"Número de pedido"])
                             _bad_time_orders=int(_slot_stats["_slot_missing"].sum())
                             _eligible=_audit_data[_audit_data["Número de pedido"].isin(_included_orders)].drop(columns="_slot_min").copy()
                             _line_count=len(_eligible)
                             _order_count=len(_included_orders)
-                            st.caption(f"Incluidos: {_order_count:,} pedidos y {_line_count:,} renglones hasta las 12:00 · Omitidos después de las 12:00: {_after_noon_orders:,} pedidos · Sin horario legible: {_bad_time_orders:,} pedidos.")
+                            st.caption(f"Pedidos con slot válido: {_order_count:,} ({_line_count:,} renglones). Sin hora legible: {_bad_time_orders:,}. El equipo del día empieza a las 07:00 y cubre los slots desde 10:00.")
                             if _eligible.empty:
-                                st.warning("No hay pedidos con slot hasta las 12:00 en este archivo.")
+                                st.warning("No hay pedidos con hora de slot válida en este archivo.")
                             else:
                                 _audit_detail,_risk_summary=order_risk_analysis(_eligible,s,fnr,mc,store.get("order_audits",[]))
+                                _risk_summary=_risk_summary.merge(
+                                    _slot_stats[["Número de pedido","_slot_min","_slot_max"]],
+                                    on="Número de pedido",how="left",validate="one_to_one",
+                                )
+                                _risk_summary["Cobertura equipo"]=_risk_summary["_slot_max"].map(
+                                    lambda minute:"🌙 Prioridad propia · slot antes de 10:00" if pd.notna(minute) and minute<600
+                                    else "☀️ Auditoría del día · slot desde 10:00"
+                                )
+                                # El turno del picker se obtiene de la plantilla, no del slot.
+                                _shift_candidates={}
+                                def _register_picker_shift(frame,turn_col):
+                                    if frame is None or frame.empty or turn_col not in frame.columns:
+                                        return
+                                    for _,_rr in frame.iterrows():
+                                        _shift=str(_rr.get(turn_col,"") or "").strip()
+                                        if not _shift or norm(_shift) in {"nan","none","no_especificado","no_asignado"}:
+                                            continue
+                                        for _identity in [_rr.get("PICKER",""),_rr.get("CORREO",""),_rr.get("_SOURCE_PICKER","")]:
+                                            _identity=str(_identity or "").strip()
+                                            if not _identity or _identity.lower()=="nan":
+                                                continue
+                                            _keys=["n:"+person_key(_identity),"t:"+token_key(_identity)]
+                                            if "@" in _identity:
+                                                _keys.append("e:"+email_key(_identity))
+                                            for _key in _keys:
+                                                if len(_key)>2:
+                                                    _shift_candidates.setdefault(_key,set()).add(_shift)
+                                _register_picker_shift(roster,"TURNO_MAESTRO")
+                                _register_picker_shift(s,"TURNO")
+                                def _shift_for_audit_picker(value):
+                                    _value=str(value or "").strip()
+                                    _keys=["e:"+email_key(_value)] if "@" in _value else []
+                                    _keys.extend(["n:"+person_key(_value),"t:"+token_key(_value)])
+                                    for _key in _keys:
+                                        _matches=_shift_candidates.get(_key,set())
+                                        if len(_matches)==1:
+                                            return next(iter(_matches))
+                                    return "Sin identificar"
+                                _audit_detail["Turno picker"]=_audit_detail["Picker relacionado"].map(_shift_for_audit_picker)
+                                _shift_by_order=_audit_detail.groupby("Número de pedido")["Turno picker"].agg(
+                                    lambda v:", ".join(sorted(set(str(z) for z in v if str(z)!="Sin identificar"))) or "Sin identificar"
+                                )
+                                _risk_summary["Turno picker"]=_risk_summary["Número de pedido"].map(_shift_by_order).fillna("Sin identificar")
+                                _risk_summary["Picker nocturno"]=_risk_summary["Turno picker"].map(
+                                    lambda text:any(norm(k).startswith("nocturn") or norm(k)=="noche" or norm(k)=="22"
+                                                    for k in str(text).split(", "))
+                                )
+                                # Bonificación pequeña para desempatar pedidos de riesgo parecido.
+                                _risk_summary["Puntaje selección"]=_risk_summary["Puntaje alarma"]+_risk_summary["Picker nocturno"].astype(int)*2
+                                _audited_orders={norm(a.get("pedido","")) for a in store.get("order_audits",[]) or [] if isinstance(a,dict)}
+                                _risk_summary["Auditado en esta app"]=_risk_summary["Número de pedido"].map(lambda v:norm(v) in _audited_orders)
                                 _risk_order={"Foco alto":3,"Revisar":2,"Muestra control":1,"Sin foco":0}
                                 _risk_badges={
                                     "Foco alto":"🔴 Foco alto",
