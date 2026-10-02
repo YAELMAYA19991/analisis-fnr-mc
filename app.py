@@ -2476,6 +2476,12 @@ def build_bulk_audit_pdf(audit_detail,risk_summary,selected_orders,source_name="
         ]))
         story.append(header)
         story.append(Spacer(1,1.8*mm))
+        story.append(Paragraph(
+            f"<b>Cobertura:</b> {html.escape(str(order_row.get('Cobertura equipo','Sin determinar')))}"
+            f"  |  <b>Turno del picker:</b> {html.escape(str(order_row.get('Turno picker','Sin identificar')))}",
+            tiny,
+        ))
+        story.append(Spacer(1,1.8*mm))
         story.append(Paragraph(f"<b>Factores de foco:</b> {html.escape(factors)}",tiny))
         story.append(Spacer(1,1.8*mm))
 
@@ -3590,8 +3596,8 @@ if _tab_active(a):
 if _tab_active(o):
     with o:
         st.subheader("📦 Auditoría de pedidos")
-        st.caption("Prioriza pedidos para revisión y descarga una hoja de validación por pedido.")
-        st.info("Solo se analizarán pedidos con slot hasta las 12:00 inclusive. Los pedidos posteriores se omiten. El archivo se usa durante esta sesión; las auditorías que guardes sí permanecen en el historial y respaldo configurado.")
+        st.caption("Auditoría focalizada: hasta 3–4 pedidos alarmantes por hora de slot, con PDF masivo listo para imprimir.")
+        st.info("Cobertura principal: slots anteriores a las 10:00. El otro equipo comienza a las 07:00 y audita los slots desde las 10:00. Puedes consultar el resto del día sin mezclarlo con la lista principal.")
         audit_upload=st.file_uploader("Archivo de picking de MFC",type=["xlsx","xls","csv"],key="order_audit_upload")
         if audit_upload is None:
             st.markdown("**Campos que se usan:** pedido, slot, SKU, producto, cantidad y picker asignado.")
