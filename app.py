@@ -2143,6 +2143,7 @@ def _audit_parse_history_bytes(data,tipo):
 
 @st.cache_data(show_spinner=False,ttl=1800,max_entries=120)
 def _audit_archive_parsed_version(key,filename,tipo):
+    """Una sola descarga por versión durante el cacheo, no cada vez que cambia un filtro."""
     if cloud_enabled():
         raw=cloud_download(f"upload_history/{key}/{filename}",missing_ok=False)
     else:
@@ -2150,7 +2151,7 @@ def _audit_archive_parsed_version(key,filename,tipo):
             raw=f.read()
     if raw is None:
         raise RuntimeError(f"No se pudo recuperar la versión {filename}")
-    return _audit_parse_history_bytes(raw,tipo)
+    return hashlib.sha256(raw).hexdigest(),_audit_parse_history_bytes(raw,tipo)
 
 
 def audit_history_30days(current_fnr,current_mc,roster,base,store,today=None):
@@ -2170,17 +2171,12 @@ def audit_history_30days(current_fnr,current_mc,roster,base,store,today=None):
         seen_hash.add(current_hash)
         names=_audit_history_archive_names(key,today.isoformat())
         for name in names:
-            # Evitar recontar el mismo archivo guardado bajo otro nombre.
-            if cloud_enabled():
-                bytes_data=cloud_download(f"upload_history/{key}/{name}",missing_ok=False)
-            else:
-                with open(os.path.join(UPLOAD_HISTORY_DIR,key,name),"rb") as f:
-                    bytes_data=f.read()
-            fingerprint=hashlib.sha256(bytes_data).hexdigest()
+            # Cachea el archivo y omite copias exactas de una versión anterior.
+            fingerprint,parsed=_audit_archive_parsed_version(key,name,tipo)
             if fingerprint in seen_hash:
                 continue
             seen_hash.add(fingerprint)
-            versions.append(_audit_parse_history_bytes(bytes_data,tipo))
+            versions.append(parsed)
         frame,stats=audit_dedupe_30day_versions(versions,today)
         if not frame.empty:
             frame=canonicalize_incidents(frame,roster)
