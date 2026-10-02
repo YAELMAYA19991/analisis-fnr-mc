@@ -16,9 +16,9 @@ jobs:
           python-version: "3.12"
       - name: Syntax check
         run: python -m py_compile app.py
-      - name: Static tests
-        run: python -m unittest discover -s tests -p "test_*.py"
       - name: Install dependencies
         run: pip install -r requirements.txt
+      - name: Static and operational tests
+        run: python -m unittest discover -s tests -p "test_*.py"
       - name: Import dependency smoke check
         run: python -c "import streamlit, pandas, openpyxl, xlrd, qrcode, reportlab; print('dependencies ok')"
