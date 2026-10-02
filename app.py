@@ -2371,6 +2371,25 @@ def order_risk_analysis(audit_lines,picker_summary,fnr_inc,mc_inc,prior_audits=N
         ).drop(columns=["_critical_sort","_priority_sort"]).reset_index(drop=True)
     return detail,order_summary
 
+def audit_coverage_filter(risks,mode):
+    """Separa responsabilidades por el slot del Excel, no por hora de picking."""
+    if mode=="early":
+        return risks[pd.to_numeric(risks["_slot_max"],errors="coerce")<600].copy()
+    if mode=="day":
+        return risks[pd.to_numeric(risks["_slot_min"],errors="coerce")>=600].copy()
+    return risks.copy()
+
+def audit_hourly_critical_queue(available,max_per_hour=4):
+    """Ordena alarmas y limita a 3–4 por franja de slot con desempate nocturno."""
+    critical=available[available["Candidato crítico"].fillna(False).astype(bool)].copy()
+    critical=critical.sort_values(
+        ["Hora auditoría","Puntaje selección","Puntaje alarma",
+         "Máx. historial picker+artículo","Diferencias cantidad","Número de pedido"],
+        ascending=[True,False,False,False,False,True],
+    )
+    critical["Ranking crítico hora"]=critical.groupby("Hora auditoría",sort=False).cumcount()+1
+    return critical[critical["Ranking crítico hora"]<=int(max_per_hour)].copy()
+
 @st.cache_data(show_spinner="Preparando paquete de auditoría…",max_entries=6,ttl=900)
 def build_bulk_audit_pdf(audit_detail,risk_summary,selected_orders,source_name=""):
     """Genera un solo PDF imprimible con una sección por pedido seleccionado."""
@@ -3670,9 +3689,14 @@ if _tab_active(o):
                                     _slot_stats[["Número de pedido","_slot_min","_slot_max"]],
                                     on="Número de pedido",how="left",validate="one_to_one",
                                 )
-                                _risk_summary["Cobertura equipo"]=_risk_summary["_slot_max"].map(
-                                    lambda minute:"🌙 Prioridad propia · slot antes de 10:00" if pd.notna(minute) and minute<600
-                                    else "☀️ Auditoría del día · slot desde 10:00"
+                                _risk_summary["Cobertura equipo"]=_risk_summary.apply(
+                                    lambda rr: (
+                                        "🌙 Prioridad propia · slot antes de 10:00"
+                                        if pd.notna(rr["_slot_max"]) and rr["_slot_max"]<600
+                                        else "☀️ Auditoría del día · slot desde 10:00"
+                                        if pd.notna(rr["_slot_min"]) and rr["_slot_min"]>=600
+                                        else "⚠️ Slots mixtos · coordinar equipos"
+                                    ),axis=1,
                                 )
                                 # El turno del picker se obtiene de la plantilla, no del slot.
                                 _shift_candidates={}
@@ -3734,13 +3758,13 @@ if _tab_active(o):
                                     key="audit_coverage_mode",
                                 )
                                 if _coverage_mode=="🌙 Principal: slots antes de 10:00":
-                                    _coverage_summary=_risk_summary[_risk_summary["_slot_max"]<600].copy()
+                                    _coverage_summary=audit_coverage_filter(_risk_summary,"early")
                                     st.caption("Foco principal en madrugada / slots anteriores a las 10:00. Entre riesgos similares, primero los pickers identificados como nocturnos.")
                                 elif _coverage_mode=="☀️ Alertas para equipo del día: slots desde 10:00":
-                                    _coverage_summary=_risk_summary[_risk_summary["_slot_min"]>=600].copy()
+                                    _coverage_summary=audit_coverage_filter(_risk_summary,"day")
                                     st.info("Estos pedidos pertenecen a la cobertura del equipo del día. Antes de reauditar, confirma con ellos si el pedido ya fue revisado.")
                                 else:
-                                    _coverage_summary=_risk_summary.copy()
+                                    _coverage_summary=audit_coverage_filter(_risk_summary,"all")
                                     st.warning("Modo excepcional: incluye ambos equipos. Comprueba las auditorías previas para evitar duplicados.")
                                 _metric1,_metric2,_metric3,_metric4=st.columns(4)
                                 _metric1.metric("Pedidos en cobertura",f"{len(_coverage_summary):,}")
@@ -3761,17 +3785,7 @@ if _tab_active(o):
                                     ~_coverage_summary["Auditado en esta app"] if _hide_done
                                     else pd.Series(True,index=_coverage_summary.index)
                                 ].copy()
-                                _critical_candidates=_available[_available["Candidato crítico"].fillna(False).astype(bool)].copy()
-                                _critical_candidates=_critical_candidates.sort_values(
-                                    ["Hora auditoría","Puntaje selección","Puntaje alarma","Máx. historial picker+artículo","Diferencias cantidad","Número de pedido"],
-                                    ascending=[True,False,False,False,False,True],
-                                )
-                                _critical_candidates["Ranking crítico hora"]=_critical_candidates.groupby(
-                                    "Hora auditoría",sort=False
-                                ).cumcount()+1
-                                _critical_hourly=_critical_candidates[
-                                    _critical_candidates["Ranking crítico hora"]<=_max_per_hour
-                                ].copy()
+                                _critical_hourly=audit_hourly_critical_queue(_available,_max_per_hour)
                                 with _cfg2:
                                     st.metric("🚨 Más alarmantes de esta cobertura",f"{len(_critical_hourly):,}",f"máx. {_max_per_hour} por hora de slot")
                                 st.caption("Solo exige cruces fuertes y no rellena el cupo. El picker nocturno suma +2 únicamente para ordenar riesgos similares.")
