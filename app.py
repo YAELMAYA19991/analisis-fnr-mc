@@ -899,6 +899,7 @@ def save_store(store):
     # Fusiona siempre los registros remotos, aunque otra sesión solo haya
     # actualizado el shard pickers.json y no la revisión del archivo principal.
     missing_shards=set()
+    remote_shard_snapshot={}
     if cloud_enabled():
         remote_main=_cloud_json_read(CLOUD_STORE_KEY,{})
         if not isinstance(remote_main,dict):
@@ -921,6 +922,7 @@ def save_store(store):
                     remote[field]={**(remote_main.get(field,{}) or {}),**(shard or {})}
                 else:
                     remote[field]=shard
+                remote_shard_snapshot[field]=shard
         local_revision=pd.to_numeric(store.get("_revision",0),errors="coerce")
         remote_revision=pd.to_numeric(remote_main.get("_revision",0),errors="coerce")
         local_revision=0 if pd.isna(local_revision) else int(local_revision)
@@ -946,7 +948,14 @@ def save_store(store):
             with open(local_path,"rb") as f: same=(f.read()==payload)
         except OSError:
             pass
-        if not same or field in missing_shards: changed_shards.append((field,payload,local_path))
+        # También comparar con la nube: un fallo de red no debe dejar
+        # un archivo local actualizado pero el respaldo remoto desfasado.
+        remote_same=True
+        if cloud_enabled() and field not in missing_shards:
+            remote_payload=json.dumps(remote_shard_snapshot.get(field),ensure_ascii=False,indent=2).encode("utf-8")
+            remote_same=(payload==remote_payload)
+        if not same or field in missing_shards or not remote_same:
+            changed_shards.append((field,payload,local_path))
 
     if not cloud_enabled() and not changed_main and not changed_shards:
         return
