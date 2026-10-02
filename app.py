@@ -2034,6 +2034,11 @@ def _audit_incident_date(value):
     if re.fullmatch(r"\d{8}",text):
         try: return datetime.strptime(text,"%Y%m%d").date()
         except ValueError: return None
+    # ISO AAAA-MM-DD siempre se interpreta como año-mes-día, incluso
+    # cuando día y mes son ambos <=12 (pandas dayfirst invierte ambiguos).
+    if re.match(r"^\d{4}-\d{2}-\d{2}(?:[T\s]|$)",text):
+        try: return datetime.strptime(text[:10],"%Y-%m-%d").date()
+        except ValueError: return None
     try:
         ts=pd.to_datetime(text,dayfirst=True,errors="coerce")
         return ts.date() if pd.notna(ts) else None
