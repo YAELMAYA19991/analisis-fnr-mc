@@ -5,7 +5,7 @@
 # ================================================================
 
 
-import io, re, json, os, smtplib, ssl, zipfile, hashlib, urllib.request, urllib.error, urllib.parse, html
+import io, re, json, os, smtplib, ssl, zipfile, hashlib, urllib.request, urllib.error, urllib.parse, html, uuid
 from difflib import SequenceMatcher
 from datetime import datetime
 from email.message import EmailMessage
@@ -389,11 +389,11 @@ def cloud_download(key,missing_ok=True):
     object_path=urllib.parse.quote(str(key).lstrip("/"),safe="/")
     return _cloud_request("GET",f"/storage/v1/object/authenticated/{bucket_path}/{object_path}",missing_ok=missing_ok)
 
-def cloud_list(prefix,limit=1000):
+def cloud_list(prefix,limit=1000,offset=0):
     if not cloud_enabled(): return []
     _cloud_ensure_bucket()
     _,_,bucket=cloud_config()
-    body=json.dumps({"prefix":str(prefix).strip("/"),"limit":int(limit),"offset":0,"sortBy":{"column":"name","order":"desc"}}).encode("utf-8")
+    body=json.dumps({"prefix":str(prefix).strip("/"),"limit":int(limit),"offset":int(offset),"sortBy":{"column":"name","order":"desc"}}).encode("utf-8")
     raw=_cloud_request("POST",f"/storage/v1/object/list/{urllib.parse.quote(bucket,safe='')}",body)
     try: return json.loads(raw.decode("utf-8"))
     except Exception as exc: raise RuntimeError("La nube devolvió una respuesta de historial inválida.") from exc
@@ -683,18 +683,24 @@ def _cloud_json_read(key,default):
         return default.copy() if isinstance(default,dict) else list(default) if isinstance(default,list) else default
     try:
         return json.loads(raw.decode("utf-8"))
-    except Exception:
-        return default.copy() if isinstance(default,dict) else list(default) if isinstance(default,list) else default
+    except (ValueError,UnicodeDecodeError) as exc:
+        raise RuntimeError(f"El archivo {key} de Supabase está dañado o no es JSON válido. No se guardará encima.") from exc
 
 def _unique_records(records):
-    out=[]; seen=set()
+    """Fusión por ID sin duplicar seguimientos cuando cambia su estado de correo."""
+    out=[]; positions={}
     for item in records or []:
-        if not isinstance(item,dict):
-            marker=json.dumps(item,ensure_ascii=False,sort_keys=True,default=str)
+        if isinstance(item,dict) and str(item.get("id","")).strip():
+            marker="id:"+str(item["id"]).strip()
         else:
-            marker=str(item.get("id") or item.get("fecha_auditoria") or item.get("fecha") or "")+"|"+json.dumps(item,ensure_ascii=False,sort_keys=True,default=str)
-        if marker in seen: continue
-        seen.add(marker); out.append(item)
+            marker="data:"+json.dumps(item,ensure_ascii=False,sort_keys=True,default=str)
+        if marker in positions:
+            # La versión posterior prevalece para metadatos, nunca elimina campos anteriores.
+            idx=positions[marker]
+            if isinstance(out[idx],dict) and isinstance(item,dict):
+                updated=dict(out[idx]); updated.update(item);out[idx]=updated
+            continue
+        positions[marker]=len(out);out.append(item)
     return out
 
 def _merge_picker_store(remote,local):
@@ -741,6 +747,85 @@ def _merge_store_states(remote,local):
     merged["powerbi_krs_history"]=sorted(pbi.values(),key=lambda item:(str(item.get("fecha","")),str(item.get("cargado",""))))
     return merged
 
+FOLLOWUP_JOURNAL_PREFIX="seguimientos_registros/"
+
+def _followup_event_objects():
+    """Lista TODOS los eventos paginando el bucket. Un fallo bloquea la carga."""
+    if not cloud_enabled():
+        return []
+    objects=[]
+    offset=0
+    while True:
+        batch=cloud_list(FOLLOWUP_JOURNAL_PREFIX,limit=500,offset=offset)
+        if not isinstance(batch,list):
+            raise RuntimeError("La lista de respaldos de seguimiento no se pudo consultar.")
+        objects.extend(item for item in batch if isinstance(item,dict) and str(item.get("name","")).endswith(".json"))
+        if len(batch)<500:
+            return objects
+        offset+=len(batch)
+
+def _load_followup_journal(store):
+    """Reincorpora registros individuales que faltan en el índice de expedientes."""
+    if not cloud_enabled():
+        return 0
+    existing_ids={
+        str(rec.get("id"))
+        for p in (store.get("pickers",{}) or {}).values()
+        if isinstance(p,dict)
+        for typ in ("acciones","documentos")
+        for rec in p.get(typ,[]) or []
+        if isinstance(rec,dict) and rec.get("id")
+    }
+    restored=0
+    for obj in _followup_event_objects():
+        name=str(obj.get("name",""))
+        record_id=name.rsplit("/",1)[-1].removesuffix(".json")
+        if record_id in existing_ids:
+            continue
+        cloud_path=name if name.startswith(FOLLOWUP_JOURNAL_PREFIX) else FOLLOWUP_JOURNAL_PREFIX+name
+        payload=_cloud_json_read(cloud_path,None)
+        if not isinstance(payload,dict) or payload.get("kind") not in {"acciones","documentos"}:
+            raise RuntimeError(f"Respaldo individual inválido: {cloud_path}")
+        picker=str(payload.get("picker","")).strip()
+        record=payload.get("registro")
+        if not picker or not isinstance(record,dict):
+            raise RuntimeError(f"Respaldo individual incompleto: {cloud_path}")
+        record_id=str(record.get("id") or record_id)
+        record["id"]=record_id
+        rec=picker_record(store,picker,aliases=payload.get("aliases",[]) or [])
+        rec.setdefault(payload["kind"],[]).append(record)
+        existing_ids.add(record_id)
+        restored+=1
+    return restored
+
+def save_followup_entry(store,picker,kind,registro,aliases=None):
+    """Respalda cada seguimiento por separado ANTES de modificar el índice global.
+
+    Si falla Supabase, no se informa un falso éxito. El archivo de evento
+    es independiente de pickers.json y no puede desaparecer por una escritura
+    concurrente de otro supervisor.
+    """
+    if kind not in {"acciones","documentos"}:
+        raise ValueError("Tipo de seguimiento inválido.")
+    if not cloud_enabled():
+        raise RuntimeError("No se guardó el seguimiento: falta configurar la nube. No se admiten guardados temporales.")
+    picker=str(picker or "").strip()
+    if not picker:
+        raise ValueError("Selecciona un picker.")
+    record=dict(registro)
+    record["id"]=str(record.get("id") or uuid.uuid4().hex)
+    path=FOLLOWUP_JOURNAL_PREFIX+record["id"]+".json"
+    journal={"v":1,"picker":picker,"aliases":list(aliases or []),"kind":kind,"registro":record}
+    payload=json.dumps(journal,ensure_ascii=False,sort_keys=True).encode("utf-8")
+    cloud_upload(path,payload,"application/json")
+    rec=picker_record(store,picker,aliases=aliases)
+    rec[kind]=_unique_records(list(rec.get(kind,[]) or [])+[record])
+    try:
+        save_store(store)
+    except Exception as exc:
+        raise RuntimeError("El seguimiento SÍ quedó respaldado individualmente en la nube, pero falló la actualización del índice; al volver a entrar se reconstruirá desde el respaldo. "+str(exc)) from exc
+    return record
+
 def _load_store_from_sources():
     ensure_persist_dir()
     cloud_main=_cloud_json_read(CLOUD_STORE_KEY,{}) if cloud_enabled() else {}
@@ -774,13 +859,23 @@ def _load_store_from_sources():
         if cloud_enabled():
             raw=cloud_download(cloud_key,missing_ok=True)
             if raw is not None:
-                try: shard=json.loads(raw.decode("utf-8"))
-                except Exception: shard=None
+                try:
+                    shard=json.loads(raw.decode("utf-8"))
+                except (ValueError,UnicodeDecodeError) as exc:
+                    raise RuntimeError(f"El archivo {cloud_key} no contiene JSON válido; se bloqueó la carga para evitar sobrescribir los datos.") from exc
         if shard is None and os.path.exists(local_path):
             shard=_json_local_read(local_path,default)
         if shard is not None:
-            data[field]=shard
+            if field=="pickers":
+                data[field]=_merge_picker_store(data.get(field,{}) or {},shard if isinstance(shard,dict) else {})
+            elif field=="order_audits":
+                data[field]=_unique_records(list(data.get(field,[]) or [])+list(shard or []))
+            elif field=="monthly_history":
+                data[field]={**(data.get(field,{}) or {}),**(shard or {})}
+            else:
+                data[field]=shard
 
+    _load_followup_journal(data)
     # Mantener copia local útil para recuperación.
     main_local={k:v for k,v in data.items() if k not in STORE_SHARDS}
     try: _json_atomic_write(STORE_FILE,main_local)
@@ -801,19 +896,37 @@ def save_store(store):
     ensure_persist_dir()
     store.setdefault("_revision",0)
 
-    # Si otra sesión escribió desde nuestra última lectura, fusionar lo append-only
-    # antes de publicar para reducir pérdidas por escrituras concurrentes.
+    # Fusiona siempre los registros remotos, aunque otra sesión solo haya
+    # actualizado el shard pickers.json y no la revisión del archivo principal.
+    missing_shards=set()
     if cloud_enabled():
         remote_main=_cloud_json_read(CLOUD_STORE_KEY,{})
-        remote_revision=int(pd.to_numeric(remote_main.get("_revision",0),errors="coerce") or 0) if isinstance(remote_main,dict) else 0
-        local_revision=int(pd.to_numeric(store.get("_revision",0),errors="coerce") or 0)
-        if remote_revision>local_revision:
-            remote=dict(remote_main)
-            for field,(cloud_key,_,default) in STORE_SHARDS.items():
-                remote[field]=_cloud_json_read(cloud_key,default)
-            merged=_merge_store_states(remote,store)
-            store.clear(); store.update(merged)
-            local_revision=remote_revision
+        if not isinstance(remote_main,dict):
+            raise RuntimeError("El índice principal no tiene formato válido.")
+        remote=dict(remote_main)
+        for field,(cloud_key,_,default) in STORE_SHARDS.items():
+            raw=cloud_download(cloud_key,missing_ok=True)
+            if raw is None:
+                missing_shards.add(field)
+                remote[field]=remote_main.get(field,default)
+            else:
+                try: shard=json.loads(raw.decode("utf-8"))
+                except (ValueError,UnicodeDecodeError) as exc:
+                    raise RuntimeError(f"Se bloqueó la escritura porque {cloud_key} está dañado.") from exc
+                if field=="pickers":
+                    remote[field]=_merge_picker_store(remote_main.get(field,{}) or {},shard or {})
+                elif field=="order_audits":
+                    remote[field]=_unique_records(list(remote_main.get(field,[]) or [])+list(shard or []))
+                elif field=="monthly_history":
+                    remote[field]={**(remote_main.get(field,{}) or {}),**(shard or {})}
+                else:
+                    remote[field]=shard
+        local_revision=pd.to_numeric(store.get("_revision",0),errors="coerce")
+        remote_revision=pd.to_numeric(remote_main.get("_revision",0),errors="coerce")
+        local_revision=0 if pd.isna(local_revision) else int(local_revision)
+        remote_revision=0 if pd.isna(remote_revision) else int(remote_revision)
+        merged=_merge_store_states(remote,store)
+        store.clear(); store.update(merged)
         store["_revision"]=max(local_revision,remote_revision)+1
 
     main_data={k:v for k,v in store.items() if k not in STORE_SHARDS}
@@ -833,7 +946,7 @@ def save_store(store):
             with open(local_path,"rb") as f: same=(f.read()==payload)
         except OSError:
             pass
-        if not same: changed_shards.append((field,payload,local_path))
+        if not same or field in missing_shards: changed_shards.append((field,payload,local_path))
 
     if not cloud_enabled() and not changed_main and not changed_shards:
         return
@@ -850,10 +963,9 @@ def save_store(store):
         main_data={k:v for k,v in store.items() if k not in STORE_SHARDS}
         main_payload=json.dumps(main_data,ensure_ascii=False,indent=2).encode("utf-8")
         try:
-            if changed_main or previous_backup!=backup_at:
-                cloud_upload(CLOUD_STORE_KEY,main_payload,"application/json")
             for field,payload,_ in changed_shards:
                 cloud_upload(STORE_SHARDS[field][0],payload,"application/json")
+            cloud_upload(CLOUD_STORE_KEY,main_payload,"application/json")
         except Exception:
             if previous_backup is None: store.pop("cloud_backup_at",None)
             else: store["cloud_backup_at"]=previous_backup
@@ -989,9 +1101,9 @@ def picker_record(store, picker, aliases=None):
     if target in store["pickers"] and target != found_key:
         current=store["pickers"][target]
         current.setdefault("comentarios",[]); current.setdefault("acciones",[]); current.setdefault("documentos",[])
-        current["comentarios"]=current["comentarios"]+rec.get("comentarios",[])
-        current["acciones"]=current["acciones"]+rec.get("acciones",[])
-        current["documentos"]=current["documentos"]+rec.get("documentos",[])
+        current["comentarios"]=_unique_records(current["comentarios"]+rec.get("comentarios",[]))
+        current["acciones"]=_unique_records(current["acciones"]+rec.get("acciones",[]))
+        current["documentos"]=_unique_records(current["documentos"]+rec.get("documentos",[]))
         return current
     store["pickers"][target]=rec
     return rec
