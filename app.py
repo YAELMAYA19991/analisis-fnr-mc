@@ -2379,8 +2379,33 @@ def audit_coverage_filter(risks,mode):
         return risks[pd.to_numeric(risks["_slot_min"],errors="coerce")>=600].copy()
     return risks.copy()
 
-def audit_hourly_critical_queue(available,max_per_hour=4):
-    """Ordena alarmas y limita a 3–4 por franja de slot con desempate nocturno."""
+def audit_hourly_quota_table(coverage,percentage=20):
+    """Cupo por hora de slot: porcentaje del TOTAL de pedidos, redondeado arriba."""
+    percentage=int(percentage)
+    if not 1<=percentage<=100:
+        raise ValueError("El porcentaje de auditoría debe estar entre 1 y 100.")
+    columns=["Hora auditoría","Pedidos detectados","Porcentaje","Cupo máximo"]
+    if coverage is None or coverage.empty:
+        return pd.DataFrame(columns=columns)
+    table=(
+        coverage.groupby("Hora auditoría",dropna=False)["Número de pedido"]
+        .nunique().reset_index(name="Pedidos detectados")
+    )
+    table["Porcentaje"]=percentage
+    table["Cupo máximo"]=(
+        (table["Pedidos detectados"].astype(int)*percentage+99)//100
+    ).astype(int)
+    return table.sort_values("Hora auditoría").reset_index(drop=True)
+
+def audit_hourly_critical_queue(available,percentage=20,population=None):
+    """Selecciona solo pedidos críticos hasta el % calculado por hora de slot.
+
+    El denominador es toda la cobertura, incluso pedidos ya auditados: al
+    ocultarlos no se amplía el cupo con casos menos urgentes. El orden conserva
+    las señales FNR/MC y usa el turno nocturno para desempatar.
+    """
+    full_coverage=population if population is not None else available
+    quotas=audit_hourly_quota_table(full_coverage,percentage)
     critical=available[available["Candidato crítico"].fillna(False).astype(bool)].copy()
     critical=critical.sort_values(
         ["Hora auditoría","Puntaje selección","Puntaje alarma",
@@ -2388,7 +2413,9 @@ def audit_hourly_critical_queue(available,max_per_hour=4):
         ascending=[True,False,False,False,False,True],
     )
     critical["Ranking crítico hora"]=critical.groupby("Hora auditoría",sort=False).cumcount()+1
-    return critical[critical["Ranking crítico hora"]<=int(max_per_hour)].copy()
+    quota_map=quotas.set_index("Hora auditoría")["Cupo máximo"].to_dict()
+    critical["Cupo máximo hora"]=critical["Hora auditoría"].map(quota_map).fillna(0).astype(int)
+    return critical[critical["Ranking crítico hora"]<=critical["Cupo máximo hora"]].copy()
 
 @st.cache_data(show_spinner="Preparando paquete de auditoría…",max_entries=6,ttl=900)
 def build_bulk_audit_pdf(audit_detail,risk_summary,selected_orders,source_name=""):
@@ -3324,8 +3351,8 @@ with st.expander("🔳 Generador de códigos QR",expanded=False):
     
 st.divider()
 
-_tab_labels=["🏠 Bodega y turnos / áreas","📦 Auditoría de pedidos","👤 Pickers y supervisores","📅 Faltas y retardos","🛡️ Seguimiento","📌 Pendientes","🧰 Herramientas"]
-a,o,b,i,h,j,x=st.tabs(_tab_labels,on_change="rerun",key="control_fnr_mc_tabs_v6")
+_tab_labels=["🏠 Bodega y turnos / áreas","👤 Pickers y supervisores","📅 Faltas y retardos","🛡️ Seguimiento","📌 Pendientes","📦 Auditoría de pedidos","🧰 Herramientas"]
+a,b,i,h,j,o,x=st.tabs(_tab_labels,on_change="rerun",key="control_fnr_mc_tabs_v7")
 # Agrupa las secciones en una sola pestaña y conserva sus formularios y cálculos.
 e=a  # Turnos / Áreas comparte la pestaña de Bodega.
 g=b  # Supervisores comparte la pestaña de Pickers.
@@ -3596,7 +3623,7 @@ if _tab_active(a):
 if _tab_active(o):
     with o:
         st.subheader("📦 Auditoría de pedidos")
-        st.caption("Auditoría focalizada: hasta 3–4 pedidos alarmantes por hora de slot, con PDF masivo listo para imprimir.")
+        st.caption("Auditoría focalizada: porcentaje configurable por hora de slot (20% por defecto), con PDF masivo listo para imprimir.")
         st.info("Cobertura principal: slots anteriores a las 10:00. El otro equipo comienza a las 07:00 y audita los slots desde las 10:00. Puedes consultar el resto del día sin mezclarlo con la lista principal.")
         audit_upload=st.file_uploader("Archivo de picking de MFC",type=["xlsx","xls","csv"],key="order_audit_upload")
         if audit_upload is None:
@@ -3785,16 +3812,48 @@ if _tab_active(o):
                                     st.caption(f"Aprendizaje en observación: {_learning_total}/10 pedidos auditados únicos.")
                                 _cfg1,_cfg2=st.columns([1,2])
                                 with _cfg1:
-                                    _max_per_hour=st.selectbox("Máximo crítico por hora de slot",[3,4],index=1,key="audit_max_per_hour")
-                                    _hide_done=st.checkbox("Ocultar pedidos ya auditados aquí",value=True,key="audit_hide_done")
+                                    _audit_percent=st.slider(
+                                        "Porcentaje máximo a auditar por hora",
+                                        min_value=5,max_value=30,value=20,step=1,
+                                        format="%d%%",key="audit_share_percent",
+                                    )
+                                    _hide_done=st.checkbox(
+                                        "Ocultar pedidos ya auditados aquí",value=True,key="audit_hide_done",
+                                    )
                                 _available=_coverage_summary[
                                     ~_coverage_summary["Auditado en esta app"] if _hide_done
                                     else pd.Series(True,index=_coverage_summary.index)
                                 ].copy()
-                                _critical_hourly=audit_hourly_critical_queue(_available,_max_per_hour)
+                                _hourly_quotas=audit_hourly_quota_table(_coverage_summary,_audit_percent)
+                                _critical_hourly=audit_hourly_critical_queue(
+                                    _available,_audit_percent,population=_coverage_summary,
+                                )
                                 with _cfg2:
-                                    st.metric("🚨 Más alarmantes de esta cobertura",f"{len(_critical_hourly):,}",f"máx. {_max_per_hour} por hora de slot")
-                                st.caption("Solo exige cruces fuertes y no rellena el cupo. El picker nocturno suma +2 únicamente para ordenar riesgos similares.")
+                                    st.metric(
+                                        "🚨 Selección crítica de esta cobertura",
+                                        f"{len(_critical_hourly):,}",
+                                        f"hasta {_audit_percent}% del total por hora de slot",
+                                    )
+                                    st.caption("Ejemplo: 50 pedidos por hora → 20% = hasta 10; 16% = hasta 8.")
+                                if not _hourly_quotas.empty:
+                                    _quota_view=_hourly_quotas.copy()
+                                    _quota_view["Críticos disponibles"]=_quota_view["Hora auditoría"].map(
+                                        _available[_available["Candidato crítico"].fillna(False).astype(bool)]
+                                        .groupby("Hora auditoría").size(),
+                                    ).fillna(0).astype(int)
+                                    _quota_view["Seleccionados"]=_quota_view["Hora auditoría"].map(
+                                        _critical_hourly.groupby("Hora auditoría").size(),
+                                    ).fillna(0).astype(int)
+                                    with st.expander("📊 Ver cupo y selección por hora del slot",expanded=False):
+                                        st.dataframe(
+                                            _quota_view.rename(columns={"Hora auditoría":"Hora del slot"}),
+                                            use_container_width=True,hide_index=True,
+                                        )
+                                st.caption(
+                                    "El cupo se calcula con todos los pedidos detectados en cada hora, aunque "
+                                    "alguno ya esté auditado. Solo entran casos muy alarmantes; no se rellena "
+                                    "con pedidos sin señales fuertes. El turno nocturno desempata riesgos similares."
+                                )
                                 _focus_mode=st.radio(
                                     "Nivel de alarma a mostrar",
                                     ["🚨 Solo los más alarmantes por hora","🔴 Solo foco alto","🔴🟡 Foco alto + revisar","Todos en esta cobertura"],
@@ -3831,7 +3890,7 @@ if _tab_active(o):
 
                                 with st.container(border=True):
                                     st.markdown("### 🖨️ Imprimir pedidos en lote")
-                                    st.caption("El PDF respeta la cobertura elegida y el máximo de 3–4 pedidos críticos por hora de slot. No mezcla automáticamente los pedidos del equipo diurno.")
+                                    st.caption("El PDF respeta el porcentaje, la cobertura y los pedidos críticos seleccionados; no mezcla automáticamente la auditoría del equipo diurno.")
                                     _packet_mode=st.selectbox(
                                         "Pedidos que incluirá el paquete",
                                         ["🚨 Más alarmantes por hora","🔴 Solo Foco alto","🔴🟡 Foco alto + Revisar","👁️ Los que estoy viendo"],
@@ -3854,7 +3913,7 @@ if _tab_active(o):
                                     st.caption("El PDF deja cada pedido separado, con sus artículos, picker, cantidades, prioridad, puntaje y espacio para marcar diferencias/correcciones.")
 
                                     _packet_signature=hashlib.sha256(
-                                        (hashlib.sha256(_audit_raw).hexdigest()+"|"+_coverage_mode+"|"+str(_max_per_hour)+"|"+"|".join(_packet_orders)).encode("utf-8")
+                                        (hashlib.sha256(_audit_raw).hexdigest()+"|"+_coverage_mode+"|"+str(_audit_percent)+"|"+"|".join(_packet_orders)).encode("utf-8")
                                     ).hexdigest()[:18] if _packet_orders else ""
                                     if _packet_orders and st.button("🧾 Preparar PDF masivo",type="primary",key="prepare_bulk_audit_pdf"):
                                         with st.spinner("Armando todas las hojas de auditoría…"):
