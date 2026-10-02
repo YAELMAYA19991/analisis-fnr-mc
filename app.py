@@ -7,7 +7,7 @@
 
 import io, re, json, os, smtplib, ssl, zipfile, hashlib, urllib.request, urllib.error, urllib.parse, html, uuid
 from difflib import SequenceMatcher
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.message import EmailMessage
 import numpy as np
 import pandas as pd
@@ -2013,6 +2013,188 @@ def _audit_item_key(sku="", product=""):
     return "PRODUCTO:"+product_key if product_key else ""
 
 
+
+def _audit_incident_date(value):
+    """Fecha real del evento FNR/MC, no fecha de subida del archivo."""
+    if value is None or (not isinstance(value,(list,dict)) and pd.isna(value)):
+        return None
+    if isinstance(value,(datetime,pd.Timestamp)):
+        return value.date()
+    if isinstance(value,(int,float,np.integer,np.floating)):
+        number=float(value)
+        if 20000<=number<=100000:
+            try: return pd.to_datetime(number,unit="D",origin="1899-12-30").date()
+            except (ValueError,OverflowError): return None
+        text=str(int(number)) if number.is_integer() else str(number)
+    else:
+        text=str(value).strip()
+    if not text or text.lower() in {"nan","nat","none","sin fecha","0"}:
+        return None
+    # Excel exporta ISO y también fechas de México dd/mm/aaaa.
+    if re.fullmatch(r"\d{8}",text):
+        try: return datetime.strptime(text,"%Y%m%d").date()
+        except ValueError: return None
+    try:
+        ts=pd.to_datetime(text,dayfirst=True,errors="coerce")
+        return ts.date() if pd.notna(ts) else None
+    except (ValueError,TypeError,OverflowError):
+        return None
+
+
+def _audit_incident_fingerprint(row):
+    """Identidad operativa de la incidencia para no contar cada recarga de nuevo."""
+    email=email_key(row.get("CORREO",""))
+    person=("e:"+email) if email else ("n:"+token_key(row.get("PICKER","")))
+    order=norm(row.get("ORDER_NUMBER",""))
+    product=_audit_item_key(row.get("SKU",""),row.get("PRODUCTO",""))
+    amount=pd.to_numeric(row.get("INCIDENCIAS",1),errors="coerce")
+    amount=1.0 if pd.isna(amount) or amount<=0 else float(amount)
+    return (
+        str(row.get("_AUDIT_DATE","")),person,order,product,
+        norm(row.get("AREA","")),amount,
+    )
+
+
+def audit_dedupe_30day_versions(versions,today):
+    """Unión por máxima multiplicidad por archivo: evita duplicar Excel acumulativos.
+
+    Cada exportación puede repetirse total o parcialmente; para una misma
+    fecha/pedido/persona/artículo se conserva el máximo de filas presentes
+    en una versión, sin eliminar dos filas idénticas dentro de un mismo Excel.
+    Sin ID único de incidencia no se puede distinguir al 100% dos eventos
+    independientes con todos sus campos iguales.
+    """
+    start=today-timedelta(days=30)
+    records={}
+    max_occurrences={}
+    skipped_dates=0
+    skipped_outside=0
+    source_rows=0
+    dated_rows=0
+    for version in versions:
+        if version is None or version.empty:
+            continue
+        occurrences={}
+        for _,row in version.iterrows():
+            source_rows+=1
+            incident_day=_audit_incident_date(row.get("FECHA"))
+            if incident_day is None:
+                skipped_dates+=1
+                continue
+            if not (start<=incident_day<today):
+                skipped_outside+=1
+                continue
+            dated_rows+=1
+            saved=dict(row)
+            saved["_AUDIT_DATE"]=incident_day.isoformat()
+            key=_audit_incident_fingerprint(saved)
+            occurrences[key]=occurrences.get(key,0)+1
+            occurrence_no=occurrences[key]
+            if occurrence_no>max_occurrences.get(key,0):
+                max_occurrences[key]=occurrence_no
+                records[(key,occurrence_no)]=saved
+    fields=["PICKER","CORREO","PRODUCTO","SKU","ORDER_NUMBER","AREA","TURNO","FECHA","INCIDENCIAS","TIPO","_AUDIT_DATE"]
+    result=pd.DataFrame(list(records.values()),columns=fields)
+    info={"versiones":len(versions),"filas_leidas":source_rows,"fechas_ausentes":skipped_dates,
+          "fuera_de_periodo":skipped_outside,"filas_con_fecha_valida":dated_rows,
+          "registros_unicos":len(result)}
+    return result,info
+
+
+@st.cache_data(show_spinner=False,ttl=120,max_entries=4)
+def _audit_history_archive_names(key,today_iso):
+    """Versiones que pudieron contener incidentes de los últimos 30 días."""
+    cutoff=datetime.fromisoformat(today_iso)-timedelta(days=31)
+    names=[]
+    prefix=f"upload_history/{key}"
+    if cloud_enabled():
+        offset=0
+        while True:
+            batch=cloud_list(prefix,limit=500,offset=offset)
+            if not isinstance(batch,list):
+                raise RuntimeError("Supabase no pudo listar las versiones históricas.")
+            for entry in batch:
+                name=str(entry.get("name","")).strip()
+                if not name: continue
+                m=re.match(r"^(\d{8})_\d{6}",name)
+                if m:
+                    stamp=datetime.strptime(m.group(1),"%Y%m%d")
+                    if stamp.date()<cutoff.date():
+                        continue
+                names.append(name)
+            if len(batch)<500: break
+            offset+=len(batch)
+    else:
+        folder=os.path.join(UPLOAD_HISTORY_DIR,key)
+        if os.path.isdir(folder):
+            for name in os.listdir(folder):
+                m=re.match(r"^(\d{8})_\d{6}",name)
+                if m and datetime.strptime(m.group(1),"%Y%m%d").date()<cutoff.date():
+                    continue
+                names.append(name)
+    return sorted(set(names),reverse=True)
+
+
+@st.cache_data(show_spinner=False,ttl=1800,max_entries=100)
+def _audit_parse_history_bytes(data,tipo):
+    words=["fnr","detalle"] if tipo=="FNR" else ["mc","mala"]
+    return parse_inc(choose(sheets_from_bytes(data),words),tipo)
+
+
+@st.cache_data(show_spinner=False,ttl=1800,max_entries=120)
+def _audit_archive_parsed_version(key,filename,tipo):
+    if cloud_enabled():
+        raw=cloud_download(f"upload_history/{key}/{filename}",missing_ok=False)
+    else:
+        with open(os.path.join(UPLOAD_HISTORY_DIR,key,filename),"rb") as f:
+            raw=f.read()
+    if raw is None:
+        raise RuntimeError(f"No se pudo recuperar la versión {filename}")
+    return _audit_parse_history_bytes(raw,tipo)
+
+
+def audit_history_30days(current_fnr,current_mc,roster,base,store,today=None):
+    """Fuente exclusiva para el riesgo histórico de auditoría: 30 días completos previos."""
+    today=today or datetime.now(ZoneInfo("America/Mexico_City")).date()
+    result={}
+    metadata={}
+    for key,tipo,now_bytes in [
+        ("detalle_fnr","FNR",current_fnr),
+        ("detalle_mc","MC",current_mc),
+    ]:
+        versions=[]
+        seen_hash=set()
+        # Incluir la versión actual incluso si todavía no aparece en el índice remoto.
+        current_hash=hashlib.sha256(now_bytes).hexdigest()
+        versions.append(_audit_parse_history_bytes(now_bytes,tipo))
+        seen_hash.add(current_hash)
+        names=_audit_history_archive_names(key,today.isoformat())
+        for name in names:
+            # Evitar recontar el mismo archivo guardado bajo otro nombre.
+            if cloud_enabled():
+                bytes_data=cloud_download(f"upload_history/{key}/{name}",missing_ok=False)
+            else:
+                with open(os.path.join(UPLOAD_HISTORY_DIR,key,name),"rb") as f:
+                    bytes_data=f.read()
+            fingerprint=hashlib.sha256(bytes_data).hexdigest()
+            if fingerprint in seen_hash:
+                continue
+            seen_hash.add(fingerprint)
+            versions.append(_audit_parse_history_bytes(bytes_data,tipo))
+        frame,stats=audit_dedupe_30day_versions(versions,today)
+        if not frame.empty:
+            frame=canonicalize_incidents(frame,roster)
+            identity=roster.rename(columns={"TURNO_MAESTRO":"TURNO","AREA_MAESTRO":"AREA_BASE"}).copy()
+            frame=attach(frame,identity)
+            frame["CORREO_KEY"]=frame.get("CORREO",pd.Series("",index=frame.index)).map(email_key)
+        result[tipo]=frame
+        metadata[tipo]=stats
+    _,result["FNR"],result["MC"]=exclude_registered_supervisors(
+        base,result["FNR"],result["MC"],store
+    )
+    return result["FNR"],result["MC"],metadata
+
+
 def order_risk_analysis(audit_lines,picker_summary,fnr_inc,mc_inc,prior_audits=None):
     """Prioriza pedidos por coincidencias históricas concretas de picker y artículo.
 
@@ -3623,7 +3805,7 @@ if _tab_active(a):
 if _tab_active(o):
     with o:
         st.subheader("📦 Auditoría de pedidos")
-        st.caption("Auditoría focalizada: porcentaje configurable por hora de slot (20% por defecto), con PDF masivo listo para imprimir.")
+        st.caption("Auditoría focalizada: porcentaje configurable por hora de slot, cruces FNR/MC de los 30 días previos y PDF masivo.")
         st.info("Cobertura principal: slots anteriores a las 10:00. El otro equipo comienza a las 07:00 y audita los slots desde las 10:00. Puedes consultar el resto del día sin mezclarlo con la lista principal.")
         audit_upload=st.file_uploader("Archivo de picking de MFC",type=["xlsx","xls","csv"],key="order_audit_upload")
         if audit_upload is None:
@@ -3717,7 +3899,50 @@ if _tab_active(o):
                             if _eligible.empty:
                                 st.warning("No hay pedidos con hora de slot válida en este archivo.")
                             else:
-                                _audit_detail,_risk_summary=order_risk_analysis(_eligible,s,fnr,mc,store.get("order_audits",[]))
+                                with st.spinner("Reuniendo FNR y MC de los 30 días anteriores…"):
+                                    _audit_hist_fnr,_audit_hist_mc,_audit_hist_meta=audit_history_30days(
+                                        uf.getvalue(),um.getvalue(),roster,base,store,
+                                    )
+                                _audit_today=datetime.now(ZoneInfo("America/Mexico_City")).date()
+                                _audit_since=_audit_today-timedelta(days=30)
+                                st.markdown("### 📅 Historial FNR y MC: últimos 30 días completos")
+                                st.caption(
+                                    f"Del {_audit_since:%d/%m/%Y} al {(_audit_today-timedelta(days=1)):%d/%m/%Y}. "
+                                    "Se usa la fecha de la incidencia, no la carga del Excel. El día actual no entra en el puntaje histórico."
+                                )
+                                _hist_k1,_hist_k2,_hist_k3=st.columns(3)
+                                _hist_k1.metric("Incidencias FNR históricas",f"{pd.to_numeric(_audit_hist_fnr.get('INCIDENCIAS',pd.Series(dtype=float)),errors='coerce').fillna(0).sum():,.0f}")
+                                _hist_k2.metric("Incidencias MC históricas",f"{pd.to_numeric(_audit_hist_mc.get('INCIDENCIAS',pd.Series(dtype=float)),errors='coerce').fillna(0).sum():,.0f}")
+                                _hist_k3.metric("Versiones de Excel analizadas",f"{sum(z['versiones'] for z in _audit_hist_meta.values()):,}")
+                                _missing_dates=sum(z["fechas_ausentes"] for z in _audit_hist_meta.values())
+                                if _missing_dates:
+                                    st.warning(
+                                        f"{_missing_dates:,} filas de FNR/MC no tienen fecha legible y se excluyeron "
+                                        "del cálculo histórico. Revisa que las columnas Fecha/Date contengan la fecha real de la incidencia."
+                                    )
+                                if _audit_hist_fnr.empty and _audit_hist_mc.empty:
+                                    st.warning(
+                                        "Todavía no hay incidencias fechadas dentro de esta ventana de 30 días. "
+                                        "El sistema no inventará antecedentes: la auditoría solo podrá detectar diferencias de cantidad actuales."
+                                    )
+                                with st.expander("📋 Registro histórico diario FNR y MC",expanded=False):
+                                    _daily_parts=[]
+                                    for _kind,_frame in (("FNR",_audit_hist_fnr),("MC",_audit_hist_mc)):
+                                        if not _frame.empty:
+                                            _daily=_frame.groupby("_AUDIT_DATE",as_index=False)["INCIDENCIAS"].sum()
+                                            _daily["Tipo"]=_kind
+                                            _daily_parts.append(_daily)
+                                    if _daily_parts:
+                                        _hist_daily=pd.concat(_daily_parts,ignore_index=True).rename(
+                                            columns={"_AUDIT_DATE":"Fecha","INCIDENCIAS":"Incidencias"},
+                                        )
+                                        st.dataframe(_hist_daily.sort_values(["Fecha","Tipo"],ascending=[False,True]),
+                                                     use_container_width=True,hide_index=True)
+                                    else:
+                                        st.info("Sin incidencias fechadas en el periodo.")
+                                _audit_detail,_risk_summary=order_risk_analysis(
+                                    _eligible,s,_audit_hist_fnr,_audit_hist_mc,store.get("order_audits",[])
+                                )
                                 _risk_summary=_risk_summary.merge(
                                     _slot_stats[["Número de pedido","_slot_min","_slot_max"]],
                                     on="Número de pedido",how="left",validate="one_to_one",
