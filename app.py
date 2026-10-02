@@ -2172,7 +2172,7 @@ def audit_history_30days(current_fnr,current_mc,roster,base,store,today=None):
         seen_hash=set()
         # Incluir la versión actual incluso si todavía no aparece en el índice remoto.
         current_hash=hashlib.sha256(now_bytes).hexdigest()
-        versions.append(_audit_parse_history_bytes(now_bytes,tipo))
+        versions.append(canonicalize_incidents(_audit_parse_history_bytes(now_bytes,tipo),roster))
         seen_hash.add(current_hash)
         names=_audit_history_archive_names(key,today.isoformat())
         for name in names:
@@ -2181,10 +2181,9 @@ def audit_history_30days(current_fnr,current_mc,roster,base,store,today=None):
             if fingerprint in seen_hash:
                 continue
             seen_hash.add(fingerprint)
-            versions.append(parsed)
+            versions.append(canonicalize_incidents(parsed,roster))
         frame,stats=audit_dedupe_30day_versions(versions,today)
         if not frame.empty:
-            frame=canonicalize_incidents(frame,roster)
             identity=roster.rename(columns={"TURNO_MAESTRO":"TURNO","AREA_MAESTRO":"AREA_BASE"}).copy()
             frame=attach(frame,identity)
             frame["CORREO_KEY"]=frame.get("CORREO",pd.Series("",index=frame.index)).map(email_key)
