@@ -35,16 +35,25 @@ class AppStaticTests(unittest.TestCase):
         self.assertIn('"order_audits"',self.text)
         self.assertIn('"monthly_history"',self.text)
 
-    def test_bulk_audit_pdf_present(self):
-        self.assertIn("def build_bulk_audit_pdf",self.text)
-        self.assertIn("Imprimir pedidos en lote",self.text)
-        self.assertIn("Descargar PDF de todos los pedidos",self.text)
+    def test_compact_order_audit_workflow(self):
+        self.assertIn("Auditoría rápida de pedidos",self.text)
+        self.assertIn("1. Cargar pedidos (Excel o CSV)",self.text)
+        self.assertIn("3. Seleccionar pedido",self.text)
+        self.assertIn("Guardar revisión",self.text)
+        self.assertIn("📚 Historial de auditorías",self.text)
 
     def test_hourly_critical_audit_selection(self):
+        self.assertIn("def audit_hourly_critical_queue",self.text)
         self.assertIn("Candidato crítico",self.text)
         self.assertIn("Ranking crítico hora",self.text)
         self.assertIn("Puntaje alarma",self.text)
-        self.assertIn("Solo los más alarmantes por hora",self.text)
+        self.assertIn("Sugeridos primero",self.text)
+
+    def test_pending_audit_logic_kept(self):
+        self.assertIn("def audit_record_is_complete",self.text)
+        self.assertIn("Motivo por el que quedó pendiente",self.text)
+        self.assertIn("30 días",self.text)
+        self.assertIn('"Estado":"Validado" if audit_record_is_complete(rec) else "Pendiente"',self.text)
 
 if __name__=="__main__":
     unittest.main()
