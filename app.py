@@ -4090,12 +4090,6 @@ if _tab_active(o):
                                         _items=_lines[_item_cols].copy().rename(columns={"Picker relacionado":"Picker"})
                                         st.markdown("**Artículos del pedido**")
                                         st.dataframe(_items,use_container_width=True,hide_index=True)
-                                        with st.expander("📱 Asignar validación móvil (supervisores)",expanded=False):
-                                            from mobile_audit_admin import render_mobile_assignment
-                                            render_mobile_assignment(
-                                                _order,_order_slot,_order_row,_lines,roster,s,_audit_raw
-                                            )
-
                                         def _audit_order_incidents(source,order):
                                             if source is None or source.empty or "ORDER_NUMBER" not in source.columns:
                                                 return pd.DataFrame()
@@ -4111,6 +4105,12 @@ if _tab_active(o):
                                             return int(len(frame))
                                         _audit_fnr_count=_audit_incident_count(_audit_fnr)
                                         _audit_mc_count=_audit_incident_count(_audit_mc)
+                                        with st.expander("📱 Asignar validación móvil (supervisores)",expanded=False):
+                                            from mobile_audit_admin import render_mobile_assignment
+                                            render_mobile_assignment(
+                                                _order,_order_slot,_order_row,_lines,roster,s,_audit_raw,
+                                                _audit_fnr_count,_audit_mc_count,
+                                            )
                                         with st.expander("Antecedentes de este pedido (FNR/MC)",expanded=False):
                                             _x1,_x2=st.columns(2)
                                             _x1.metric("FNR",_audit_fnr_count)
