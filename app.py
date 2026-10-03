@@ -4090,6 +4090,11 @@ if _tab_active(o):
                                         _items=_lines[_item_cols].copy().rename(columns={"Picker relacionado":"Picker"})
                                         st.markdown("**Artículos del pedido**")
                                         st.dataframe(_items,use_container_width=True,hide_index=True)
+                                        with st.expander("📱 Asignar validación móvil (supervisores)",expanded=False):
+                                            from mobile_audit_admin import render_mobile_assignment
+                                            render_mobile_assignment(
+                                                _order,_order_slot,_order_row,_lines,roster,s,_audit_raw
+                                            )
 
                                         def _audit_order_incidents(source,order):
                                             if source is None or source.empty or "ORDER_NUMBER" not in source.columns:
