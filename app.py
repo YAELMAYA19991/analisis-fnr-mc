@@ -2195,6 +2195,22 @@ def audit_history_30days(current_fnr,current_mc,roster,base,store,today=None):
     return result["FNR"],result["MC"],metadata
 
 
+def audit_record_is_complete(record):
+    """Solo una revisión confirmada puede retirar un pedido de la lista pendiente."""
+    if not isinstance(record,dict):
+        return False
+    result=str(record.get("resultado","")).strip().casefold()
+    if result in {"no se pudo validar","pendiente","sin validar",""}:
+        return False
+    checked=record.get("pedido_validado",None)
+    if checked is None:
+        # Compatibilidad con las revisiones antiguas que carecían del indicador.
+        return result in {"pedido correcto","con diferencias"}
+    if isinstance(checked,str):
+        return checked.strip().casefold() in {"true","1","yes","si","sí","verdadero"}
+    return bool(checked)
+
+
 def order_risk_analysis(audit_lines,picker_summary,fnr_inc,mc_inc,prior_audits=None):
     """Prioriza pedidos por coincidencias históricas concretas de picker y artículo.
 
@@ -2273,6 +2289,8 @@ def order_risk_analysis(audit_lines,picker_summary,fnr_inc,mc_inc,prior_audits=N
 
     prior_by_order={}
     for audit in prior_audits:
+        if not audit_record_is_complete(audit):
+            continue
         key=norm(audit.get("pedido",""))
         if not key:
             continue
@@ -3912,6 +3930,33 @@ if _tab_active(o):
                                     _audit_hist_fnr,_audit_hist_mc,_audit_hist_meta=audit_history_30days(
                                         uf.getvalue(),um.getvalue(),roster,base,store,
                                     )
+                                _last_hist_date=datetime.now(ZoneInfo("America/Mexico_City")).date()-timedelta(days=1)
+                                _first_hist_date=_last_hist_date-timedelta(days=29)
+                                _historical_fnr=int(pd.to_numeric(
+                                    _audit_hist_fnr.get("INCIDENCIAS",pd.Series(dtype=float)),
+                                    errors="coerce",
+                                ).fillna(0).sum())
+                                _historical_mc=int(pd.to_numeric(
+                                    _audit_hist_mc.get("INCIDENCIAS",pd.Series(dtype=float)),
+                                    errors="coerce",
+                                ).fillna(0).sum())
+                                st.caption(
+                                    f"📅 Historial de 30 días ({_first_hist_date:%d/%m}–{_last_hist_date:%d/%m})"
+                                    f" · FNR: {_historical_fnr:,} · MC: {_historical_mc:,}"
+                                )
+                                _missing_history_dates=sum(
+                                    int(m.get("fechas_ausentes",0)) for m in _audit_hist_meta.values()
+                                )
+                                if _missing_history_dates:
+                                    st.caption(
+                                        f"⚠️ {_missing_history_dates:,} renglones sin fecha legible "
+                                        "no cuentan en el historial."
+                                    )
+                                if _audit_hist_fnr.empty and _audit_hist_mc.empty:
+                                    st.warning(
+                                        "Sin registros históricos fechados de FNR/MC en los 30 días previos. "
+                                        "La prioridad puede ser menos representativa."
+                                    )
                                 _audit_detail,_risk_summary=order_risk_analysis(
                                     _eligible,s,_audit_hist_fnr,_audit_hist_mc,store.get("order_audits",[])
                                 )
@@ -3968,7 +4013,10 @@ if _tab_active(o):
                                 _risk_summary["Puntaje selección"]=_risk_summary["Puntaje alarma"]+_risk_summary["Picker nocturno"].astype(int)*2
 
                                 _saved_audits=store.get("order_audits",[]) or []
-                                _audited_orders={norm(a.get("pedido","")) for a in _saved_audits if isinstance(a,dict)}
+                                _audited_orders={
+                                    norm(a.get("pedido","")) for a in _saved_audits
+                                    if audit_record_is_complete(a) and str(a.get("pedido","")).strip()
+                                }
                                 _risk_summary["Ya auditado"]=_risk_summary["Número de pedido"].map(lambda v:norm(v) in _audited_orders)
 
                                 _coverage_label=st.selectbox(
@@ -4094,15 +4142,28 @@ if _tab_active(o):
                                             else:
                                                 _diff_items=[]
                                                 _diff_notes=""
-                                            _audit_notes=st.text_area("Observaciones (opcional)",key="audit_notes_simple_"+_audit_key)
-                                            _approved=st.checkbox("Confirmo que revisé el pedido completo",key="audit_approved_simple_"+_audit_key)
+                                            _audit_notes=st.text_area(
+                                                "Motivo por el que quedó pendiente" if _result=="No se pudo validar"
+                                                else "Observaciones (opcional)",
+                                                key="audit_notes_simple_"+_audit_key,
+                                            )
+                                            if _result=="No se pudo validar":
+                                                st.caption("Este intento se registrará como pendiente; el pedido seguirá disponible.")
+                                                _approved=False
+                                            else:
+                                                _approved=st.checkbox(
+                                                    "Confirmo que revisé el pedido completo",
+                                                    key="audit_approved_simple_"+_audit_key,
+                                                )
                                             _save_audit=st.form_submit_button("Guardar revisión",type="primary",use_container_width=True)
 
                                         if _save_audit:
-                                            if not _approved:
-                                                st.error("Confirma que revisaste el pedido completo.")
-                                            elif not _auditor.strip():
+                                            if not _auditor.strip():
                                                 st.error("Escribe quién realizó la revisión.")
+                                            elif _result!="No se pudo validar" and not _approved:
+                                                st.error("Confirma que revisaste el pedido completo.")
+                                            elif _result=="No se pudo validar" and not _audit_notes.strip():
+                                                st.error("Describe por qué el pedido sigue pendiente.")
                                             elif _result=="Con diferencias" and (not _diff_items or not _diff_notes.strip()):
                                                 st.error("Elige el artículo y describe la diferencia.")
                                             else:
@@ -4128,7 +4189,7 @@ if _tab_active(o):
                                                     "picker":str(_order_row.get("Pickers asignados","")).strip(),
                                                     "auditor":_auditor.strip(),
                                                     "resultado":_result,
-                                                    "pedido_validado":bool(_approved),
+                                                    "pedido_validado":bool(_approved and _result!="No se pudo validar"),
                                                     "observaciones":_audit_notes.strip(),
                                                     "diferencias":len(_diff_items),
                                                     "lineas":_line_records,
@@ -4149,7 +4210,11 @@ if _tab_active(o):
                                                         store["order_audits"].pop()
                                                     st.error(f"No se pudo guardar la auditoría: {_audit_save_error}")
                                                 else:
-                                                    st.session_state["_order_audit_flash"]=f"Pedido {_order}: auditoría guardada."
+                                                    st.session_state["_order_audit_flash"]=(
+                                                        f"Pedido {_order}: intento registrado; sigue pendiente."
+                                                        if _result=="No se pudo validar"
+                                                        else f"Pedido {_order}: auditoría validada y guardada."
+                                                    )
                                                     st.rerun()
                                 else:
                                     st.info("No hay pedidos pendientes en esta lista.")
@@ -4167,6 +4232,7 @@ if _tab_active(o):
                     "Picker":rec.get("picker",""),
                     "Revisó":rec.get("auditor",""),
                     "Resultado":rec.get("resultado",""),
+                    "Estado":"Validado" if audit_record_is_complete(rec) else "Pendiente",
                     "Diferencias":rec.get("diferencias",0),
                     "FNR":rec.get("fnr_al_guardar",0),
                     "MC":rec.get("mc_al_guardar",0),
