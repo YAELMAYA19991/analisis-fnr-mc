@@ -11,7 +11,7 @@ import urllib.request
 from typing import Mapping
 
 
-EMAIL_PATTERN = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}")
+EMAIL_PATTERN = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+[.][A-Za-z]{2,}")
 MODES = {"autoverificacion", "auditoria_cruzada"}
 RESULTS = {"Pedido correcto", "Con diferencias", "No se pudo validar"}
 
@@ -40,7 +40,7 @@ def email_set(raw):
     if isinstance(raw, (tuple, list, set)):
         candidates = raw
     else:
-        candidates = re.split(r"[,;\\n]+", str(raw or ""))
+        candidates = str(raw or "").replace(";", ",").replace(chr(10), ",").split(",")
     return {str(v).strip().lower() for v in candidates if EMAIL_PATTERN.fullmatch(str(v).strip().lower())}
 
 
@@ -49,7 +49,7 @@ def admin_allowed(email, configured):
 
 
 def domain_allowed(email, configured):
-    domains = {v.strip().lstrip("@").lower() for v in re.split(r"[,;\\n]+", str(configured or "")) if v.strip()}
+    domains = {v.strip().lstrip("@").lower() for v in str(configured or "").replace(";", ",").replace(chr(10), ",").split(",") if v.strip()}
     return bool(email) and (not domains or email.rsplit("@", 1)[-1] in domains)
 
 
