@@ -103,6 +103,7 @@ declare
     v_id uuid;
     v_notes text := btrim(coalesce(p_notes, ''));
     v_count integer := 0;
+    v_expected integer := 0;
 begin
     select * into v_assignment
       from public.mobile_audit_assignments
@@ -140,6 +141,23 @@ begin
         raise exception 'Las diferencias deben ser una lista.';
     end if;
     v_count := jsonb_array_length(p_differences);
+
+    -- La revisión completa debe cubrir todos los artículos asignados;
+    -- no se acepta un conteo enviado arbitrariamente desde el formulario.
+    select count(*)::integer into v_expected
+      from public.mobile_audit_orders o,
+           lateral jsonb_array_elements(o.items) as item
+     where o.id = v_assignment.order_id
+       and (
+           v_assignment.mode = 'auditoria_cruzada'
+           or item->>'picker_email' = v_assignment.assignee_email
+       );
+    if v_expected < 1 then
+        raise exception 'La asignación no tiene artículos verificables.';
+    end if;
+    if p_result <> 'No se pudo validar' and p_checked_items <> v_expected then
+        raise exception 'Debes revisar todos los artículos de esta asignación.';
+    end if;
 
     if p_result = 'Pedido correcto' and v_count > 0 then
         raise exception 'Un pedido correcto no puede tener diferencias.';
