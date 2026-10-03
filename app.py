@@ -3805,13 +3805,22 @@ if _tab_active(a):
 
 if _tab_active(o):
     with o:
-        st.subheader("📦 Auditoría de pedidos")
-        st.caption("Auditoría focalizada: porcentaje configurable por hora de slot, cruces FNR/MC de los 30 días previos y PDF masivo.")
-        st.info("Cobertura principal: slots anteriores a las 10:00. El otro equipo comienza a las 07:00 y audita los slots desde las 10:00. Puedes consultar el resto del día sin mezclarlo con la lista principal.")
-        audit_upload=st.file_uploader("Archivo de picking de MFC",type=["xlsx","xls","csv"],key="order_audit_upload")
+        st.subheader("📦 Auditoría rápida de pedidos")
+        st.caption("Carga el archivo de pedidos, elige uno de la lista y guarda el resultado. Los archivos originales solo se consultan; las auditorías quedan guardadas por separado.")
+
+        _audit_flash=st.session_state.pop("_order_audit_flash",None)
+        if _audit_flash:
+            st.success(_audit_flash)
+
+        audit_upload=st.file_uploader(
+            "1. Cargar pedidos (Excel o CSV)",
+            type=["xlsx","xls","csv"],
+            key="order_audit_upload",
+            help="Usa el archivo de picking exportado. No se modifica ni se reemplaza.",
+        )
         if audit_upload is None:
-            st.markdown("**Campos que se usan:** pedido, slot, SKU, producto, cantidad y picker asignado.")
-            st.caption("La prioridad preventiva combina el historial FNR/MC del picker y las incidencias históricas del producto. No requiere datos del cliente.")
+            st.info("Carga el archivo del día para ver los pedidos pendientes de auditoría.")
+            st.markdown("**Columnas necesarias:** pedido, hora/slot, SKU, artículo y cantidad pedida. Picker y cantidad pickeada son opcionales.")
         else:
             try:
                 _audit_raw=audit_upload.getvalue()
@@ -3826,43 +3835,41 @@ if _tab_active(o):
                 if not _audit_sheets:
                     st.error("El archivo no contiene filas con datos.")
                 else:
-                    _sheet_name=st.selectbox("Hoja del archivo",list(_audit_sheets),key="order_audit_sheet") if len(_audit_sheets)>1 else next(iter(_audit_sheets))
+                    _sheet_name=st.selectbox("Hoja",list(_audit_sheets),key="order_audit_sheet") if len(_audit_sheets)>1 else next(iter(_audit_sheets))
                     _audit_df=_audit_sheets[_sheet_name].copy()
                     _audit_df.columns=[str(c).strip() for c in _audit_df.columns]
                     _audit_cols=list(_audit_df.columns)
                     _normalized_cols={norm(c):c for c in _audit_cols}
+
                     def _audit_guess(aliases):
                         for _alias in aliases:
                             if norm(_alias) in _normalized_cols:
                                 return _normalized_cols[norm(_alias)]
                         return "— Sin columna —"
+
                     _fields=[
                         ("pedido","Pedido",["orden","order","numero_pedido","número de pedido","order_number","order_no","order_id","numero_orden","pedido"]),
-                        ("slot","Slot / hora",["slot","horario","hora entrega","hora de entrega","delivery slot","time slot","hora pedido","hora del pedido","order_time","created_at","created","fecha_hora","order_created_at","hora","time"]),
+                        ("slot","Hora / slot",["slot","horario","hora entrega","hora de entrega","delivery slot","time slot","hora pedido","hora del pedido","order_time","created_at","created","fecha_hora","order_created_at","hora","time"]),
                         ("sku","SKU",["sku","seller_sku","product_sku","codigo_sku","código sku","item_sku"]),
-                        ("articulo","Producto",["producto","product","articulo","artículo","product_name","item_name","item","nombre_articulo"]),
-                        ("cantidad_pedida","Cantidad pedida",["qty pedido","qtypedido","cantidad pedida","cantidad solicitada","quantity ordered","qty_ordered","quantity","qty","cantidad","unidades","cant"]),
-                        ("picker","Picker asignado",["picker","picker asignado","picker_name","nombre picker","pickeador"]),
+                        ("articulo","Artículo",["producto","product","articulo","artículo","product_name","item_name","item","nombre_articulo"]),
+                        ("cantidad_pedida","Cantidad",["qty pedido","qtypedido","cantidad pedida","cantidad solicitada","quantity ordered","qty_ordered","quantity","qty","cantidad","unidades","cant"]),
+                        ("picker","Picker",["picker","picker asignado","picker_name","nombre picker","pickeador"]),
                         ("cantidad_pickeada","Cantidad pickeada",["qty picked","qtypicked","cantidad pickeada","cantidad preparada","quantity picked"]),
-                        ("estatus","Estatus del pedido",["estatus orden","order status","estatus","status"]),
+                        ("estatus","Estatus",["estatus orden","order status","estatus","status"]),
                     ]
-                    with st.expander("⚙️ Confirmar columnas del archivo",expanded=True):
-                        st.caption("Revisa los campos detectados. Los opcionales ayudan a explicar y validar cada pedido.")
+                    with st.expander("⚙️ Corregir columnas detectadas",expanded=False):
+                        st.caption("Normalmente se detectan solas. Cambia solo las que aparezcan incorrectas.")
                         _mapping={}
                         _required_keys={"pedido","slot","sku","articulo","cantidad_pedida"}
-                        _required_fields=[item for item in _fields if item[0] in _required_keys]
-                        _optional_fields=[item for item in _fields if item[0] not in _required_keys]
-                        for _label_group,_field_group in [("Datos necesarios",_required_fields),("Datos opcionales",_optional_fields)]:
-                            st.markdown(f"**{_label_group}**")
-                            _map_cols=st.columns(5 if _label_group=="Datos necesarios" else 3)
-                            for _idx,(_key,_label,_aliases) in enumerate(_field_group):
-                                with _map_cols[_idx%len(_map_cols)]:
-                                    _options=["— Sin columna —"]+_audit_cols
-                                    _default=_audit_guess(_aliases)
-                                    _mapping[_key]=st.selectbox(_label,_options,index=_options.index(_default),key=f"order_audit_map_{_key}")
+                        for _key,_label,_aliases in _fields:
+                            _options=["— Sin columna —"]+_audit_cols
+                            _default=_audit_guess(_aliases)
+                            _mapping[_key]=st.selectbox(
+                                _label,_options,index=_options.index(_default),
+                                key=f"order_audit_map_{_key}",
+                            )
                     if any(_mapping.get(_k)=="— Sin columna —" for _k in _required_keys):
-                        st.warning("Selecciona pedido, slot/hora, SKU, producto y cantidad pedida para continuar.")
-                        st.dataframe(_audit_df.head(10),use_container_width=True,hide_index=True)
+                        st.warning("No pude detectar todas las columnas necesarias. Abre «Corregir columnas detectadas» y selecciona pedido, hora/slot, SKU, artículo y cantidad.")
                     else:
                         _audit_data=pd.DataFrame({
                             "Número de pedido":_audit_df[_mapping["pedido"]].astype(str).str.strip(),
@@ -3874,73 +3881,37 @@ if _tab_active(o):
                             "Picker":_audit_df[_mapping["picker"]].astype(str).str.strip() if _mapping["picker"]!="— Sin columna —" else "",
                             "Estatus":_audit_df[_mapping["estatus"]].astype(str).str.strip() if _mapping["estatus"]!="— Sin columna —" else "",
                         })
-                        _audit_data=_audit_data[_audit_data["Número de pedido"].ne("") & _audit_data["Número de pedido"].str.casefold().ne("nan")]
-                        _audit_data=_audit_data[_audit_data["Artículo"].ne("") | _audit_data["SKU"].ne("")]
+                        _audit_data=_audit_data[
+                            _audit_data["Número de pedido"].ne("")
+                            & _audit_data["Número de pedido"].str.casefold().ne("nan")
+                            & (_audit_data["Artículo"].ne("") | _audit_data["SKU"].ne(""))
+                        ]
                         if _audit_data.empty:
-                            st.error("No encontré filas con número de pedido y artículo/SKU. Revisa la hoja y las columnas elegidas.")
+                            st.error("No encontré pedidos con artículo/SKU. Revisa el archivo o las columnas.")
                         else:
                             def _slot_minutes(value):
                                 _match=re.search(r"(?<!\d)(\d{1,2}):(\d{2})(?!\d)",str(value or ""))
                                 if not _match: return np.nan
                                 _hour,_minute=int(_match.group(1)),int(_match.group(2))
                                 return _hour*60+_minute if 0<=_hour<=23 and 0<=_minute<=59 else np.nan
+
                             _audit_data["_slot_min"]=_audit_data["Slot"].map(_slot_minutes)
                             _slot_stats=_audit_data.groupby("Número de pedido",as_index=False).agg(
                                 _slot_missing=("_slot_min",lambda values:bool(values.isna().any())),
                                 _slot_max=("_slot_min","max"),
                                 _slot_min=("_slot_min","min"),
                             )
-                            # Separa por SLOT del Excel, no por hora de inicio del otro equipo.
                             _included_orders=set(_slot_stats.loc[~_slot_stats["_slot_missing"],"Número de pedido"])
                             _bad_time_orders=int(_slot_stats["_slot_missing"].sum())
                             _eligible=_audit_data[_audit_data["Número de pedido"].isin(_included_orders)].drop(columns="_slot_min").copy()
-                            _line_count=len(_eligible)
-                            _order_count=len(_included_orders)
-                            st.caption(f"Pedidos con slot válido: {_order_count:,} ({_line_count:,} renglones). Sin hora legible: {_bad_time_orders:,}. El equipo del día empieza a las 07:00 y cubre los slots desde 10:00.")
+
                             if _eligible.empty:
-                                st.warning("No hay pedidos con hora de slot válida en este archivo.")
+                                st.warning(f"No hay pedidos con hora legible. Pedidos sin hora válida: {_bad_time_orders:,}.")
                             else:
-                                with st.spinner("Reuniendo FNR y MC de los 30 días anteriores…"):
+                                with st.spinner("Revisando señales FNR/MC de los últimos 30 días…"):
                                     _audit_hist_fnr,_audit_hist_mc,_audit_hist_meta=audit_history_30days(
                                         uf.getvalue(),um.getvalue(),roster,base,store,
                                     )
-                                _audit_today=datetime.now(ZoneInfo("America/Mexico_City")).date()
-                                _audit_since=_audit_today-timedelta(days=30)
-                                st.markdown("### 📅 Historial FNR y MC: últimos 30 días completos")
-                                st.caption(
-                                    f"Del {_audit_since:%d/%m/%Y} al {(_audit_today-timedelta(days=1)):%d/%m/%Y}. "
-                                    "Se usa la fecha de la incidencia, no la carga del Excel. El día actual no entra en el puntaje histórico."
-                                )
-                                _hist_k1,_hist_k2,_hist_k3=st.columns(3)
-                                _hist_k1.metric("Incidencias FNR históricas",f"{pd.to_numeric(_audit_hist_fnr.get('INCIDENCIAS',pd.Series(dtype=float)),errors='coerce').fillna(0).sum():,.0f}")
-                                _hist_k2.metric("Incidencias MC históricas",f"{pd.to_numeric(_audit_hist_mc.get('INCIDENCIAS',pd.Series(dtype=float)),errors='coerce').fillna(0).sum():,.0f}")
-                                _hist_k3.metric("Versiones de Excel analizadas",f"{sum(z['versiones'] for z in _audit_hist_meta.values()):,}")
-                                _missing_dates=sum(z["fechas_ausentes"] for z in _audit_hist_meta.values())
-                                if _missing_dates:
-                                    st.warning(
-                                        f"{_missing_dates:,} filas de FNR/MC no tienen fecha legible y se excluyeron "
-                                        "del cálculo histórico. Revisa que las columnas Fecha/Date contengan la fecha real de la incidencia."
-                                    )
-                                if _audit_hist_fnr.empty and _audit_hist_mc.empty:
-                                    st.warning(
-                                        "Todavía no hay incidencias fechadas dentro de esta ventana de 30 días. "
-                                        "El sistema no inventará antecedentes: la auditoría solo podrá detectar diferencias de cantidad actuales."
-                                    )
-                                with st.expander("📋 Registro histórico diario FNR y MC",expanded=False):
-                                    _daily_parts=[]
-                                    for _kind,_frame in (("FNR",_audit_hist_fnr),("MC",_audit_hist_mc)):
-                                        if not _frame.empty:
-                                            _daily=_frame.groupby("_AUDIT_DATE",as_index=False)["INCIDENCIAS"].sum()
-                                            _daily["Tipo"]=_kind
-                                            _daily_parts.append(_daily)
-                                    if _daily_parts:
-                                        _hist_daily=pd.concat(_daily_parts,ignore_index=True).rename(
-                                            columns={"_AUDIT_DATE":"Fecha","INCIDENCIAS":"Incidencias"},
-                                        )
-                                        st.dataframe(_hist_daily.sort_values(["Fecha","Tipo"],ascending=[False,True]),
-                                                     use_container_width=True,hide_index=True)
-                                    else:
-                                        st.info("Sin incidencias fechadas en el periodo.")
                                 _audit_detail,_risk_summary=order_risk_analysis(
                                     _eligible,s,_audit_hist_fnr,_audit_hist_mc,store.get("order_audits",[])
                                 )
@@ -3950,20 +3921,19 @@ if _tab_active(o):
                                 )
                                 _risk_summary["Cobertura equipo"]=_risk_summary.apply(
                                     lambda rr: (
-                                        "🌙 Prioridad propia · slot antes de 10:00"
+                                        "Madrugada"
                                         if pd.notna(rr["_slot_max"]) and rr["_slot_max"]<600
-                                        else "☀️ Auditoría del día · slot desde 10:00"
+                                        else "Día"
                                         if pd.notna(rr["_slot_min"]) and rr["_slot_min"]>=600
-                                        else "⚠️ Slots mixtos · coordinar equipos"
+                                        else "Slots mixtos"
                                     ),axis=1,
                                 )
-                                # El turno del picker se obtiene de la plantilla, no del slot.
                                 _shift_candidates={}
-                                def _register_picker_shift(frame,turn_col):
-                                    if frame is None or frame.empty or turn_col not in frame.columns:
-                                        return
-                                    for _,_rr in frame.iterrows():
-                                        _shift=str(_rr.get(turn_col,"") or "").strip()
+                                for _frame,_turn_col in ((roster,"TURNO_MAESTRO"),(s,"TURNO")):
+                                    if _frame is None or _frame.empty or _turn_col not in _frame.columns:
+                                        continue
+                                    for _,_rr in _frame.iterrows():
+                                        _shift=str(_rr.get(_turn_col,"") or "").strip()
                                         if not _shift or norm(_shift) in {"nan","none","no_especificado","no_asignado"}:
                                             continue
                                         for _identity in [_rr.get("PICKER",""),_rr.get("CORREO",""),_rr.get("_SOURCE_PICKER","")]:
@@ -3976,8 +3946,7 @@ if _tab_active(o):
                                             for _key in _keys:
                                                 if len(_key)>2:
                                                     _shift_candidates.setdefault(_key,set()).add(_shift)
-                                _register_picker_shift(roster,"TURNO_MAESTRO")
-                                _register_picker_shift(s,"TURNO")
+
                                 def _shift_for_audit_picker(value):
                                     _value=str(value or "").strip()
                                     _keys=["e:"+email_key(_value)] if "@" in _value else []
@@ -3987,464 +3956,230 @@ if _tab_active(o):
                                         if len(_matches)==1:
                                             return next(iter(_matches))
                                     return "Sin identificar"
-                                _audit_detail["Turno picker"]=_audit_detail["Picker relacionado"].map(_shift_for_audit_picker)
-                                _shift_by_order=_audit_detail.groupby("Número de pedido")["Turno picker"].agg(
-                                    lambda v:", ".join(sorted(set(str(z) for z in v if str(z)!="Sin identificar"))) or "Sin identificar"
+
+                                _shift_by_order=_audit_detail.groupby("Número de pedido")["Picker relacionado"].agg(
+                                    lambda values:", ".join(sorted({_shift_for_audit_picker(v) for v in values if str(v).strip()})) or "Sin identificar"
                                 )
                                 _risk_summary["Turno picker"]=_risk_summary["Número de pedido"].map(_shift_by_order).fillna("Sin identificar")
                                 _risk_summary["Picker nocturno"]=_risk_summary["Turno picker"].map(
-                                    lambda text:any(norm(k).startswith("nocturn") or norm(k)=="noche" or norm(k)=="22"
-                                                    for k in str(text).split(", "))
+                                    lambda value:any(norm(part).startswith("nocturn") or norm(part) in {"noche","22"}
+                                                     for part in str(value).split(", "))
                                 )
-                                # Bonificación pequeña para desempatar pedidos de riesgo parecido.
                                 _risk_summary["Puntaje selección"]=_risk_summary["Puntaje alarma"]+_risk_summary["Picker nocturno"].astype(int)*2
-                                _audited_orders={norm(a.get("pedido","")) for a in store.get("order_audits",[]) or [] if isinstance(a,dict)}
-                                _risk_summary["Auditado en esta app"]=_risk_summary["Número de pedido"].map(lambda v:norm(v) in _audited_orders)
-                                _risk_order={"Foco alto":3,"Revisar":2,"Muestra control":1,"Sin foco":0}
-                                _risk_badges={
-                                    "Foco alto":"🔴 Foco alto",
-                                    "Revisar":"🟡 Revisar",
-                                    "Muestra control":"🔵 Muestra control",
-                                    "Sin foco":"🟢 Sin foco",
-                                }
-                                st.markdown("### 🎯 Cobertura de auditoría sin duplicados")
-                                st.caption("El otro equipo empieza a revisar a las 07:00, pero su cobertura corresponde a los slots del Excel desde las 10:00. La hora del slot NO determina el turno del picker.")
-                                _coverage_mode=st.radio(
-                                    "Qué pedidos son responsabilidad de esta revisión",
-                                    ["🌙 Principal: slots antes de 10:00",
-                                     "☀️ Alertas para equipo del día: slots desde 10:00",
-                                     "🌐 Todos los slots (consulta excepcional)"],
-                                    key="audit_coverage_mode",
+
+                                _saved_audits=store.get("order_audits",[]) or []
+                                _audited_orders={norm(a.get("pedido","")) for a in _saved_audits if isinstance(a,dict)}
+                                _risk_summary["Ya auditado"]=_risk_summary["Número de pedido"].map(lambda v:norm(v) in _audited_orders)
+
+                                _coverage_label=st.selectbox(
+                                    "2. Pedidos a revisar",
+                                    ["Mi turno: slots antes de 10:00","Equipo de día: slots desde 10:00","Todo el día"],
+                                    key="audit_coverage_simple",
                                 )
-                                if _coverage_mode=="🌙 Principal: slots antes de 10:00":
-                                    _coverage_summary=audit_coverage_filter(_risk_summary,"early")
-                                    st.caption("Foco principal en madrugada / slots anteriores a las 10:00. Entre riesgos similares, primero los pickers identificados como nocturnos.")
-                                elif _coverage_mode=="☀️ Alertas para equipo del día: slots desde 10:00":
-                                    _coverage_summary=audit_coverage_filter(_risk_summary,"day")
-                                    st.info("Estos pedidos pertenecen a la cobertura del equipo del día. Antes de reauditar, confirma con ellos si el pedido ya fue revisado.")
-                                else:
-                                    _coverage_summary=audit_coverage_filter(_risk_summary,"all")
-                                    st.warning("Modo excepcional: incluye ambos equipos. Comprueba las auditorías previas para evitar duplicados.")
-                                _metric1,_metric2,_metric3,_metric4=st.columns(4)
-                                _metric1.metric("Pedidos en cobertura",f"{len(_coverage_summary):,}")
-                                _metric2.metric("Picker nocturno identificado",f"{int(_coverage_summary['Picker nocturno'].sum()):,}")
-                                _metric3.metric("Foco alto",f"{int(_coverage_summary['Prioridad'].eq('Foco alto').sum()):,}")
-                                _metric4.metric("Ya auditados en esta app",f"{int(_coverage_summary['Auditado en esta app'].sum()):,}")
-                                st.caption("El cruce picker→turno viene de plantilla y base. Si no hay una coincidencia segura, aparece «Sin identificar».")
-                                _learning_total=len({norm(a.get("pedido","")) for a in store.get("order_audits",[]) if str(a.get("pedido","")).strip()})
-                                if _learning_total>=10:
-                                    st.caption(f"Aprendizaje activo con {_learning_total} pedidos auditados: el ajuste estadístico requiere suficiente muestra.")
-                                else:
-                                    st.caption(f"Aprendizaje en observación: {_learning_total}/10 pedidos auditados únicos.")
-                                _cfg1,_cfg2=st.columns([1,2])
-                                with _cfg1:
+                                _coverage_mode="early" if _coverage_label.startswith("Mi turno") else "day" if _coverage_label.startswith("Equipo") else "all"
+                                _coverage_summary=audit_coverage_filter(_risk_summary,_coverage_mode)
+                                with st.expander("Ajustar cantidad sugerida",expanded=False):
                                     _audit_percent=st.slider(
-                                        "Porcentaje máximo a auditar por hora",
-                                        min_value=5,max_value=30,value=20,step=1,
+                                        "Porcentaje máximo por hora",5,30,20,1,
                                         format="%d%%",key="audit_share_percent",
                                     )
-                                    _hide_done=st.checkbox(
-                                        "Ocultar pedidos ya auditados aquí",value=True,key="audit_hide_done",
-                                    )
+                                    _hide_done=st.checkbox("Ocultar pedidos ya auditados",value=True,key="audit_hide_done")
+                                if "_audit_percent" not in locals():
+                                    _audit_percent=20
+                                    _hide_done=True
+
                                 _available=_coverage_summary[
-                                    ~_coverage_summary["Auditado en esta app"] if _hide_done
+                                    ~_coverage_summary["Ya auditado"] if _hide_done
                                     else pd.Series(True,index=_coverage_summary.index)
                                 ].copy()
-                                _hourly_quotas=audit_hourly_quota_table(_coverage_summary,_audit_percent)
                                 _critical_hourly=audit_hourly_critical_queue(
                                     _available,_audit_percent,population=_coverage_summary,
                                 )
-                                with _cfg2:
-                                    st.metric(
-                                        "🚨 Selección crítica de esta cobertura",
-                                        f"{len(_critical_hourly):,}",
-                                        f"hasta {_audit_percent}% del total por hora de slot",
-                                    )
-                                    st.caption("Ejemplo: 50 pedidos por hora → 20% = hasta 10; 16% = hasta 8.")
-                                if not _hourly_quotas.empty:
-                                    _quota_view=_hourly_quotas.copy()
-                                    _quota_view["Críticos disponibles"]=_quota_view["Hora auditoría"].map(
-                                        _available[_available["Candidato crítico"].fillna(False).astype(bool)]
-                                        .groupby("Hora auditoría").size(),
-                                    ).fillna(0).astype(int)
-                                    _quota_view["Seleccionados"]=_quota_view["Hora auditoría"].map(
-                                        _critical_hourly.groupby("Hora auditoría").size(),
-                                    ).fillna(0).astype(int)
-                                    with st.expander("📊 Ver cupo y selección por hora del slot",expanded=False):
-                                        st.dataframe(
-                                            _quota_view.rename(columns={"Hora auditoría":"Hora del slot"}),
-                                            use_container_width=True,hide_index=True,
-                                        )
-                                st.caption(
-                                    "El cupo se calcula con todos los pedidos detectados en cada hora, aunque "
-                                    "alguno ya esté auditado. Solo entran casos muy alarmantes; no se rellena "
-                                    "con pedidos sin señales fuertes. El turno nocturno desempata riesgos similares."
-                                )
-                                _focus_mode=st.radio(
-                                    "Nivel de alarma a mostrar",
-                                    ["🚨 Solo los más alarmantes por hora","🔴 Solo foco alto","🔴🟡 Foco alto + revisar","Todos en esta cobertura"],
+                                _queue_mode=st.radio(
+                                    "Lista",
+                                    ["Sugeridos primero","Todos los pendientes"],
                                     horizontal=True,
-                                    key="order_audit_focus_mode",
+                                    key="audit_queue_mode_simple",
                                 )
-                                if _focus_mode=="🚨 Solo los más alarmantes por hora":
-                                    _risk_filtered=_critical_hourly.copy()
-                                elif _focus_mode=="🔴 Solo foco alto":
-                                    _risk_filtered=_available[_available["Prioridad"].eq("Foco alto")].copy()
-                                elif _focus_mode=="🔴🟡 Foco alto + revisar":
-                                    _risk_filtered=_available[_available["Prioridad"].isin(["Foco alto","Revisar"])].copy()
-                                else:
-                                    _risk_filtered=_available.copy()
-                                _risk_filtered=_risk_filtered.sort_values(
-                                    ["Puntaje selección","Puntaje alarma","Número de pedido"],
-                                    ascending=[False,False,True],
-                                )
+                                _queue=_critical_hourly.copy() if _queue_mode=="Sugeridos primero" else _available.copy()
+                                if "Puntaje selección" in _queue.columns:
+                                    _queue=_queue.sort_values(["Puntaje selección","Número de pedido"],ascending=[False,True])
+                                if _queue.empty and _queue_mode=="Sugeridos primero" and not _available.empty:
+                                    st.info("No hay alertas prioritarias para esta hora. Cambia a «Todos los pendientes» para revisar el resto.")
+                                if _bad_time_orders:
+                                    st.caption(f"{_bad_time_orders:,} pedidos no tienen una hora reconocible y no entran en la lista.")
+                                if not _coverage_summary.empty:
+                                    _n_done=int(_coverage_summary["Ya auditado"].sum())
+                                    _q1,_q2,_q3=st.columns(3)
+                                    _q1.metric("Pedidos en esta cobertura",f"{len(_coverage_summary):,}")
+                                    _q2.metric("Pendientes",f"{len(_available):,}")
+                                    _q3.metric("Ya auditados",f"{_n_done:,}")
+                                st.caption("Las sugerencias usan señales históricas FNR/MC y picker/artículo para ordenar la revisión; sirven como guía, no determinan la causa.")
 
-                                _risk_display=_risk_filtered.copy().rename(columns={"Hora auditoría":"Hora del slot"})
-                                _display_cols=[
-                                    "Número de pedido","Slot","Hora del slot","Cobertura equipo","Turno picker","Picker nocturno","Alarma","Ranking crítico hora","Puntaje alarma","Puntaje selección",
-                                    "Prioridad","Puntaje foco","Diferencias cantidad","Máx. historial picker+artículo",
-                                    "Picker >5","Artículo FNR ≥5","Artículo MC ≥5",
-                                    "Coincidencia picker+artículo","Artículos de riesgo","Ajuste aprendido",
-                                    "Pickers asignados","Factores alarma","Factores",
-                                ]
-                                _display_cols=[col for col in _display_cols if col in _risk_display.columns]
-                                if _risk_display.empty:
-                                    st.success("No hay pedidos en este nivel de foco. Puedes cambiar el filtro para ver los demás.")
-                                else:
-                                    _risk_display["Prioridad"]=_risk_display["Prioridad"].map(lambda value:_risk_badges.get(str(value),str(value)))
-                                    st.dataframe(_risk_display[_display_cols],use_container_width=True,hide_index=True)
-
-                                with st.container(border=True):
-                                    st.markdown("### 🖨️ Imprimir pedidos en lote")
-                                    st.caption("El PDF respeta el porcentaje, la cobertura y los pedidos críticos seleccionados; no mezcla automáticamente la auditoría del equipo diurno.")
-                                    _packet_mode=st.selectbox(
-                                        "Pedidos que incluirá el paquete",
-                                        ["🚨 Más alarmantes por hora","🔴 Solo Foco alto","🔴🟡 Foco alto + Revisar","👁️ Los que estoy viendo"],
-                                        key="bulk_audit_packet_mode",
+                                if not _queue.empty:
+                                    _search=st.text_input("Buscar número de pedido",key="audit_order_search_simple")
+                                    if _search.strip():
+                                        _queue=_queue[_queue["Número de pedido"].astype(str).str.contains(re.escape(_search.strip()),case=False,na=False)]
+                                    _compact_cols=[c for c in ["Número de pedido","Hora auditoría","Turno picker","Prioridad","Pickers asignados"] if c in _queue.columns]
+                                    st.dataframe(
+                                        _queue[_compact_cols].rename(columns={"Número de pedido":"Pedido","Hora auditoría":"Hora","Turno picker":"Turno","Pickers asignados":"Picker"}),
+                                        use_container_width=True,hide_index=True,
                                     )
-                                    if _packet_mode=="🚨 Más alarmantes por hora":
-                                        _packet_summary=_critical_hourly.copy()
-                                    elif _packet_mode=="🔴 Solo Foco alto":
-                                        _packet_summary=_available[_available["Prioridad"].eq("Foco alto")].copy()
-                                    elif _packet_mode=="🔴🟡 Foco alto + Revisar":
-                                        _packet_summary=_available[_available["Prioridad"].isin(["Foco alto","Revisar"])].copy()
-                                    else:
-                                        _packet_summary=_risk_filtered.copy()
+                                    _order_options=_queue["Número de pedido"].astype(str).tolist()
+                                    if _order_options:
+                                        _order=st.selectbox("3. Seleccionar pedido",_order_options,key="order_audit_selected_simple")
+                                        _lines=_audit_detail[_audit_detail["Número de pedido"].astype(str)==str(_order)].copy().reset_index(drop=True)
+                                        _order_row=_queue[_queue["Número de pedido"].astype(str)==str(_order)].iloc[0]
+                                        _slot_values=[v for v in _lines["Slot"].drop_duplicates().astype(str).tolist() if v and v.casefold()!="nan"]
+                                        _order_slot="–".join(_slot_values) if _slot_values else "Sin dato"
 
-                                    _packet_orders=_packet_summary["Número de pedido"].astype(str).tolist()
-                                    _packet_rows=int(_audit_detail["Número de pedido"].astype(str).isin(_packet_orders).sum()) if _packet_orders else 0
-                                    _pc1,_pc2=st.columns(2)
-                                    _pc1.metric("Pedidos en el PDF",f"{len(_packet_orders):,}")
-                                    _pc2.metric("Renglones a imprimir",f"{_packet_rows:,}")
-                                    st.caption("El PDF deja cada pedido separado, con sus artículos, picker, cantidades, prioridad, puntaje y espacio para marcar diferencias/correcciones.")
+                                        _head1,_head2,_head3=st.columns(3)
+                                        _head1.metric("Pedido",str(_order))
+                                        _head2.metric("Hora / slot",_order_slot)
+                                        _head3.metric("Picker",str(_order_row.get("Pickers asignados","Sin asignar")))
+                                        st.caption(f"Turno del picker: {_order_row.get('Turno picker','Sin identificar')}")
+                                        _item_cols=[c for c in ["SKU","Artículo","Picker relacionado","Cantidad pedida","Cantidad pickeada"] if c in _lines.columns]
+                                        _items=_lines[_item_cols].copy().rename(columns={"Picker relacionado":"Picker"})
+                                        st.markdown("**Artículos del pedido**")
+                                        st.dataframe(_items,use_container_width=True,hide_index=True)
 
-                                    _packet_signature=hashlib.sha256(
-                                        (hashlib.sha256(_audit_raw).hexdigest()+"|"+_coverage_mode+"|"+str(_audit_percent)+"|"+"|".join(_packet_orders)).encode("utf-8")
-                                    ).hexdigest()[:18] if _packet_orders else ""
-                                    if _packet_orders and st.button("🧾 Preparar PDF masivo",type="primary",key="prepare_bulk_audit_pdf"):
-                                        with st.spinner("Armando todas las hojas de auditoría…"):
-                                            st.session_state["_bulk_audit_pdf_bytes"]=build_bulk_audit_pdf(
-                                                _audit_detail,_risk_summary,_packet_orders,audit_upload.name
-                                            )
-                                            st.session_state["_bulk_audit_pdf_signature"]=_packet_signature
-                                            st.session_state["_bulk_audit_pdf_name"]=f"Paquete_auditoria_{datetime.now(ZoneInfo('America/Mexico_City')).strftime('%Y%m%d_%H%M')}.pdf"
-                                    if (
-                                        _packet_orders
-                                        and st.session_state.get("_bulk_audit_pdf_bytes")
-                                        and st.session_state.get("_bulk_audit_pdf_signature")==_packet_signature
-                                    ):
-                                        st.download_button(
-                                            "⬇️ Descargar PDF de todos los pedidos",
-                                            st.session_state["_bulk_audit_pdf_bytes"],
-                                            file_name=st.session_state.get("_bulk_audit_pdf_name","Paquete_auditoria.pdf"),
-                                            mime="application/pdf",
-                                            key="download_bulk_audit_pdf",
-                                            use_container_width=True,
-                                        )
-                                    elif not _packet_orders:
-                                        st.info("No hay pedidos en este nivel de foco.")
+                                        def _audit_order_incidents(source,order):
+                                            if source is None or source.empty or "ORDER_NUMBER" not in source.columns:
+                                                return pd.DataFrame()
+                                            _mask=source["ORDER_NUMBER"].astype(str).str.strip().map(norm)==norm(order)
+                                            return source.loc[_mask].copy()
 
-                                _selection_source=_risk_filtered.copy()
-                                _order_options=_selection_source["Número de pedido"].astype(str).tolist()
-                                if not _order_options:
-                                    st.info("No hay pedidos con este criterio. Cambia la cobertura o el nivel de alarma; no se seleccionarán pedidos de otro equipo automáticamente.")
-                                else:
-                                    _order=st.selectbox("Pedido a validar",_order_options,key="order_audit_selected")
-                                    _lines=_audit_detail[_audit_detail["Número de pedido"].astype(str)==str(_order)].copy()
-                                    _order_row=_selection_source[_selection_source["Número de pedido"].astype(str)==str(_order)].iloc[0]
-                                    _slot_values=[v for v in _lines["Slot"].drop_duplicates().astype(str).tolist() if v and v.casefold()!="nan"]
-                                    _order_slot="–".join(_slot_values) if _slot_values else "Sin dato"
-                                    _units=pd.to_numeric(_lines["Cantidad pedida"].str.replace(",","",regex=False),errors="coerce").sum()
-                                    _picked_values=pd.to_numeric(_lines["Cantidad pickeada"].str.replace(",","",regex=False),errors="coerce")
-                                    _picked=_picked_values.sum() if _picked_values.notna().any() else np.nan
-                                    _k1,_k2,_k3,_k4,_k5=st.columns(5)
-                                    _k1.metric("Pedido",str(_order))
-                                    _k2.metric("Slot",_order_slot)
-                                    _k3.metric("Alarma",str(_order_row.get("Alarma","")))
-                                    _k4.metric("Puntaje alarma",int(_order_row.get("Puntaje alarma",0)))
-                                    _k5.metric("Rank hora",str(_order_row.get("Ranking crítico hora","—")) if pd.notna(_order_row.get("Ranking crítico hora",pd.NA)) else "—")
-                                    st.markdown(f"**Picker(s):** {_order_row['Pickers asignados']}  \n**Factores:** {_order_row['Factores']}")
-                                    st.caption(f"Renglones: {len(_lines):,} · Cantidad pedida: {_units:g} · Cantidad pickeada: {f'{_picked:g}' if pd.notna(_picked) else 'N/D'}")
-                                    _preview=_lines[["SKU","Artículo","Picker relacionado","Cantidad pedida","Cantidad pickeada","Diferencia cantidad actual","Historial mismo picker+artículo","Señales","Coincidencia picker+artículo"]].reset_index(drop=True)
-                                    _preview["Coincidencia picker+artículo"]=_preview["Coincidencia picker+artículo"].map(lambda value:"🎯 Sí" if bool(value) else "")
-                                    st.dataframe(_preview,use_container_width=True,hide_index=True)
-
-                                    st.markdown("### ✅ Validar y guardar auditoría")
-                                    st.caption("Revisa el pedido completo una sola vez. Si todo está correcto, basta con una aprobación general. Si algo está mal o falta, marca solo ese renglón y escribe la corrección.")
-                                    _existing_audit=next((a for a in reversed(store.get("order_audits",[]) or []) if str(a.get("pedido",""))==str(_order)),None)
-                                    if _existing_audit:
-                                        st.info(f"Última auditoría guardada: {_existing_audit.get('fecha_auditoria','')} · {_existing_audit.get('resultado','')}. Puedes registrar una nueva revisión sin borrar la anterior.")
-
-                                    _audit_key=hashlib.sha256((str(_order)+"|"+hashlib.sha256(_audit_raw).hexdigest()).encode()).hexdigest()[:14]
-                                    _editor_cols=["SKU","Artículo","Picker relacionado","Cantidad pedida","Cantidad pickeada"]
-                                    _audit_editor=_lines[_editor_cols].reset_index(drop=True).copy()
-                                    _audit_editor["Diferencia encontrada"]=False
-                                    _audit_editor["Corrección / observación"]=""
-                                    _audit_editor=st.data_editor(
-                                        _audit_editor,
-                                        hide_index=True,
-                                        use_container_width=True,
-                                        num_rows="fixed",
-                                        disabled=_editor_cols,
-                                        key="audit_editor_"+_audit_key,
-                                    )
-
-                                    def _audit_order_incidents(source,order):
-                                        if source is None or source.empty or "ORDER_NUMBER" not in source.columns:
-                                            return pd.DataFrame()
-                                        _mask=source["ORDER_NUMBER"].astype(str).str.strip().map(norm)==norm(order)
-                                        return source.loc[_mask].copy()
-
-                                    _audit_fnr=_audit_order_incidents(fnr,_order)
-                                    _audit_mc=_audit_order_incidents(mc,_order)
-                                    def _audit_incident_count(frame):
-                                        if frame.empty: return 0
-                                        if "INCIDENCIAS" in frame.columns:
-                                            return int(pd.to_numeric(frame["INCIDENCIAS"],errors="coerce").fillna(0).sum())
-                                        return int(len(frame))
-                                    _audit_fnr_count=_audit_incident_count(_audit_fnr)
-                                    _audit_mc_count=_audit_incident_count(_audit_mc)
-
-                                    st.markdown("#### 🔎 Cruce del pedido con FNR y Mala Calidad")
-                                    _cross1,_cross2=st.columns(2)
-                                    _cross1.metric("FNR vinculadas",_audit_fnr_count)
-                                    _cross2.metric("MC vinculadas",_audit_mc_count)
-                                    if _audit_fnr_count or _audit_mc_count:
-                                        st.warning("Este pedido aparece en FNR y/o MC. La coincidencia sirve como evidencia para investigar, pero no determina por sí sola si el origen fue pickeo u operación.")
-                                        for _audit_type,_audit_frame in (("FNR",_audit_fnr),("MC",_audit_mc)):
-                                            if not _audit_frame.empty:
-                                                _show_cols=[col for col in ["ORDER_NUMBER","PRODUCTO","PICKER","AREA","INCIDENCIAS"] if col in _audit_frame.columns]
-                                                with st.expander(f"Ver {_audit_type} relacionados ({len(_audit_frame):,} registros)"):
-                                                    st.dataframe(_audit_frame[_show_cols],use_container_width=True,hide_index=True)
-                                    else:
-                                        st.caption("No hay coincidencias para este pedido en los archivos FNR/MC actualmente cargados.")
-
-                                    _audit_form1,_audit_form2=st.columns(2)
-                                    with _audit_form1:
-                                        _audit_picker_default=str(_order_row.get("Pickers asignados",""))
-                                        _audit_picker=st.text_input("Picker(s) relacionado(s)",value="" if _audit_picker_default=="Sin asignar" else _audit_picker_default,key="audit_picker_"+_audit_key)
-                                        _audit_responsable=st.text_input("Persona que realizó la auditoría",key="audit_responsable_"+_audit_key)
-                                    with _audit_form2:
-                                        _audit_resultado=st.selectbox(
-                                            "Conclusión final",
-                                            ["Pendiente de determinar","Pedido correcto","Posible error de operación","Posible error de pickeo","Otra incidencia"],
-                                            key="audit_resultado_"+_audit_key,
-                                        )
-                                        _audit_notes=st.text_area("Evidencia / observaciones generales",key="audit_notes_"+_audit_key)
-
-                                    _audit_order_approved=st.checkbox(
-                                        "✅ Confirmo que revisé el pedido completo",
-                                        key="audit_order_approved_"+_audit_key,
-                                        help="Una sola aprobación valida el pedido completo. Usa la tabla únicamente para registrar diferencias o correcciones.",
-                                    )
-
-                                    if st.button("💾 Aprobar pedido y guardar auditoría",type="primary",key="audit_save_"+_audit_key):
-                                        _has_difference=bool(_audit_editor["Diferencia encontrada"].fillna(False).astype(bool).any())
-                                        _line_notes=bool(_audit_editor["Corrección / observación"].fillna("").astype(str).str.strip().ne("").any())
-                                        if not _audit_order_approved:
-                                            st.error("Confirma que revisaste el pedido completo antes de guardarlo.")
-                                        elif not _audit_responsable.strip():
-                                            st.error("Indica quién realizó la auditoría.")
-                                        elif _has_difference and not (_audit_notes.strip() or _line_notes):
-                                            st.error("Encontraste una diferencia: escribe la corrección u observación correspondiente.")
-                                        else:
-                                            _audit_record={
-                                                "id":hashlib.sha256((str(_order)+"|"+datetime.now().isoformat()).encode()).hexdigest()[:18],
-                                                "pedido":str(_order),
-                                                "slot":str(_order_slot),
-                                                "cobertura_equipo":str(_order_row.get("Cobertura equipo","")),
-                                                "turno_picker":str(_order_row.get("Turno picker","Sin identificar")),
-                                                "fecha_auditoria":datetime.now().isoformat(timespec="seconds"),
-                                                "picker":_audit_picker.strip(),
-                                                "auditor":_audit_responsable.strip(),
-                                                "resultado":_audit_resultado,
-                                                "pedido_validado":True,
-                                                "observaciones":_audit_notes.strip(),
-                                                "diferencias":int(_audit_editor["Diferencia encontrada"].fillna(False).astype(bool).sum()),
-                                                "lineas":json.loads(_audit_editor.to_json(orient="records",force_ascii=False)),
-                                                "fnr_al_guardar":_audit_fnr_count,
-                                                "mc_al_guardar":_audit_mc_count,
-                                                "prioridad_preventiva":str(_order_row.get("Prioridad","")),
-                                                "puntaje_foco":int(_order_row.get("Puntaje foco",0)),
-                                                "nivel_foco":str(_order_row.get("Prioridad","")),
-                                                "factores_foco":str(_order_row.get("Factores","")),
-                                                "picker_riesgo":bool(_order_row.get("Picker >5",False)),
-                                                "articulo_fnr_riesgo":bool(_order_row.get("Artículo FNR ≥5",False)),
-                                                "articulo_mc_riesgo":bool(_order_row.get("Artículo MC ≥5",False)),
-                                                "coincidencia_picker_articulo":bool(_order_row.get("Coincidencia picker+artículo",False)),
-                                                "puntaje_alarma":int(_order_row.get("Puntaje alarma",0)),
-                                                "alarma":str(_order_row.get("Alarma","")),
-                                                "ranking_critico_hora":None if pd.isna(_order_row.get("Ranking crítico hora",pd.NA)) else int(_order_row.get("Ranking crítico hora")),
-                                                "reincidencia_picker_articulo":float(_order_row.get("Máx. historial picker+artículo",0) or 0),
-                                                "diferencias_cantidad":int(_order_row.get("Diferencias cantidad",0) or 0),
-                                                "fuente_archivo":audit_upload.name,
-                                            }
-                                            store.setdefault("order_audits",[]).append(_audit_record)
-                                            try:
-                                                save_store(store)
-                                            except Exception as _audit_save_error:
-                                                if store.get("order_audits") and store["order_audits"][-1].get("id")==_audit_record["id"]:
-                                                    store["order_audits"].pop()
-                                                st.error(f"No se pudo confirmar el guardado: {_audit_save_error}")
+                                        _audit_fnr=_audit_order_incidents(fnr,_order)
+                                        _audit_mc=_audit_order_incidents(mc,_order)
+                                        def _audit_incident_count(frame):
+                                            if frame.empty: return 0
+                                            if "INCIDENCIAS" in frame.columns:
+                                                return int(pd.to_numeric(frame["INCIDENCIAS"],errors="coerce").fillna(0).sum())
+                                            return int(len(frame))
+                                        _audit_fnr_count=_audit_incident_count(_audit_fnr)
+                                        _audit_mc_count=_audit_incident_count(_audit_mc)
+                                        with st.expander("Antecedentes de este pedido (FNR/MC)",expanded=False):
+                                            _x1,_x2=st.columns(2)
+                                            _x1.metric("FNR",_audit_fnr_count)
+                                            _x2.metric("MC",_audit_mc_count)
+                                            if _audit_fnr_count or _audit_mc_count:
+                                                st.caption("La coincidencia ayuda a investigar; por sí sola no prueba el origen.")
+                                                for _kind,_frame in (("FNR",_audit_fnr),("MC",_audit_mc)):
+                                                    if not _frame.empty:
+                                                        _show_cols=[c for c in ["ORDER_NUMBER","PRODUCTO","PICKER","AREA","INCIDENCIAS"] if c in _frame.columns]
+                                                        st.markdown(f"**{_kind} relacionados**")
+                                                        st.dataframe(_frame[_show_cols],use_container_width=True,hide_index=True)
                                             else:
-                                                st.success("Pedido marcado como auditado. El registro quedó guardado para compararlo con FNR y MC.")
+                                                st.caption("Sin coincidencia actual en los archivos FNR/MC cargados.")
 
-                                    _print_buffer=io.BytesIO()
-                                    with pd.ExcelWriter(_print_buffer,engine="openpyxl") as _writer:
-                                        _preview.to_excel(_writer,sheet_name="Validar pedido",index=False,startrow=5)
-                                        _ws=_writer.sheets["Validar pedido"]
-                                        _ws.merge_cells("A1:I1")
-                                        _ws["A1"]="AUDITORÍA DE PEDIDO"
-                                        _ws["A2"]="Número de pedido"; _ws["B2"]=str(_order)
-                                        _ws["C2"]="Slot"; _ws["D2"]=_order_slot
-                                        _ws["E2"]="Prioridad"; _ws["F2"]=_order_row["Prioridad"]
-                                        _ws["A3"]="Picker(s)"; _ws["B3"]=_order_row["Pickers asignados"]
-                                        _ws["C3"]="Fecha / hora de validación"; _ws["D3"]=""
-                                        _ws["E3"]="Pedido revisado completo"; _ws["F3"]="□ Sí"
-                                        _ws["A4"]="Motivo"; _ws["B4"]=_order_row.get("Factores","Sin señales de foco")
-                                        _ws.merge_cells("B4:I4")
-                                        _headers=6
-                                        _ws.cell(_headers,8,"Diferencia")
-                                        _ws.cell(_headers,9,"Corrección / observaciones")
-                                        for _row in range(_headers+1,_headers+1+len(_preview)):
-                                            _ws.cell(_row,8,"")
-                                            _ws.cell(_row,9,"")
-                                        _footer=_headers+len(_preview)+2
-                                        _ws.cell(_footer,1,"Revisa el pedido completo una sola vez. Si detectas una diferencia, anótala únicamente en el renglón correspondiente.")
-                                        _ws.merge_cells(start_row=_footer,start_column=1,end_row=_footer,end_column=9)
-                                        from openpyxl.styles import Font as _XLFont, PatternFill as _XLFill, Border as _XLBorder, Side as _XLSide, Alignment as _XLAlignment
-                                        _ws["A1"].font=_XLFont(name="Arial",size=16,bold=True,color="FFFFFF")
-                                        _ws["A1"].fill=_XLFill("solid",fgColor="BD2426")
-                                        _ws["A1"].alignment=_XLAlignment(horizontal="center")
-                                        _thin=_XLSide(style="thin",color="D9D9D9")
-                                        for _cell in _ws[_headers]:
-                                            _cell.font=_XLFont(bold=True,color="FFFFFF")
-                                            _cell.fill=_XLFill("solid",fgColor="444654")
-                                            _cell.alignment=_XLAlignment(horizontal="center",vertical="center",wrap_text=True)
-                                        for _row in _ws.iter_rows(min_row=2,max_row=_headers+len(_preview),min_col=1,max_col=9):
-                                            for _cell in _row:
-                                                _cell.border=_XLBorder(bottom=_thin)
-                                                _cell.alignment=_XLAlignment(vertical="center",wrap_text=True)
-                                        for _col,_width in {"A":18,"B":38,"C":24,"D":14,"E":14,"F":14,"G":14,"H":12,"I":28}.items():
-                                            _ws.column_dimensions[_col].width=_width
-                                        _ws.row_dimensions[1].height=28
-                                        _ws.row_dimensions[_headers].height=32
-                                        _ws.freeze_panes="A7"
-                                        _ws.sheet_properties.pageSetUpPr.fitToPage=True
-                                        _ws.page_setup.orientation="landscape"
-                                        _ws.page_setup.paperSize=_ws.PAPERSIZE_LETTER
-                                        _ws.page_setup.fitToWidth=1
-                                        _ws.page_setup.fitToHeight=0
-                                        _ws.page_margins.left=0.25; _ws.page_margins.right=0.25
-                                        _ws.page_margins.top=0.4; _ws.page_margins.bottom=0.4
-                                        _ws.print_area=f"A1:I{_footer}"
-                                        _ws.print_title_rows="1:6"
-                                    _safe_order=re.sub(r"[^A-Za-z0-9_-]+","_",str(_order)).strip("_")[:40] or "pedido"
-                                    st.download_button("⬇️ Descargar hoja de validación",_print_buffer.getvalue(),file_name=f"Validacion_pedido_{_safe_order}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",key=f"order_audit_download_{hashlib.md5(str(_order).encode()).hexdigest()}",type="primary")
-                                    st.caption("La hoja conserva el picker de cada renglón y usa una sola aprobación para el pedido completo; las diferencias se anotan solo donde correspondan.")
+                                        st.markdown("### 4. Guardar auditoría")
+                                        _existing_audit=next((a for a in reversed(_saved_audits) if norm(a.get("pedido",""))==norm(_order)),None)
+                                        if _existing_audit:
+                                            st.caption(f"Auditoría anterior: {_existing_audit.get('fecha_auditoria','')} · {_existing_audit.get('resultado','')}. La nueva revisión se agrega al historial.")
+                                        _audit_key=hashlib.sha256((str(_order)+"|"+hashlib.sha256(_audit_raw).hexdigest()).encode()).hexdigest()[:14]
+                                        _result=st.selectbox(
+                                            "Resultado",
+                                            ["Pedido correcto","Con diferencias","No se pudo validar"],
+                                            key="audit_result_simple_"+_audit_key,
+                                        )
+                                        _line_options=[
+                                            f"{idx+1}. {row.get('SKU','')} · {row.get('Artículo','')} · Cantidad {row.get('Cantidad pedida','')}"
+                                            for idx,row in _lines.iterrows()
+                                        ]
+                                        with st.form("audit_save_form_"+_audit_key,clear_on_submit=False):
+                                            _auditor=st.text_input("Quién revisó",key="audit_responsable_simple_"+_audit_key)
+                                            if _result=="Con diferencias":
+                                                _diff_items=st.multiselect("Artículos con diferencia",_line_options,key="audit_diff_items_"+_audit_key)
+                                                _diff_notes=st.text_area("Qué debía haber y qué encontraste",key="audit_diff_notes_"+_audit_key)
+                                            else:
+                                                _diff_items=[]
+                                                _diff_notes=""
+                                            _audit_notes=st.text_area("Observaciones (opcional)",key="audit_notes_simple_"+_audit_key)
+                                            _approved=st.checkbox("Confirmo que revisé el pedido completo",key="audit_approved_simple_"+_audit_key)
+                                            _save_audit=st.form_submit_button("Guardar revisión",type="primary",use_container_width=True)
+
+                                        if _save_audit:
+                                            if not _approved:
+                                                st.error("Confirma que revisaste el pedido completo.")
+                                            elif not _auditor.strip():
+                                                st.error("Escribe quién realizó la revisión.")
+                                            elif _result=="Con diferencias" and (not _diff_items or not _diff_notes.strip()):
+                                                st.error("Elige el artículo y describe la diferencia.")
+                                            else:
+                                                _line_records=[]
+                                                for _idx,_line in _lines.iterrows():
+                                                    _label=_line_options[_idx]
+                                                    _line_records.append({
+                                                        "SKU":str(_line.get("SKU","")),
+                                                        "Artículo":str(_line.get("Artículo","")),
+                                                        "Picker relacionado":str(_line.get("Picker relacionado","")),
+                                                        "Cantidad pedida":str(_line.get("Cantidad pedida","")),
+                                                        "Cantidad pickeada":str(_line.get("Cantidad pickeada","")),
+                                                        "Diferencia encontrada":_label in _diff_items,
+                                                        "Corrección / observación":_diff_notes.strip() if _label in _diff_items else "",
+                                                    })
+                                                _audit_record={
+                                                    "id":hashlib.sha256((str(_order)+"|"+datetime.now().isoformat()).encode()).hexdigest()[:18],
+                                                    "pedido":str(_order),
+                                                    "slot":str(_order_slot),
+                                                    "cobertura_equipo":str(_order_row.get("Cobertura equipo","")),
+                                                    "turno_picker":str(_order_row.get("Turno picker","Sin identificar")),
+                                                    "fecha_auditoria":datetime.now(ZoneInfo("America/Mexico_City")).isoformat(timespec="seconds"),
+                                                    "picker":str(_order_row.get("Pickers asignados","")).strip(),
+                                                    "auditor":_auditor.strip(),
+                                                    "resultado":_result,
+                                                    "pedido_validado":bool(_approved),
+                                                    "observaciones":_audit_notes.strip(),
+                                                    "diferencias":len(_diff_items),
+                                                    "lineas":_line_records,
+                                                    "fnr_al_guardar":_audit_fnr_count,
+                                                    "mc_al_guardar":_audit_mc_count,
+                                                    "prioridad_preventiva":str(_order_row.get("Prioridad","")),
+                                                    "nivel_foco":str(_order_row.get("Prioridad","")),
+                                                    "puntaje_foco":int(_order_row.get("Puntaje foco",0) or 0),
+                                                    "factores_foco":str(_order_row.get("Factores","")),
+                                                    "alarma":str(_order_row.get("Alarma","")),
+                                                    "fuente_archivo":audit_upload.name,
+                                                }
+                                                store.setdefault("order_audits",[]).append(_audit_record)
+                                                try:
+                                                    save_store(store)
+                                                except Exception as _audit_save_error:
+                                                    if store.get("order_audits") and store["order_audits"][-1].get("id")==_audit_record["id"]:
+                                                        store["order_audits"].pop()
+                                                    st.error(f"No se pudo guardar la auditoría: {_audit_save_error}")
+                                                else:
+                                                    st.session_state["_order_audit_flash"]=f"Pedido {_order}: auditoría guardada."
+                                                    st.rerun()
+                                else:
+                                    st.info("No hay pedidos pendientes en esta lista.")
+                                    if _coverage_summary.empty:
+                                        st.caption("No se encontraron pedidos dentro de esta cobertura.")
             except Exception as _audit_error:
                 st.error(f"No pude leer el archivo de pedidos: {_audit_error}")
 
-        st.divider()
-        st.subheader("📚 Historial de pedidos auditados")
         _saved_audits=store.get("order_audits",[]) or []
-        if _saved_audits:
-            def _current_order_incident_count(source,order):
-                if source is None or source.empty or "ORDER_NUMBER" not in source.columns:
-                    return 0
-                _rows=source[source["ORDER_NUMBER"].astype(str).str.strip().map(norm)==norm(order)]
-                if _rows.empty: return 0
-                if "INCIDENCIAS" in _rows.columns:
-                    return int(pd.to_numeric(_rows["INCIDENCIAS"],errors="coerce").fillna(0).sum())
-                return int(len(_rows))
-            _audit_history=pd.DataFrame([{
-                "Pedido":rec.get("pedido",""),
-                "Slot":rec.get("slot",rec.get("hora_pedido","")),
-                "Fecha auditoría":rec.get("fecha_auditoria",""),
-                "Picker":rec.get("picker",""),
-                "Auditó":rec.get("auditor",""),
-                "Resultado":rec.get("resultado",""),
-                "Nivel foco":rec.get("nivel_foco",rec.get("prioridad_preventiva","")),
-                "Puntaje foco":rec.get("puntaje_foco",""),
-                "Diferencias":rec.get("diferencias",0),
-                "FNR al guardar":rec.get("fnr_al_guardar",0),
-                "MC al guardar":rec.get("mc_al_guardar",0),
-                "Observaciones":rec.get("observaciones",""),
-            } for rec in _saved_audits])
-            _audit_history["FNR actual"]=_audit_history["Pedido"].map(lambda order:_current_order_incident_count(fnr,order))
-            _audit_history["MC actual"]=_audit_history["Pedido"].map(lambda order:_current_order_incident_count(mc,order))
-            _audit_history=_audit_history.sort_values("Fecha auditoría",ascending=False)
-            _audit_search=st.text_input("Buscar pedido auditado",key="audit_history_search")
-            if _audit_search.strip():
-                _audit_history=_audit_history[_audit_history["Pedido"].astype(str).str.contains(re.escape(_audit_search.strip()),case=False,na=False)]
-            st.dataframe(_audit_history,use_container_width=True,hide_index=True)
-            st.caption("FNR/MC actual se recalcula con los archivos operativos que estén cargados ahora; así puedes comparar la auditoría previa contra incidencias que aparezcan después.")
-            _audit_export=io.BytesIO()
-            with pd.ExcelWriter(_audit_export,engine="openpyxl") as _audit_writer:
-                _audit_history.to_excel(_audit_writer,index=False,sheet_name="Auditorias")
-                _audit_line_rows=[]
-                for _rec in _saved_audits:
-                    for _line in _rec.get("lineas",[]) or []:
-                        _audit_line_rows.append({"Pedido":_rec.get("pedido",""),"Fecha auditoría":_rec.get("fecha_auditoria",""),**_line})
-                pd.DataFrame(_audit_line_rows).to_excel(_audit_writer,index=False,sheet_name="Articulos auditados")
-            st.download_button("⬇️ Exportar historial de auditorías",_audit_export.getvalue(),file_name="Historial_auditorias_pedidos.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",key="audit_history_export")
+        with st.expander(f"📚 Historial de auditorías ({len(_saved_audits)})",expanded=False):
+            if _saved_audits:
+                _history=pd.DataFrame([{
+                    "Pedido":rec.get("pedido",""),
+                    "Fecha":rec.get("fecha_auditoria",""),
+                    "Picker":rec.get("picker",""),
+                    "Revisó":rec.get("auditor",""),
+                    "Resultado":rec.get("resultado",""),
+                    "Diferencias":rec.get("diferencias",0),
+                    "FNR":rec.get("fnr_al_guardar",0),
+                    "MC":rec.get("mc_al_guardar",0),
+                    "Observaciones":rec.get("observaciones",""),
+                } for rec in _saved_audits])
+                _history=_history.sort_values("Fecha",ascending=False)
+                _history_search=st.text_input("Buscar en el historial",key="audit_history_search_simple")
+                if _history_search.strip():
+                    _history=_history[_history["Pedido"].astype(str).str.contains(re.escape(_history_search.strip()),case=False,na=False)]
+                st.dataframe(_history,use_container_width=True,hide_index=True)
+            else:
+                st.caption("Todavía no hay auditorías guardadas.")
 
-            _latest_audits={}
-            for _rec in sorted(_saved_audits,key=lambda z:str(z.get("fecha_auditoria",""))):
-                if _rec.get("puntaje_foco") is not None:
-                    _latest_audits[str(_rec.get("pedido",""))]=_rec
-            if _latest_audits:
-                st.markdown("### 📈 Qué señales están acertando")
-                st.caption("Comparación descriptiva basada en la última auditoría de cada pedido. Se cuenta como incidencia posterior cuando el FNR+MC actual del pedido supera lo que tenía al momento de guardarlo. Sirve para aprender qué señales funcionan; no demuestra causalidad.")
-                _assoc_records=list(_latest_audits.values())
-                def _audit_has_new_incidence(rec):
-                    current=_current_order_incident_count(fnr,rec.get("pedido",""))+_current_order_incident_count(mc,rec.get("pedido",""))
-                    saved_fnr=pd.to_numeric(rec.get("fnr_al_guardar",0),errors="coerce")
-                    saved_mc=pd.to_numeric(rec.get("mc_al_guardar",0),errors="coerce")
-                    saved=(0.0 if pd.isna(saved_fnr) else float(saved_fnr))+(0.0 if pd.isna(saved_mc) else float(saved_mc))
-                    return current>saved
-                _assoc_defs=[
-                    ("Picker >5",lambda r:bool(r.get("picker_riesgo",False))),
-                    ("Artículo ≥5 FNR/MC",lambda r:bool(r.get("articulo_fnr_riesgo",False) or r.get("articulo_mc_riesgo",False))),
-                    ("Picker + artículo",lambda r:bool(r.get("coincidencia_picker_articulo",False))),
-                    ("Sin señales",lambda r:not bool(r.get("picker_riesgo",False) or r.get("articulo_fnr_riesgo",False) or r.get("articulo_mc_riesgo",False))),
-                ]
-                _assoc_rows=[]
-                for _label,_rule in _assoc_defs:
-                    _subset=[rec for rec in _assoc_records if _rule(rec)]
-                    _hits=sum(1 for rec in _subset if _audit_has_new_incidence(rec))
-                    _n=len(_subset)
-                    _assoc_rows.append({
-                        "Señal":_label,
-                        "Pedidos auditados":_n,
-                        "Con incidencia posterior":_hits,
-                        "Tasa observada":round(_hits/_n*100,1) if _n else 0.0,
-                        "Lectura":"Referencia útil" if _n>=10 else ("Muestra pequeña" if _n else "Sin datos"),
-                    })
-                st.dataframe(pd.DataFrame(_assoc_rows),use_container_width=True,hide_index=True)
-                st.caption("Cuando acumulemos más auditorías, esta tabla permitirá ajustar los pesos del puntaje con evidencia real de la operación.")
-        else:
-            st.caption("Aún no hay pedidos auditados guardados.")
 
 if _tab_active(b):
     with b:
