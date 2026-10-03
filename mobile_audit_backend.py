@@ -8,7 +8,6 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Mapping
 
 
 EMAIL_PATTERN = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+[.][A-Za-z]{2,}")
@@ -50,7 +49,7 @@ def admin_allowed(email, configured):
 
 def domain_allowed(email, configured):
     domains = {v.strip().lstrip("@").lower() for v in str(configured or "").replace(";", ",").replace(chr(10), ",").split(",") if v.strip()}
-    return bool(email) and (not domains or email.rsplit("@", 1)[-1] in domains)
+    return bool(email) and bool(domains) and email.rsplit("@", 1)[-1] in domains
 
 
 def normalized_name(value):
