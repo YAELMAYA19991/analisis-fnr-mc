@@ -146,11 +146,11 @@ begin
     -- no se acepta un conteo enviado arbitrariamente desde el formulario.
     select count(*)::integer into v_expected
       from public.mobile_audit_orders o,
-           lateral jsonb_array_elements(o.items) as item
+           lateral jsonb_array_elements(o.items) as item_row(value)
      where o.id = v_assignment.order_id
        and (
            v_assignment.mode = 'auditoria_cruzada'
-           or item->>'picker_email' = v_assignment.assignee_email
+           or item_row.value->>'picker_email' = v_assignment.assignee_email
        );
     if v_expected < 1 then
         raise exception 'La asignación no tiene artículos verificables.';
