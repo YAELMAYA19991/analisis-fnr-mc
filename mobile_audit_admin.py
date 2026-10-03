@@ -30,7 +30,7 @@ def _items_with_owner_email(lines, people):
     return result
 
 
-def render_mobile_assignment(pedido, slot, row, lines, roster, summary, raw_upload):
+def render_mobile_assignment(pedido, slot, row, lines, roster, summary, raw_upload, fnr_count=0, mc_count=0):
     """Nadie sin OIDC + lista explícita de administradores puede asignar ni ver revisiones."""
     st.caption("Asigna autoverificaciones y auditorías cruzadas sin modificar el Excel original.")
     if "auth" not in st.secrets:
@@ -38,6 +38,9 @@ def render_mobile_assignment(pedido, slot, row, lines, roster, summary, raw_uplo
         return
     if not st.secrets.get("MOBILE_AUDIT_ADMIN_EMAILS"):
         st.info("Configura MOBILE_AUDIT_ADMIN_EMAILS con los correos autorizados para asignar pedidos.")
+        return
+    if not st.secrets.get("MOBILE_AUDIT_ALLOWED_DOMAINS"):
+        st.info("Configura MOBILE_AUDIT_ALLOWED_DOMAINS para limitar el acceso a correos corporativos.")
         return
     if not st.user.is_logged_in:
         if st.button("Iniciar sesión como supervisor",key="mobile_manager_signin"):
@@ -137,13 +140,17 @@ def render_mobile_assignment(pedido, slot, row, lines, roster, summary, raw_uplo
                 } for rec in rows],hide_index=True,use_container_width=True)
                 reviews=db.reviews_for_order(key)
                 if reviews:
-                    st.caption("Registro de intentos y hallazgos. La coincidencia con FNR/MC no determina la causa.")
+                    st.caption(
+                        f"Cruce con archivos operativos cargados: FNR {fnr_count:,} · MC {mc_count:,}. "
+                        "Una coincidencia requiere investigación y no determina la causa."
+                    )
                     st.dataframe([{
                         "Revisó":rec.get("reviewer_email",""),
                         "Tipo":"Propio" if rec.get("mode")=="autoverificacion" else "Cruzada",
                         "Resultado":rec.get("result",""),
+                        "Artículos con diferencia":len(rec.get("differences",[]) or []),
                         "Detalles":rec.get("notes",""),
-                        "FNR actual":str(row.get("_audit_fnr_count","")), 
+                        "Fecha":rec.get("created_at",""),
                     } for rec in reviews],hide_index=True,use_container_width=True)
             else:
                 st.info("Aún no hay validaciones móviles asignadas a este pedido.")
