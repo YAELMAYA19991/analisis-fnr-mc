@@ -15,7 +15,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Syntax check
-        run: python -m py_compile app.py
+        run: python -m py_compile app.py picker_mobile.py mobile_audit_backend.py mobile_audit_admin.py
       - name: Install dependencies
         run: pip install -r requirements.txt
       - name: Static and operational tests
