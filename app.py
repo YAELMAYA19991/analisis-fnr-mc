@@ -596,17 +596,19 @@ def load_process_images(process):
 def new_process_id():
     return datetime.now().strftime("%Y%m%d%H%M%S%f")
 
-def save_followup_pdf(data, picker, filename):
+def save_followup_pdf(data, picker, filename, identity_email=""):
     """Guarda un PDF de acta/seguimiento asociado a un picker."""
     ensure_persist_dir()
     doc_id=datetime.now().strftime("%Y%m%d%H%M%S%f")
-    folder=os.path.join(PERSIST_DIR, "seguimiento_pdfs", person_key(picker) or "picker", doc_id)
+    _email_key=email_key(identity_email)
+    _owner_folder=("email-"+hashlib.sha256(_email_key.encode("utf-8")).hexdigest()[:20]) if _email_key else (person_key(picker) or "picker")
+    folder=os.path.join(PERSIST_DIR, "seguimiento_pdfs", _owner_folder, doc_id)
     os.makedirs(folder, exist_ok=True)
     safe=_safe_filename(filename)
     path=os.path.join(folder, safe)
     with open(path, "wb") as f: f.write(data)
     if cloud_enabled():
-        key=f"seguimiento_pdfs/{person_key(picker) or 'picker'}/{doc_id}/{safe}"
+        key=f"seguimiento_pdfs/{_owner_folder}/{doc_id}/{safe}"
         cloud_upload(key,data,"application/pdf")
         return "cloud://"+key, doc_id
     return path, doc_id
@@ -792,13 +794,21 @@ def _load_followup_journal(store):
             raise RuntimeError(f"Respaldo individual incompleto: {cloud_path}")
         record_id=str(record.get("id") or record_id)
         record["id"]=record_id
-        rec=picker_record(store,picker,aliases=payload.get("aliases",[]) or [])
+        _correo_key=email_key(payload.get("correo_key",payload.get("correo","")))
+        if _correo_key:
+            rec=followup_email_record(
+                store,picker,_correo_key,
+                aliases=payload.get("aliases",[]) or [],
+                migrate_legacy=False,create=True,
+            )
+        else:
+            rec=picker_record(store,picker,aliases=payload.get("aliases",[]) or [])
         rec.setdefault(payload["kind"],[]).append(record)
         existing_ids.add(record_id)
         restored+=1
     return restored
 
-def save_followup_entry(store,picker,kind,registro,aliases=None):
+def save_followup_entry(store,picker,kind,registro,aliases=None,identity_email="",identity_fields=None):
     """Respalda cada seguimiento por separado ANTES de modificar el índice global.
 
     Si falla Supabase, no se informa un falso éxito. El archivo de evento
@@ -815,10 +825,29 @@ def save_followup_entry(store,picker,kind,registro,aliases=None):
     record=dict(registro)
     record["id"]=str(record.get("id") or uuid.uuid4().hex)
     path=FOLLOWUP_JOURNAL_PREFIX+record["id"]+".json"
-    journal={"v":1,"picker":picker,"aliases":list(aliases or []),"kind":kind,"registro":record}
+    _correo_key=email_key(identity_email)
+    _identity_fields=dict(identity_fields or {})
+    if _correo_key:
+        record["picker"]=picker
+        record["correo"]=str(_identity_fields.get("CORREO",identity_email) or identity_email).strip()
+        record["correo_key"]=_correo_key
+        for _src,_dst in (("PERSONAL_TIPO","tipo_personal"),("TURNO","turno"),("SUPERVISOR","supervisor"),("AREA_BASE","area")):
+            if str(_identity_fields.get(_src,"")).strip(): record[_dst]=str(_identity_fields[_src]).strip()
+    journal={"v":2 if _correo_key else 1,"picker":picker,"aliases":list(aliases or []),"kind":kind,"registro":record}
+    if _correo_key:
+        journal["correo_key"]=_correo_key
+        journal["identidad_plantilla"]={
+            "PICKER":picker,"CORREO_KEY":_correo_key,
+            "CORREO":str(_identity_fields.get("CORREO",identity_email) or identity_email).strip(),
+            "PERSONAL_TIPO":str(_identity_fields.get("PERSONAL_TIPO","")).strip(),
+            "TURNO":str(_identity_fields.get("TURNO","")).strip(),
+            "SUPERVISOR":str(_identity_fields.get("SUPERVISOR","")).strip(),
+            "AREA_BASE":str(_identity_fields.get("AREA_BASE","")).strip(),
+        }
     payload=json.dumps(journal,ensure_ascii=False,sort_keys=True).encode("utf-8")
     cloud_upload(path,payload,"application/json")
-    rec=picker_record(store,picker,aliases=aliases)
+    rec=(followup_email_record(store,picker,_correo_key,aliases=aliases,migrate_legacy=True,create=True)
+         if _correo_key else picker_record(store,picker,aliases=aliases))
     rec[kind]=_unique_records(list(rec.get(kind,[]) or [])+[record])
     try:
         save_store(store)
@@ -1116,6 +1145,57 @@ def picker_record(store, picker, aliases=None):
         return current
     store["pickers"][target]=rec
     return rec
+
+def followup_email_record(store,picker,email,aliases=None,migrate_legacy=False,create=False):
+    """Expediente de Seguimiento por correo maestro, sin resolver por parecido de nombre.
+
+    Los historiales antiguos se muestran/migran sólo cuando la vista confirma que
+    el nombre del Maestro pertenece a una sola dirección de correo.
+    """
+    store.setdefault("pickers",{})
+    target=str(picker or "").strip()
+    ek=email_key(email)
+    if not ek:
+        return picker_record(store,target,aliases=aliases)
+    identity_key="email:"+ek
+    records=store["pickers"]
+    rec=records.get(identity_key)
+    if rec is None:
+        rec=None
+        if migrate_legacy:
+            # Sólo exactos: nunca person_key/token_key ni coincidencia parcial.
+            for candidate in [target]+[str(a).strip() for a in (aliases or []) if str(a).strip()]:
+                if candidate in records and candidate!=identity_key:
+                    rec=records.pop(candidate)
+                    break
+        if rec is None and create:
+            rec={"estado":"ACTIVO","comentarios":[],"acciones":[],"documentos":[]}
+        if rec is not None:
+            records[identity_key]=rec
+    if rec is None:
+        return {"estado":"ACTIVO","comentarios":[],"acciones":[],"documentos":[]}
+    rec.setdefault("estado","ACTIVO")
+    rec.setdefault("comentarios",[])
+    rec.setdefault("acciones",[])
+    rec.setdefault("documentos",[])
+    rec["identidad_plantilla"]={
+        **(rec.get("identidad_plantilla",{}) or {}),
+        "PICKER":target,"CORREO_KEY":ek,
+    }
+    return rec
+
+def master_name_is_unique(identity_df,picker,email):
+    """Indica si un historial histórico por nombre puede vincularse sin ambigüedad."""
+    if identity_df is None or identity_df.empty:
+        return False
+    name_key=person_key(picker)
+    ek=email_key(email)
+    if not name_key or not ek or "PICKER" not in identity_df:
+        return False
+    matches=identity_df[identity_df["PICKER"].map(person_key)==name_key]
+    return matches.get("CORREO_KEY",pd.Series(dtype=str)).map(email_key).nunique()==1 and bool(
+        (matches.get("CORREO_KEY",pd.Series(dtype=str)).map(email_key)==ek).any()
+    )
 
 def active_picker_names(store):
     return {p for p,r in store.get("pickers",{}).items() if r.get("estado", "ACTIVO") == "ACTIVO"}
@@ -1511,13 +1591,19 @@ def effective_roster(roster, store):
     excluded=set(store.get("master_excluded",[])) if isinstance(store,dict) else set()
     if overrides:
         rows=[]
+        _existing_role_by_email={
+            email_key(row.get("CORREO","")):str(row.get("PERSONAL_TIPO",""))
+            for _,row in r.iterrows()
+        } if not r.empty else {}
         for _,ov in overrides.items():
+            _override_email=email_key(ov.get("CORREO",""))
             rows.append({
                 "PICKER":str(ov.get("PICKER","")).strip(),
                 "TURNO_MAESTRO":str(ov.get("TURNO","")).strip(),
                 "CORREO":str(ov.get("CORREO","")).strip(),
                 "SUPERVISOR":str(ov.get("SUPERVISOR","No asignado")).strip() or "No asignado",
                 "AREA_MAESTRO":str(ov.get("AREA_BASE","")).strip(),
+                "PERSONAL_TIPO":str(ov.get("PERSONAL_TIPO",_existing_role_by_email.get(_override_email,""))).strip(),
             })
         if rows:
             manual=pd.DataFrame(rows)
@@ -1585,17 +1671,27 @@ def template_roster_from_upload(data):
         em=col(df,["codigo_correo","codigo + correo","codigo correo","correo","email","usuario"])
         if not em:
             continue
-        p=col(df,["picker","picker_nombre","email_picker","nombre","persona"])
+        p=col(df,["picker","picker_nombre","email_picker","nombre","nombre completo","persona","colaborador","empleado"])
         sh=col(df,["turno","shift"])
         sup=col(df,["supervisor","supervisor_nombre","jefe","responsable"])
         ar=col(df,["area_base","area","departamento","department"])
+        role=col(df,["tipo de personal","tipo personal","tipo de colaborador","tipo colaborador","puesto","cargo","rol","perfil","funcion"])
         estado=col(df,["estado","estatus","status","estatus_cruce"])
+        _role_values=[]
+        for _idx in df.index:
+            _role_value=str(df.at[_idx,role]).strip() if role and pd.notna(df.at[_idx,role]) else ""
+            _area_value=str(df.at[_idx,ar]).strip() if ar and pd.notna(df.at[_idx,ar]) else ""
+            if "layout" in n or "layout" in norm(_area_value) or "layout" in norm(_role_value):
+                _role_values.append("Layout")
+            else:
+                _role_values.append(_role_value)
         tmp=pd.DataFrame({
             "PICKER":df[p].fillna("").astype(str).str.strip() if p else "",
             "TURNO_MAESTRO":df[sh].fillna("").astype(str).str.strip() if sh else "",
             "CORREO":df[em].fillna("").astype(str).str.strip(),
             "SUPERVISOR":df[sup].fillna("").astype(str).str.strip() if sup else "",
             "AREA_MAESTRO":df[ar].fillna("").astype(str).str.strip() if ar else "",
+            "PERSONAL_TIPO":_role_values,
             "ESTADO_PLANTILLA":df[estado].fillna("").astype(str).str.strip() if estado else "",
         })
         tmp["_EMAIL_KEY"]=tmp["CORREO"].map(email_key)
@@ -1618,18 +1714,23 @@ def template_roster_from_upload(data):
     rows=[]
     for ek,g in raw.groupby("_EMAIL_KEY",sort=False):
         row={"_EMAIL_KEY":ek}
-        for field in ["PICKER","TURNO_MAESTRO","CORREO","SUPERVISOR","AREA_MAESTRO","ESTADO_PLANTILLA"]:
+        for field in ["PICKER","TURNO_MAESTRO","CORREO","SUPERVISOR","AREA_MAESTRO","PERSONAL_TIPO","ESTADO_PLANTILLA"]:
             vals=[v for v in g[field].tolist() if useful(v)]
             row[field]=str(vals[0]).strip() if vals else ""
         # Preferir el valor que aparezca más veces cuando existan varias fuentes.
-        for field in ["PICKER","TURNO_MAESTRO","SUPERVISOR","AREA_MAESTRO","ESTADO_PLANTILLA"]:
+        for field in ["PICKER","TURNO_MAESTRO","SUPERVISOR","AREA_MAESTRO","PERSONAL_TIPO","ESTADO_PLANTILLA"]:
             vals=[str(v).strip() for v in g[field].tolist() if useful(v)]
             if vals:
+                if field=="PERSONAL_TIPO" and any("layout" in norm(v) for v in vals):
+                    row[field]="Layout"
+                    continue
                 counts=pd.Series(vals).value_counts()
                 row[field]=str(counts.index[0]).strip()
         # El correo canónico siempre sale del valor con @.
         emails=[str(v).strip() for v in g["CORREO"].tolist() if extract_email_address(v)]
         row["CORREO"]=emails[0] if emails else str(g["CORREO"].iloc[0]).strip()
+        if not row.get("PERSONAL_TIPO"):
+            row["PERSONAL_TIPO"]="Picker"
         rows.append(row)
 
     r=pd.DataFrame(rows)
@@ -3305,19 +3406,24 @@ def _context_identity_view(roster,base=None,fnr=None,mc=None):
     por separado a quienes no están en la plantilla.
     """
     if roster is None or roster.empty:
-        r=pd.DataFrame(columns=["PICKER","TURNO","SUPERVISOR","AREA_BASE","CORREO","CORREO_KEY","_CONTEXT_KEY","CATEGORIA"])
+        r=pd.DataFrame(columns=["PICKER","TURNO","SUPERVISOR","AREA_BASE","CORREO","CORREO_KEY","PERSONAL_TIPO","_CONTEXT_KEY","CATEGORIA"])
     else:
         r=roster.copy()
     r["PICKER"]=r.get("PICKER",pd.Series("",index=r.index)).fillna("").astype(str).str.strip()
     r["TURNO"]=r.get("TURNO_MAESTRO",pd.Series("",index=r.index)).fillna("").astype(str).str.strip()
     r["SUPERVISOR"]=r.get("SUPERVISOR",pd.Series("",index=r.index)).fillna("").astype(str).str.strip()
     r["AREA_BASE"]=r.get("AREA_MAESTRO",pd.Series("",index=r.index)).fillna("").astype(str).str.strip()
+    r["PERSONAL_TIPO"]=r.get("PERSONAL_TIPO",pd.Series("",index=r.index)).fillna("").astype(str).str.strip()
     r["CORREO"]=r.get("CORREO",pd.Series("",index=r.index)).fillna("").astype(str).str.strip()
     r["CORREO_KEY"]=r["CORREO"].map(email_key)
     r=r[r["CORREO_KEY"].ne("")].copy()
     r.loc[r["TURNO"].eq(""),"TURNO"]="No especificado"
     r.loc[r["SUPERVISOR"].eq(""),"SUPERVISOR"]="No asignado"
     r.loc[r["AREA_BASE"].eq(""),"AREA_BASE"]="No especificada"
+    _layout_mask=(r["PERSONAL_TIPO"].map(norm).str.contains("layout",regex=False)
+                  | r["AREA_BASE"].map(norm).str.contains("layout",regex=False))
+    r.loc[_layout_mask,"PERSONAL_TIPO"]="Layout"
+    r.loc[r["PERSONAL_TIPO"].eq(""),"PERSONAL_TIPO"]="Picker"
     r["CATEGORIA"]="Picker"
     r["_CONTEXT_KEY"]=r["CORREO_KEY"].map(lambda z:"correo:"+str(z))
     r=r[r["CORREO_KEY"].ne("")].copy()
@@ -3515,9 +3621,20 @@ if isinstance(s,pd.DataFrame) and "PICKER" in s.columns:
             _category=_row.get("CATEGORIA","Picker"); _supervisor=_row.get("SUPERVISOR","No especificado")
             if pd.isna(_category) or not str(_category).strip(): _category="Picker"
             if pd.isna(_supervisor) or not str(_supervisor).strip(): _supervisor="No especificado"
-            _candidate={"PICKER":_name,"CATEGORIA":str(_category),"SUPERVISOR":str(_supervisor)}
+            _candidate={
+                "PICKER":_name,"CATEGORIA":str(_category),"SUPERVISOR":str(_supervisor),
+                "CORREO":str(_row.get("CORREO","")),
+                "TURNO":str(_row.get("TURNO","")),
+                "AREA_BASE":str(_row.get("AREA_BASE","")),
+            }
             _bucket=app_people_by_name.setdefault(_k,[])
-            if not any(x["PICKER"]==_candidate["PICKER"] and x["CATEGORIA"]==_candidate["CATEGORIA"] for x in _bucket): _bucket.append(_candidate)
+            if not any(
+                x["PICKER"]==_candidate["PICKER"]
+                and x["CATEGORIA"]==_candidate["CATEGORIA"]
+                and email_key(x.get("CORREO",""))==email_key(_candidate.get("CORREO",""))
+                for x in _bucket
+            ):
+                _bucket.append(_candidate)
 app_people_names=sorted({z["PICKER"] for _bucket in app_people_by_name.values() for z in _bucket},key=lambda z:z.upper())
 
 with st.expander("🔳 Generador de códigos QR",expanded=False):
@@ -4329,7 +4446,14 @@ if _tab_active(b):
                 _src_alias=[str(s[s.PICKER==sp].iloc[0].get("_SOURCE_PICKER","")).strip()] if not s[s.PICKER==sp].empty else []
             except Exception:
                 _src_alias=[]
-            rec=picker_record(store,sp,aliases=_src_alias)
+            _picker_email=str(r.get("CORREO","")).strip()
+            _picker_identity={
+                "PICKER":sp,"CORREO":_picker_email,
+                "TURNO":str(r.get("TURNO","")).strip(),
+                "SUPERVISOR":str(r.get("SUPERVISOR","")).strip(),
+                "AREA_BASE":str(r.get("AREA_BASE","")).strip(),
+            }
+            rec=followup_email_record(store,sp,_picker_email,aliases=_src_alias,create=False)
             st.subheader("📝 Retroalimentación y seguimiento")
             st.caption("Solo se solicita el tipo de seguimiento. La retroalimentación opcional queda dentro del mismo registro.")
             with st.form(f"accion_picker_form_{sp}", clear_on_submit=True):
@@ -4345,7 +4469,10 @@ if _tab_active(b):
                         "motivo":act_motivo.strip(),"retroalimentacion":act_retro.strip()
                     }
                     try:
-                        save_followup_entry(store,sp,"acciones",_seguimiento,aliases=_src_alias)
+                        save_followup_entry(
+                            store,sp,"acciones",_seguimiento,aliases=_src_alias,
+                            identity_email=_picker_email,identity_fields=_picker_identity,
+                        )
                     except Exception as exc:
                         st.error(str(exc))
                     else:
@@ -4743,6 +4870,15 @@ if _tab_active(i):
                     _selected_candidate=next((z for _bucket in app_people_by_name.values() for z in _bucket if z["PICKER"]==_linked_name),{})
                     if _linked_name==_person_selected: st.caption("Sin coincidencia guardada: se registrará con este nombre como personal sin registrar.")
                 if _linked_name!="No asociar":
+                    _same_name_candidates=[
+                        z for _bucket in app_people_by_name.values() for z in _bucket
+                        if z.get("PICKER")==_linked_name and email_key(z.get("CORREO",""))
+                    ]
+                    _same_name_emails={email_key(z.get("CORREO","")) for z in _same_name_candidates}
+                    _followup_candidate=(
+                        _same_name_candidates[0] if len(_same_name_emails)==1 and _same_name_candidates else {}
+                    )
+                    _followup_email=_followup_candidate.get("CORREO","")
                     _default_supervisor=_selected_candidate.get("SUPERVISOR","No especificado")
                     _form_suffix=person_key(_linked_name) or "persona"
                     _saved_resource_options={}
@@ -4787,17 +4923,29 @@ if _tab_active(i):
                                     "documentos_enlaces":_document_links
                                 }
                                 try:
-                                    save_followup_entry(store,_linked_name,"acciones",_new_att_followup,aliases=[_person_selected])
+                                    save_followup_entry(
+                                        store,_linked_name,"acciones",_new_att_followup,
+                                        aliases=[_person_selected],
+                                        identity_email=_followup_email,
+                                        identity_fields=_followup_candidate,
+                                    )
                                 except Exception as exc:
                                     st.error(str(exc))
                                 else:
                                     st.success("Seguimiento respaldado en la nube.")
                                     st.rerun()
-                    _stored_record=None
-                    for _stored_name,_stored_value in (store.get("pickers",{}) or {}).items():
-                        if token_key(_stored_name) in {token_key(_linked_name),token_key(_person_selected)}:
-                            _stored_record=_stored_value
-                            break
+                    _linked_email=str(_followup_email)
+                    if email_key(_linked_email):
+                        _stored_record=followup_email_record(
+                            store,_linked_name,_linked_email,
+                            aliases=[_person_selected],migrate_legacy=False,create=False,
+                        )
+                    else:
+                        _stored_record=None
+                        for _stored_name,_stored_value in (store.get("pickers",{}) or {}).items():
+                            if token_key(_stored_name) in {token_key(_linked_name),token_key(_person_selected)}:
+                                _stored_record=_stored_value
+                                break
                     if _stored_record and _stored_record.get("acciones"):
                         st.markdown("**Historial de seguimiento de esta persona**")
                         _history_df=pd.DataFrame(_stored_record["acciones"]).rename(columns={"fecha":"Fecha","accion":"Categoría","supervisor":"Supervisor","motivo":"Motivo","retroalimentacion":"Retroalimentación"})
@@ -4821,16 +4969,32 @@ if _tab_active(h):
         st.subheader("🛡️ Seguimiento")
         st.caption("Todos los registros se organizan en tres categorías: 1. Seguimiento, 2. Acta y 3. 0 Tolerancia.")
         ctx,_,_,_=global_context(context_identity)
-        selected_context=apply_context(s_view,ctx,identity_df=context_identity)
-        selected_context=selected_context[selected_context.get("CATEGORIA",pd.Series("Picker",index=selected_context.index)).astype(str).eq("Picker")].copy()
-        render_context_banner(ctx,selected_context,context_reference(s_view,ctx,identity_df=context_identity),"Contexto heredado")
+        selected_context=apply_person_filters(
+            context_identity,"Todos",
+            ctx.get("turno","Todos"),ctx.get("supervisor","Todos"),ctx.get("area","Todos"),
+        )
+        selected_context=selected_context[selected_context["CORREO_KEY"].map(email_key).ne("")].copy()
+        _scope_parts=[f"{label}: {ctx[key]}" for key,label in (("turno","Turno"),("supervisor","Supervisor"),("area","Área")) if ctx.get(key,"Todos")!="Todos"]
+        _scope=" · ".join(_scope_parts) if _scope_parts else "Todos los turnos, supervisores y áreas"
+        st.caption(f"La lista se toma directamente del master de plantillas e incluye personal de Layout aunque no aparezca en los reportes operativos. · {_scope}")
 
         all_rows=[]
         for _,rr in selected_context.iterrows():
-            picker=str(rr.get("PICKER","")); rec0=picker_record(store,picker,aliases=[str(rr.get("_SOURCE_PICKER",""))])
+            picker=str(rr.get("PICKER","")); _ek=email_key(rr.get("CORREO_KEY",rr.get("CORREO","")))
+            _unique_name=master_name_is_unique(context_identity,picker,_ek)
+            rec0=followup_email_record(
+                store,picker,_ek,aliases=[str(rr.get("_SOURCE_PICKER",""))],
+                migrate_legacy=_unique_name,create=False,
+            )
             acciones=rec0.get("acciones",[]) or []
             documentos=rec0.get("documentos",[]) or []
-            retro_legacy=[z for z in store.get("feedback_rows",[]) if str(z.get("PICKER",""))==picker]
+            retro_legacy=[]
+            for z in store.get("feedback_rows",[]) or []:
+                _z_email=email_key(z.get("CORREO_KEY",z.get("CORREO","")))
+                if _z_email and _z_email==_ek:
+                    retro_legacy.append(z)
+                elif not _z_email and _unique_name and person_key(z.get("PICKER",""))==person_key(picker):
+                    retro_legacy.append(z)
             retro_new=[z for z in acciones if str(z.get("retroalimentacion","")).strip()]
             categorias=[normalize_followup_category(z.get("accion","")) for z in acciones]
             categorias += [normalize_followup_category(z.get("tipo","")) for z in documentos]
@@ -4838,13 +5002,13 @@ if _tab_active(h):
             acta_count=sum(c==FOLLOWUP_CATEGORIES[1] for c in categorias)
             tolerancia_count=sum(c==FOLLOWUP_CATEGORIES[2] for c in categorias)
             fechas=[str(z.get("fecha","")) for z in acciones+documentos if z.get("fecha")]
-            all_rows.append({"PICKER":picker,"TURNO":rr.get("TURNO",""),"SUPERVISOR":rr.get("SUPERVISOR",""),"AREA":rr.get("AREA_BASE",""),"RETROALIMENTACIONES":len(retro_legacy)+len(retro_new),"1. SEGUIMIENTO":seguimiento_count,"2. ACTA":acta_count,"3. 0 TOLERANCIA":tolerancia_count,"DOCUMENTOS":len(documentos),"TOTAL":len(acciones)+len(documentos)+len(retro_legacy),"ÚLTIMO SEGUIMIENTO":max(fechas,default="")})
+            all_rows.append({"PERSONA":picker,"TIPO DE PERSONAL":rr.get("PERSONAL_TIPO","Picker"),"CORREO":str(rr.get("CORREO","")),"TURNO":rr.get("TURNO",""),"SUPERVISOR":rr.get("SUPERVISOR",""),"AREA":rr.get("AREA_BASE",""),"RETROALIMENTACIONES":len(retro_legacy)+len(retro_new),"1. SEGUIMIENTO":seguimiento_count,"2. ACTA":acta_count,"3. 0 TOLERANCIA":tolerancia_count,"DOCUMENTOS":len(documentos),"TOTAL":len(acciones)+len(documentos)+len(retro_legacy),"ÚLTIMO SEGUIMIENTO":max(fechas,default="")})
         seguimiento_df=pd.DataFrame(all_rows)
         if seguimiento_df.empty: st.info("No hay pickers disponibles para seguimiento.")
         else:
             with st.container(border=True):
                 fc1,fc2,fc3,fc4=st.columns(4)
-                search_seg=fc1.text_input("Buscar picker",placeholder="Nombre…",key="seguimiento_global_search")
+                search_seg=fc1.text_input("Buscar picker",placeholder="Nombre o correo…",key="seguimiento_global_search")
                 old_filter_map={"Con actas":"Con 2. Acta","Sin actas":"Sin 2. Acta","Con cero tolerancia":"Con 3. 0 Tolerancia","Sin seguimiento":"Sin 1. Seguimiento"}
                 if st.session_state.get("seguimiento_global_estado") in old_filter_map:
                     st.session_state["seguimiento_global_estado"]=old_filter_map[st.session_state["seguimiento_global_estado"]]
@@ -4855,7 +5019,11 @@ if _tab_active(h):
                 seg_sort=fc3.selectbox("Ordenar por",["1. SEGUIMIENTO","2. ACTA","3. 0 TOLERANCIA","RETROALIMENTACIONES","DOCUMENTOS","TOTAL"],key="seguimiento_global_sort")
                 seg_dir=fc4.selectbox("Orden",["Mayor a menor","Menor a mayor"],key="seguimiento_global_dir")
                 view=seguimiento_df.copy()
-                if search_seg.strip(): view=view[view["PICKER"].map(norm).str.contains(norm(search_seg),regex=False)]
+                if search_seg.strip():
+                    _term_seg=norm(search_seg)
+                    _name_hit=view["PERSONA"].map(norm).str.contains(_term_seg,regex=False)
+                    _email_hit=view["CORREO"].map(norm).str.contains(_term_seg,regex=False)
+                    view=view[_name_hit|_email_hit]
                 if seg_filter=="Con 1. Seguimiento": view=view[view["1. SEGUIMIENTO"]>0]
                 elif seg_filter=="Sin 1. Seguimiento": view=view[view["1. SEGUIMIENTO"]==0]
                 elif seg_filter=="Con 2. Acta": view=view[view["2. ACTA"]>0]
@@ -4864,25 +5032,52 @@ if _tab_active(h):
                 elif seg_filter=="Sin 3. 0 Tolerancia": view=view[view["3. 0 TOLERANCIA"]==0]
                 view=view.sort_values(seg_sort,ascending=(seg_dir=="Menor a mayor"))
                 st.dataframe(view,use_container_width=True,hide_index=True)
-            st.caption(f"{len(view):,} pickers visibles.")
+            st.caption(f"{len(view):,} personas del master visibles.")
 
         st.divider()
-        nombres=person_options(selected_context)
+        _master_options={}
+        for _,_master_row in selected_context.iterrows():
+            _master_email=email_key(_master_row.get("CORREO_KEY",_master_row.get("CORREO","")))
+            if _master_email:
+                _master_options[_master_email]=_master_row.to_dict()
+        _master_labels={
+            _email:f"{_row.get('PICKER','')} · {_row.get('PERSONAL_TIPO','Picker')} · {_email}"
+            for _email,_row in _master_options.items()
+        }
         with st.container(border=True):
             st.markdown("**🔎 Abrir expediente individual**")
-            buscar=st.text_input("Nombre del picker",placeholder="Escribe parte del nombre…",key="seguimiento_picker_search")
-            opciones=nombres
+            buscar=st.text_input("Buscar en la plantilla",placeholder="Nombre o correo…",key="seguimiento_picker_search")
+            opciones=sorted(_master_options)
             if buscar.strip():
-                term=norm(buscar); opciones=[n for n in nombres if term in norm(n)]
-            seguimiento_picker=st.selectbox("Picker",["Selecciona un picker"]+opciones,key="seguimiento_picker_select")
+                term=norm(buscar); opciones=[k for k in opciones if term in norm(_master_labels[k])]
+            _selected_email=st.selectbox(
+                "Picker · correo de la plantilla",[""]+opciones,
+                format_func=lambda k:"Selecciona un picker" if not k else _master_labels.get(k,k),
+                key="seguimiento_picker_email_select_v2",
+            )
 
-        if seguimiento_picker == "Selecciona un picker":
+        if not _selected_email:
             st.info("Selecciona un picker para consultar y documentar su expediente.")
         else:
-            r=s[s.PICKER==seguimiento_picker].iloc[0]
-            rec=picker_record(store,seguimiento_picker,aliases=[str(r.get("_SOURCE_PICKER",""))])
+            r=pd.Series(_master_options[_selected_email])
+            seguimiento_picker=str(r.get("PICKER","")).strip()
+            seguimiento_email=str(r.get("CORREO",_selected_email)).strip()
+            _seguimiento_id=hashlib.sha256(_selected_email.encode("utf-8")).hexdigest()[:16]
+            _seguimiento_identity={
+                "PICKER":seguimiento_picker,"CORREO":seguimiento_email,
+                "CORREO_KEY":_selected_email,"TURNO":str(r.get("TURNO","")),
+                "SUPERVISOR":str(r.get("SUPERVISOR","")),
+                "AREA_BASE":str(r.get("AREA_BASE","")),
+                "PERSONAL_TIPO":str(r.get("PERSONAL_TIPO","Picker")),
+            }
+            _legacy_name_unique=master_name_is_unique(context_identity,seguimiento_picker,_selected_email)
+            rec=followup_email_record(
+                store,seguimiento_picker,seguimiento_email,
+                aliases=[str(r.get("_SOURCE_PICKER",""))],
+                migrate_legacy=_legacy_name_unique,create=False,
+            )
             acciones=rec.get("acciones",[]) or []; documentos=rec.get("documentos",[]) or []
-            st.markdown(f"<div class='justo-card'><div class='justo-kicker'>Expediente</div><div class='justo-title'>{_h(seguimiento_picker)}</div><div class='justo-muted'>Turno: {_h(r.TURNO)} · Supervisor: {_h(r.SUPERVISOR)} · Área: {_h(r.AREA_BASE)}</div></div>",unsafe_allow_html=True)
+            st.markdown(f"<div class='justo-card'><div class='justo-kicker'>Expediente · referencia del master</div><div class='justo-title'>{_h(seguimiento_picker)}</div><div class='justo-muted'>Tipo: {_h(r.get('PERSONAL_TIPO','Picker'))} · Correo: {_h(seguimiento_email)} · Turno: {_h(r.get('TURNO',''))} · Supervisor: {_h(r.get('SUPERVISOR',''))} · Área: {_h(r.get('AREA_BASE',''))}</div></div>",unsafe_allow_html=True)
             k1,k2,k3,k4,k5=st.columns(5)
             categorias_picker=[normalize_followup_category(z.get("accion","")) for z in acciones]
             categorias_picker += [normalize_followup_category(z.get("tipo","")) for z in documentos]
@@ -4891,7 +5086,7 @@ if _tab_active(h):
             k3.metric("2. Acta",f"{sum(c==FOLLOWUP_CATEGORIES[1] for c in categorias_picker):,}")
             k4.metric("3. 0 Tolerancia",f"{sum(c==FOLLOWUP_CATEGORIES[2] for c in categorias_picker):,}")
             k5.metric("Documentos",f"{len(documentos):,}")
-            _attendance_matches=attendance_by_name.get(token_key(seguimiento_picker),[])
+            _attendance_matches=attendance_by_name.get(token_key(seguimiento_picker),[]) if _legacy_name_unique else []
             if len(_attendance_matches)==1:
                 _att_row=_attendance_matches[0]
                 st.markdown("### 📅 Asistencia del periodo cargado")
@@ -4920,19 +5115,19 @@ if _tab_active(h):
                 recurso_opciones=["Sin enlace guardado"]+list(recurso_lookup)
                 with st.container(border=True):
                     st.markdown("**🔗 Elegir enlace guardado (opcional)**")
-                    recurso_seleccionado=st.selectbox("Enlaces de seguimiento",recurso_opciones,key=f"seguimiento_enlace_guardado_{person_key(seguimiento_picker)}")
+                    recurso_seleccionado=st.selectbox("Enlaces de seguimiento",recurso_opciones,key=f"seguimiento_enlace_guardado_{_seguimiento_id}")
                     recurso_actual=recurso_lookup.get(recurso_seleccionado)
                     if recurso_actual:
                         st.info(f"Seleccionado: {recurso_actual.get('tipo','Seguimiento')} · {recurso_actual.get('titulo','Enlace de seguimiento')}")
                         st.link_button("Abrir enlace para revisar",str(recurso_actual.get("url","")))
-                enviar_copia=st.checkbox("Enviar copia por correo al guardar",value=False,key=f"seguimiento_email_{person_key(seguimiento_picker)}")
-                destinatarios=st.text_input("Correo(s) destinatario(s)",placeholder="persona@correo.com (separa varios con coma)",key=f"seguimiento_destinatarios_{person_key(seguimiento_picker)}") if enviar_copia else ""
-                with st.form(f"seguimiento_documento_form_{seguimiento_picker}",clear_on_submit=True):
+                enviar_copia=st.checkbox("Enviar copia por correo al guardar",value=False,key=f"seguimiento_email_{_seguimiento_id}")
+                destinatarios=st.text_input("Correo(s) destinatario(s)",placeholder="persona@correo.com (separa varios con coma)",key=f"seguimiento_destinatarios_{_seguimiento_id}") if enviar_copia else ""
+                with st.form(f"seguimiento_documento_form_{_seguimiento_id}",clear_on_submit=True):
                     dc1,dc2=st.columns([1,2])
                     with dc1: doc_tipo=st.selectbox("Categoría",FOLLOWUP_CATEGORIES)
                     with dc2: doc_titulo=st.text_input("Nombre / referencia",placeholder="Ej. Acta por FNR — septiembre 2026")
                     doc_detalle=st.text_area("Detalle / motivo",placeholder="Qué originó el seguimiento y cualquier dato importante…")
-                    doc_pdf=st.file_uploader("📎 Adjuntar PDF",type=["pdf"],accept_multiple_files=False,key=f"seguimiento_pdf_{seguimiento_picker}")
+                    doc_pdf=st.file_uploader("📎 Adjuntar PDF",type=["pdf"],accept_multiple_files=False,key=f"seguimiento_pdf_{_seguimiento_id}")
                     if st.form_submit_button("💾 Guardar seguimiento / documento",type="primary"):
                         url=str(recurso_actual.get("url","")).strip() if recurso_actual else ""
                         titulo=doc_titulo.strip() or (doc_pdf.name if doc_pdf is not None else (str(recurso_actual.get("titulo",doc_tipo)) if recurso_actual else doc_tipo))
@@ -4954,14 +5149,16 @@ if _tab_active(h):
                                     raise RuntimeError("No se guardó: el respaldo en nube está desactivado.")
                                 if doc_pdf is not None:
                                     pdf_bytes=doc_pdf.getvalue()
-                                    path,_=save_followup_pdf(pdf_bytes,seguimiento_picker,doc_pdf.name)
+                                    path,_=save_followup_pdf(pdf_bytes,seguimiento_picker,doc_pdf.name,identity_email=seguimiento_email)
                                     registro["path"]=path
                                     registro["archivo"]=_safe_filename(doc_pdf.name)
                                 if enviar_copia:
                                     registro["email_estado"]="Pendiente de envío"
                                 save_followup_entry(
                                     store,seguimiento_picker,"documentos",registro,
-                                    aliases=[str(r.get("_SOURCE_PICKER",""))]
+                                    aliases=[str(r.get("_SOURCE_PICKER",""))],
+                                    identity_email=seguimiento_email,
+                                    identity_fields=_seguimiento_identity,
                                 )
                             except Exception as exc:
                                 st.error(str(exc))
@@ -4976,7 +5173,10 @@ if _tab_active(h):
                                         email_body,destinatarios,pdf_bytes,
                                         registro.get("archivo") or "seguimiento.pdf"
                                     )
-                                    _saved_rec=picker_record(store,seguimiento_picker)
+                                    _saved_rec=followup_email_record(
+                                        store,seguimiento_picker,seguimiento_email,
+                                        migrate_legacy=False,create=True,
+                                    )
                                     _saved_doc=next(
                                         (d for d in _saved_rec.get("documentos",[])
                                          if d.get("id")==registro["id"]),None
@@ -5048,9 +5248,9 @@ if _tab_active(h):
                             "Destinatario(s)",
                             value=str(doc.get("destinatarios", "")),
                             placeholder="persona@correo.com (separa varios con coma)",
-                            key=f"resend_to_{person_key(seguimiento_picker)}_{doc.get('id',i)}",
+                            key=f"resend_to_{_seguimiento_id}_{doc.get('id',i)}",
                         )
-                        if st.button("Reenviar correo",key=f"resend_email_{person_key(seguimiento_picker)}_{doc.get('id',i)}",type="primary"):
+                        if st.button("Reenviar correo",key=f"resend_email_{_seguimiento_id}_{doc.get('id',i)}",type="primary"):
                             email_body=f"Se comparte el documento {doc.get('tipo','Seguimiento')} de {seguimiento_picker}.\n\n{doc.get('detalle') or 'Sin detalle.'}"
                             if doc.get("url"):
                                 email_body+=f"\n\nEnlace de seguimiento: {doc.get('url')}"
