@@ -1681,7 +1681,7 @@ def template_roster_from_upload(data):
         for _idx in df.index:
             _role_value=str(df.at[_idx,role]).strip() if role and pd.notna(df.at[_idx,role]) else ""
             _area_value=str(df.at[_idx,ar]).strip() if ar and pd.notna(df.at[_idx,ar]) else ""
-            if "layout" in n or "layout" in norm(_area_value) or "layout" in norm(_role_value):
+            if any("layout" in re.sub(r"[^a-z0-9]", "", norm(value)) for value in (n,_area_value,_role_value)):
                 _role_values.append("Layout")
             else:
                 _role_values.append(_role_value)
@@ -1721,7 +1721,7 @@ def template_roster_from_upload(data):
         for field in ["PICKER","TURNO_MAESTRO","SUPERVISOR","AREA_MAESTRO","PERSONAL_TIPO","ESTADO_PLANTILLA"]:
             vals=[str(v).strip() for v in g[field].tolist() if useful(v)]
             if vals:
-                if field=="PERSONAL_TIPO" and any("layout" in norm(v) for v in vals):
+                if field=="PERSONAL_TIPO" and any("layout" in re.sub(r"[^a-z0-9]", "", norm(v)) for v in vals):
                     row[field]="Layout"
                     continue
                 counts=pd.Series(vals).value_counts()
@@ -3420,8 +3420,8 @@ def _context_identity_view(roster,base=None,fnr=None,mc=None):
     r.loc[r["TURNO"].eq(""),"TURNO"]="No especificado"
     r.loc[r["SUPERVISOR"].eq(""),"SUPERVISOR"]="No asignado"
     r.loc[r["AREA_BASE"].eq(""),"AREA_BASE"]="No especificada"
-    _layout_mask=(r["PERSONAL_TIPO"].map(norm).str.contains("layout",regex=False)
-                  | r["AREA_BASE"].map(norm).str.contains("layout",regex=False))
+    _layout_mask=(r["PERSONAL_TIPO"].map(lambda v:"layout" in re.sub(r"[^a-z0-9]", "", norm(v)))
+                  | r["AREA_BASE"].map(lambda v:"layout" in re.sub(r"[^a-z0-9]", "", norm(v))))
     r.loc[_layout_mask,"PERSONAL_TIPO"]="Layout"
     r.loc[r["PERSONAL_TIPO"].eq(""),"PERSONAL_TIPO"]="Picker"
     r["CATEGORIA"]="Picker"
