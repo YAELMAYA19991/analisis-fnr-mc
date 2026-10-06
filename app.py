@@ -4967,6 +4967,9 @@ if _tab_active(i):
 if _tab_active(h):
     with h:
         st.subheader("🛡️ Seguimiento")
+        _saved_flash=st.session_state.pop("seguimiento_saved_flash","")
+        if _saved_flash:
+            st.success(_saved_flash)
         st.caption("Todos los registros se organizan en tres categorías: 1. Seguimiento, 2. Acta y 3. 0 Tolerancia.")
         ctx,_,_,_=global_context(context_identity)
         selected_context=apply_person_filters(
@@ -5079,6 +5082,26 @@ if _tab_active(h):
             acciones=rec.get("acciones",[]) or []; documentos=rec.get("documentos",[]) or []
             st.markdown(f"<div class='justo-card'><div class='justo-kicker'>Expediente · referencia del master</div><div class='justo-title'>{_h(seguimiento_picker)}</div><div class='justo-muted'>Tipo: {_h(r.get('PERSONAL_TIPO','Picker'))} · Correo: {_h(seguimiento_email)} · Turno: {_h(r.get('TURNO',''))} · Supervisor: {_h(r.get('SUPERVISOR',''))} · Área: {_h(r.get('AREA_BASE',''))}</div></div>",unsafe_allow_html=True)
             k1,k2,k3,k4,k5=st.columns(5)
+            _history_rows=[]
+            for _item in acciones:
+                _history_rows.append({
+                    "Fecha":str(_item.get("fecha","")),
+                    "Categoría":normalize_followup_category(_item.get("accion","")),
+                    "Tipo de registro":"Seguimiento",
+                    "Supervisor":str(_item.get("supervisor","")),
+                    "Detalle":str(_item.get("motivo","")),
+                    "Retroalimentación":str(_item.get("retroalimentacion","")),
+                })
+            for _item in documentos:
+                _history_rows.append({
+                    "Fecha":str(_item.get("fecha","")),
+                    "Categoría":normalize_followup_category(_item.get("tipo","")),
+                    "Tipo de registro":"Documento / acta",
+                    "Supervisor":str(_item.get("supervisor",r.get("SUPERVISOR",""))),
+                    "Detalle":" · ".join(v for v in [str(_item.get("titulo","")).strip(),str(_item.get("detalle","")).strip()] if v),
+                    "Retroalimentación":"",
+                })
+            _history_rows.sort(key=lambda z:z["Fecha"],reverse=True)
             categorias_picker=[normalize_followup_category(z.get("accion","")) for z in acciones]
             categorias_picker += [normalize_followup_category(z.get("tipo","")) for z in documentos]
             k1.metric("Retroalimentaciones",f"{sum(1 for z in acciones if str(z.get('retroalimentacion','')).strip()):,}")
@@ -5099,14 +5122,12 @@ if _tab_active(h):
                 st.caption(f"Datos del periodo {attendance_summary.get('fecha_desde','')} a {attendance_summary.get('fecha_hasta','')}. El turno proviene del reporte de retardos.")
             with st.container(border=True):
                 st.markdown("### 📋 Historial de seguimiento")
-                if acciones:
-                    hist=pd.DataFrame(acciones).rename(columns={"fecha":"Fecha","accion":"Tipo","supervisor":"Supervisor","motivo":"Motivo","retroalimentacion":"Retroalimentación"})
-                    cols=[c for c in ["Fecha","Tipo","Supervisor","Motivo","Retroalimentación"] if c in hist.columns]
-                    st.dataframe(hist.sort_values("Fecha",ascending=False)[cols],use_container_width=True,hide_index=True)
+                if _history_rows:
+                    st.dataframe(pd.DataFrame(_history_rows),use_container_width=True,hide_index=True)
                 else: st.info("Este picker todavía no tiene seguimientos registrados.")
             with st.container(border=True):
                 st.markdown("### 📄 Registrar seguimiento")
-                st.caption("Selecciona una categoría: 1. Seguimiento, 2. Acta o 3. 0 Tolerancia. Adjunta un PDF o elige un enlace guardado.")
+                st.caption("Selecciona una categoría y registra el motivo. El PDF y el enlace son opcionales.")
                 recursos=store.get("recursos_formatos",[]) or []
                 recurso_lookup={}
                 for i,z in enumerate(recursos):
@@ -5131,66 +5152,67 @@ if _tab_active(h):
                     if st.form_submit_button("💾 Guardar seguimiento / documento",type="primary"):
                         url=str(recurso_actual.get("url","")).strip() if recurso_actual else ""
                         titulo=doc_titulo.strip() or (doc_pdf.name if doc_pdf is not None else (str(recurso_actual.get("titulo",doc_tipo)) if recurso_actual else doc_tipo))
-                        if doc_pdf is None and not url: st.error("Adjunta un PDF o selecciona un enlace guardado.")
+                        registro={
+                            "id":uuid.uuid4().hex,
+                            "fecha":datetime.now().strftime("%Y-%m-%d %H:%M"),
+                            "tipo":doc_tipo,"titulo":titulo,
+                            "detalle":doc_detalle.strip(),
+                            "supervisor":str(r.get("SUPERVISOR","")),
+                            "url":url,
+                            "url_titulo":str(recurso_actual.get("titulo","")) if recurso_actual else "",
+                            "path":"","archivo":"","destinatarios":destinatarios,
+                        }
+                        pdf_bytes=None
+                        try:
+                            if not cloud_enabled():
+                                raise RuntimeError("No se guardó: el respaldo en nube está desactivado.")
+                            if doc_pdf is not None:
+                                pdf_bytes=doc_pdf.getvalue()
+                                path,_=save_followup_pdf(pdf_bytes,seguimiento_picker,doc_pdf.name,identity_email=seguimiento_email)
+                                registro["path"]=path
+                                registro["archivo"]=_safe_filename(doc_pdf.name)
+                            if enviar_copia:
+                                registro["email_estado"]="Pendiente de envío"
+                            save_followup_entry(
+                                store,seguimiento_picker,"documentos",registro,
+                                aliases=[str(r.get("_SOURCE_PICKER",""))],
+                                identity_email=seguimiento_email,
+                                identity_fields=_seguimiento_identity,
+                            )
+                        except Exception as exc:
+                            st.error(str(exc))
                         else:
-                            registro={
-                                "id":uuid.uuid4().hex,
-                                "fecha":datetime.now().strftime("%Y-%m-%d %H:%M"),
-                                "tipo":doc_tipo,"titulo":titulo,
-                                "detalle":doc_detalle.strip(),
-                                "supervisor":str(r.get("SUPERVISOR","")),
-                                "url":url,
-                                "url_titulo":str(recurso_actual.get("titulo","")) if recurso_actual else "",
-                                "path":"","archivo":"","destinatarios":destinatarios,
-                            }
-                            pdf_bytes=None
-                            try:
-                                if not cloud_enabled():
-                                    raise RuntimeError("No se guardó: el respaldo en nube está desactivado.")
-                                if doc_pdf is not None:
-                                    pdf_bytes=doc_pdf.getvalue()
-                                    path,_=save_followup_pdf(pdf_bytes,seguimiento_picker,doc_pdf.name,identity_email=seguimiento_email)
-                                    registro["path"]=path
-                                    registro["archivo"]=_safe_filename(doc_pdf.name)
-                                if enviar_copia:
-                                    registro["email_estado"]="Pendiente de envío"
-                                save_followup_entry(
-                                    store,seguimiento_picker,"documentos",registro,
-                                    aliases=[str(r.get("_SOURCE_PICKER",""))],
-                                    identity_email=seguimiento_email,
-                                    identity_fields=_seguimiento_identity,
+                            st.success("Documento / seguimiento respaldado en la nube.")
+                            if enviar_copia:
+                                email_body=f"Se registró un {doc_tipo} para {seguimiento_picker}.\\n\\nDetalle: {doc_detalle.strip() or 'Sin detalle.'}"
+                                if url:
+                                    email_body+=f"\\n\\nEnlace de seguimiento: {url}"
+                                ok,msg=send_followup_email(
+                                    f"Seguimiento {doc_tipo} · {seguimiento_picker}",
+                                    email_body,destinatarios,pdf_bytes,
+                                    registro.get("archivo") or "seguimiento.pdf"
                                 )
-                            except Exception as exc:
-                                st.error(str(exc))
+                                _saved_rec=followup_email_record(
+                                    store,seguimiento_picker,seguimiento_email,
+                                    migrate_legacy=False,create=True,
+                                )
+                                _saved_doc=next(
+                                    (d for d in _saved_rec.get("documentos",[])
+                                     if d.get("id")==registro["id"]),None
+                                )
+                                if _saved_doc is not None:
+                                    _saved_doc["email_estado"]="Enviado" if ok else "Pendiente: error de envío"
+                                    _saved_doc["email_ultimo_envio"]=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                    _saved_doc["email_mensaje"]=msg
+                                    try:
+                                        save_store(store)
+                                    except Exception as exc:
+                                        st.warning("Se respaldó el documento, pero no pudo actualizarse el resultado del correo: "+str(exc))
+                                if ok: st.session_state["seguimiento_saved_flash"]=f"{doc_tipo} guardado. {msg}"
+                                else: st.session_state["seguimiento_saved_flash"]=f"{doc_tipo} guardado en la nube. El correo quedó pendiente."
                             else:
-                                st.success("Documento / seguimiento respaldado en la nube.")
-                                if enviar_copia:
-                                    email_body=f"Se registró un {doc_tipo} para {seguimiento_picker}.\\n\\nDetalle: {doc_detalle.strip() or 'Sin detalle.'}"
-                                    if url:
-                                        email_body+=f"\\n\\nEnlace de seguimiento: {url}"
-                                    ok,msg=send_followup_email(
-                                        f"Seguimiento {doc_tipo} · {seguimiento_picker}",
-                                        email_body,destinatarios,pdf_bytes,
-                                        registro.get("archivo") or "seguimiento.pdf"
-                                    )
-                                    _saved_rec=followup_email_record(
-                                        store,seguimiento_picker,seguimiento_email,
-                                        migrate_legacy=False,create=True,
-                                    )
-                                    _saved_doc=next(
-                                        (d for d in _saved_rec.get("documentos",[])
-                                         if d.get("id")==registro["id"]),None
-                                    )
-                                    if _saved_doc is not None:
-                                        _saved_doc["email_estado"]="Enviado" if ok else "Pendiente: error de envío"
-                                        _saved_doc["email_ultimo_envio"]=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                                        _saved_doc["email_mensaje"]=msg
-                                        try:
-                                            save_store(store)
-                                        except Exception as exc:
-                                            st.warning("Se respaldó el documento, pero no pudo actualizarse el resultado del correo: "+str(exc))
-                                    if ok: st.success(msg)
-                                    else: st.warning(msg)
+                                st.session_state["seguimiento_saved_flash"]=f"{doc_tipo} guardado en la nube."
+                            st.rerun()
             st.markdown("### 🔗 Enlaces de seguimiento")
             st.caption("Aquí puedes consultar y administrar los enlaces guardados.")
             with st.expander(f"Administrar enlaces de seguimiento ({len(recursos)})",expanded=False):
