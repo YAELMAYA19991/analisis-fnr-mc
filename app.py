@@ -1662,6 +1662,72 @@ def template_roster_from_upload(data):
     elige una sola fila por correo: se consolidan los campos no vacíos de
     todas las hojas de la plantilla para que el turno nunca se pierda.
     """
+    # Si el libro contiene Outbound OKI, usar únicamente esa pestaña como maestro.
+    # Su encabezado se repite más abajo para el roster; se detecta por sus columnas.
+    if isinstance(data,(bytes,bytearray)):
+        try:
+            _xls=pd.ExcelFile(io.BytesIO(data))
+        except Exception:
+            _xls=None
+        _outbound_sheet=next((name for name in (_xls.sheet_names if _xls else []) if norm(name)=="outbound_oki"),None)
+        if _outbound_sheet:
+            _raw=pd.read_excel(io.BytesIO(data),sheet_name=_outbound_sheet,header=None,dtype=object)
+            _header_idx=None
+            _header_map={}
+            _required={"puesto","turno","nombre","cargo","correo"}
+            for _i in range(8,len(_raw)):
+                _candidate={norm(v):j for j,v in enumerate(_raw.iloc[_i].tolist()) if pd.notna(v) and str(v).strip()}
+                if _required.issubset(_candidate):
+                    _header_idx=_i
+                    _header_map=_candidate
+                    break
+            if _header_idx is None:
+                raise ValueError("La hoja Outbound OKI no tiene los encabezados PUESTO, TURNO, NOMBRE, CARGO y CORREO.")
+            _rows=[]
+            for _i in range(_header_idx+1,len(_raw)):
+                def _value(_field):
+                    _v=_raw.iat[_i,_header_map[_field]]
+                    return "" if pd.isna(_v) else str(_v).strip()
+                _cargo=_value("cargo")
+                _cargo_key=norm(_cargo).replace("_","")
+                if _cargo_key=="picker":
+                    _tipo="Picker"
+                elif _cargo_key=="layout":
+                    _tipo="Layout"
+                else:
+                    continue
+                _nombre=_value("nombre")
+                if not _nombre or norm(_nombre) in {"nombre","nan","none"}:
+                    continue
+                _turno=_value("turno")
+                _turno_key=norm(_turno)
+                _turno={"manana":"Mañana","intermedio":"Intermedio","tarde":"Tarde","noche":"Nocturno"}.get(_turno_key,_turno)
+                _rows.append({
+                    "PICKER":_nombre,
+                    "TURNO_MAESTRO":_turno,
+                    "CORREO":_value("correo"),
+                    "SUPERVISOR":"",
+                    "AREA_MAESTRO":"Outbound OKI",
+                    "PERSONAL_TIPO":_tipo,
+                    "ESTADO_PLANTILLA":"",
+                })
+            if not _rows:
+                raise ValueError("No encontré filas con CARGO Picker o Lay Out en Outbound OKI.")
+            r=pd.DataFrame(_rows)
+            r["_EMAIL_KEY"]=r["CORREO"].map(email_key)
+            # Con correo, la identidad se deduplica por email; cuando falta,
+            # se conserva el registro para el cruce conservador por nombre.
+            r["_ROSTER_KEY"]=r["_EMAIL_KEY"]
+            _missing=r["_ROSTER_KEY"].eq("")
+            r.loc[_missing,"_ROSTER_KEY"]="nombre:"+r.loc[_missing,"PICKER"].map(person_key)
+            r=r[r["_ROSTER_KEY"].ne("nombre:")].drop_duplicates("_ROSTER_KEY",keep="first").drop(columns=["_ROSTER_KEY"]).reset_index(drop=True)
+            r["_KEY"]=r["PICKER"].map(person_key)
+            r["_TOKEN_KEY"]=r["PICKER"].map(token_key)
+            r["_EMAIL_KEY"]=r["CORREO"].map(email_key)
+            r["_CODE_KEY"]=r["CORREO"].map(extract_code)
+            r["_EMAIL_TOKENS"]=r["CORREO"].map(email_name_tokens)
+            return r
+
     ss=sheets_from_bytes(data) if isinstance(data,(bytes,bytearray)) else sheets(data)
     frames=[]
     for name,df in ss.items():
