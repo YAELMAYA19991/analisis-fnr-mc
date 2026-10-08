@@ -145,7 +145,7 @@ def render_mobile_assignment(pedido, slot, row, lines, roster, summary, raw_uplo
                         "Una coincidencia requiere investigación y no determina la causa."
                     )
                     st.dataframe([{
-                        "Revisó":rec.get("reviewer_name") or rec.get("reviewer_email",""),
+                        "Revisó":rec.get("reviewer_email",""),
                         "Tipo":"Propio" if rec.get("mode")=="autoverificacion" else "Cruzada",
                         "Resultado":rec.get("result",""),
                         "Artículos con diferencia":len(rec.get("differences",[]) or []),
