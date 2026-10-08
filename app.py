@@ -1743,7 +1743,10 @@ def template_roster_from_upload(data):
                 _rows.append({
                     "PICKER":_nombre,
                     "TURNO_MAESTRO":_shift_label(_value("turno")),
-                    "CORREO":_value("correo"),
+                    # Algunas filas de Outbound OKI dejan CORREO vacío, pero
+                    # sí tienen el correo corporativo en USUARIO. Usarlo como
+                    # respaldo mantiene la llave de identidad y el expediente.
+                    "CORREO":_value("correo") or _value("usuario"),
                     "SUPERVISOR":"",
                     "AREA_MAESTRO":"Outbound OKI",
                     "PERSONAL_TIPO":_tipo,
