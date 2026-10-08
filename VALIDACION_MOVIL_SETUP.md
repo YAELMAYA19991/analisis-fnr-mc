@@ -8,7 +8,8 @@
 - `mobile_audit_admin.py`: panel de administración dentro de la auditoría FNR–MC.
 - `supabase_mobile_audit.sql`: crea únicamente las nuevas tablas para validación móvil; no modifica las tablas existentes.
 - `supabase_supervisor_pin_migration.sql`: agrega el nombre del supervisor a las revisiones móviles sin borrar datos existentes.
-- `supabase_public_mobile_audit_rpc.sql`: limita el acceso público a dos funciones; no permite lectura directa de tablas.
+- `supabase_public_mobile_audit_rpc.sql`: limita el acceso público a lectura saneada y registro de revisiones.
+- `supabase_public_mobile_publish_rpc.sql`: permite enviar el pedido seleccionado a la cola de auditoría, sin editar el original.
 - `tests/test_mobile_audit.py`: regresiones de permisos y separación de funciones.
 
 ## Requisitos ANTES de dar acceso al personal
@@ -17,7 +18,7 @@
 2. La miniaplicación móvil ya no necesita Google OAuth ni URL de retorno. El panel de asignaciones dentro de FNR–MC conserva su configuración actual; este cambio no modifica esa app principal.
 3. En **Streamlit Community Cloud**, crea otra aplicación desde el repositorio `YAELMAYA19991/analisis-fnr-mc`, rama `main`, archivo principal **`picker_mobile.py`**. Conserva la aplicación principal existente `app.py` sin reemplazarla.
 4. La miniaplicación ya no requiere Secrets de Supabase. Usa una clave publishable pública y funciones restringidas; la clave privada de servidor no se copia a esta app.
-5. En la aplicación FNR–MC: carga plantilla de personal y Excel de pedidos, selecciona un pedido, abre **Asignar validación móvil (supervisores)**, inicia sesión y asigna la autoverificación a su picker; la auditoría cruzada a un correo corporativo distinto.
+5. En FNR–MC: carga plantilla y pedidos, selecciona cada pedido que se quiera auditar, abre **Asignar validación móvil (supervisores)**, elige el tipo y pulsa **Publicar y enviar al celular**. No solicita correo ni inicio de sesión.
 6. En la miniaplicación: abre el enlace sin iniciar sesión ni introducir códigos, escribe el nombre de quien audita, revisa los artículos y registra el resultado. Comprueba el historial en FNR–MC.
 
 ## Configuración privada de FNR–MC
@@ -44,7 +45,7 @@ La configuración OAuth anterior aplica únicamente a FNR–MC. La miniapp móvi
 
 ## Reglas de operación
 
-- La miniapp es pública: cualquier persona con el enlace puede ver los pedidos asignados y registrar auditorías o diferencias. El nombre del auditor es autodeclarado y no comprueba su identidad.
+- Las dos pantallas móviles son públicas: cualquier persona con los enlaces puede publicar pedidos seleccionados desde FNR–MC, consultar la cola y registrar auditorías o diferencias. El nombre del auditor es autodeclarado y no comprueba su identidad.
 - Las asignaciones existentes siguen asociadas internamente al picker del roster para limitar los artículos de autoverificación; el picker no inicia sesión ni escribe su correo.
 - Nadie puede auditar como tercero un pedido propio; la base de datos también valida esta regla.
 - La miniapp muestra a quien tenga el enlace la cola de pedidos asignados; en autoverificación presenta únicamente los artículos asociados al picker asignado y omite correos internos.
@@ -64,4 +65,4 @@ La configuración OAuth anterior aplica únicamente a FNR–MC. La miniapp móvi
 6. Recargar el Excel y probar una asignación duplicada: no debe crear dos revisiones.
 7. Confirma que el registro de auditorías y diferencias aparezca en FNR–MC y que los pedidos originales no se hayan modificado.
 
-La app móvil puede conectarse sin código o cuenta. Su clave publishable es pública; las tablas siguen bloqueadas para lectura directa y las revisiones se envían por funciones limitadas. La app FNR–MC original y los pedidos originales no se modifican con esta configuración.
+La app móvil y la sección de publicación funcionan sin código, correo o cuenta. La clave publishable de Supabase es pública; las tablas siguen bloqueadas para acceso directo y los cambios se envían por funciones limitadas. La app FNR–MC original y los pedidos originales no se modifican con esta configuración.
