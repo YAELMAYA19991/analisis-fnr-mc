@@ -16,6 +16,9 @@ MODES = {"autoverificacion", "auditoria_cruzada"}
 RESULTS = {"Pedido correcto", "Con diferencias", "No se pudo validar"}
 
 
+SUPABASE_PUBLIC_URL = "https://kywxkynoigufkyzzaryx.supabase.co"
+SUPABASE_PUBLISHABLE_KEY = "sb_publishable_pvXrzejU-C-T4MKr_smDyQ__DyfxYm3"
+
 class MobileAuditError(RuntimeError):
     pass
 
@@ -145,7 +148,7 @@ def _request(url, key, method, resource, *, params=None, payload=None, prefer=""
     raw = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
     req = urllib.request.Request(target, method=method, data=raw)
     req.add_header("apikey", key)
-    if not key.startswith("sb_secret_"):
+    if not key.startswith(("sb_secret_", "sb_publishable_")):
         req.add_header("Authorization", "Bearer " + key)
     req.add_header("Content-Type", "application/json")
     req.add_header("Accept", "application/json")
@@ -209,15 +212,8 @@ class MobileAuditDB:
         )
 
     def all_assignments(self):
-        """La pantalla de supervisor PIN necesita cargar la cola sin pedir correo."""
-        return self.request(
-            "GET", "mobile_audit_assignments",
-            params={
-                "select": "id,assignee_email,mode,status,last_result,order_id,mobile_audit_orders(pedido,slot,items,picker_labels)",
-                "order": "created_at.desc",
-                "limit": "500",
-            },
-        )
+        """Obtiene la cola pública mediante una función que devuelve datos de pedido saneados."""
+        return self.request("POST", "rpc/list_mobile_audit_assignments_public", payload={})
 
     def assignments_for_order(self, order_key):
         return self.request(
