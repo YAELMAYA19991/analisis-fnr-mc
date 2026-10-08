@@ -1351,6 +1351,8 @@ def parse_base(df):
         return (label in {"", "total", "total general", "gran total", "grand total", "sin registrar", "picker"}
                 or label.startswith("filtros aplicados") or label.startswith("filtros"))
     x=x.loc[~x["PICKER"].map(_is_non_person_row)].copy()
+    _picker_area=x["AREA_BASE"].map(lambda v:norm(v).replace("_"," ").strip()).eq("picker")
+    x.loc[_picker_area,"AREA_BASE"]="No especificada"
     x["_KEY"]=x["PICKER"].map(person_key)
     x["_TOKEN_KEY"]=x["PICKER"].map(token_key)
     x["_CODE_KEY"]=x["CORREO"].map(extract_code)
@@ -1910,6 +1912,10 @@ def parse_inc(df,tipo):
         "FECHA":df[fe] if fe else "",
         "INCIDENCIAS":pd.to_numeric(df[qty],errors="coerce").fillna(1) if qty else 1,
         "TIPO":tipo})
+    # "PICKER" no es un área operativa; conservar los registros y sus métricas
+    # bajo un área pendiente en vez de crear una categoría de área falsa.
+    _picker_area=x["AREA"].map(lambda v:norm(v).replace("_"," ").strip()).eq("picker")
+    x.loc[_picker_area,"AREA"]="No especificada"
     # Los reportes operativos pueden repetir la fila de encabezados dentro de
     # la hoja. Sin este filtro, "PICKER" termina sumándose como persona/área.
     _header_or_total=x["PICKER"].map(lambda v:norm(v).replace("_"," ").strip() in {
