@@ -1,66 +1,20 @@
-"""Miniaplicación móvil de auditoría para supervisores; acceso por código, sin correo."""
-import time
+"""Miniaplicación móvil de auditoría; acceso abierto sin correo ni código."""
 import uuid
 
 import streamlit as st
 
-from mobile_audit_backend import (
-    MobileAuditDB, MobileAuditError, supervisor_pin_valid,
-)
+from mobile_audit_backend import MobileAuditDB, MobileAuditError
 
 st.set_page_config(page_title="Validación Coyoacán", page_icon="📱", layout="centered")
 st.title("📱 Validación Coyoacán")
-st.caption("Auditoría rápida desde el teléfono · acceso de supervisor")
+st.caption("Revisa pedidos y registra auditorías o diferencias desde el teléfono.")
 
-configured_pin = str(st.secrets.get("MOBILE_AUDIT_SUPERVISOR_PIN", "")).strip()
-if len(configured_pin) < 8:
-    st.error("Falta configurar un código privado de supervisor (mínimo 8 caracteres) en Secrets de Streamlit.")
-    st.info("Agrega MOBILE_AUDIT_SUPERVISOR_PIN en Settings → Secrets. No lo publiques en GitHub ni lo compartas en el chat.")
-    st.stop()
-
-# Mantiene abierta la sesión hasta 12 horas; el código nunca se guarda en la sesión.
-authenticated = bool(st.session_state.get("mobile_supervisor_authenticated", False))
-auth_time = float(st.session_state.get("mobile_supervisor_auth_time", 0) or 0)
-if authenticated and time.time() - auth_time > 12 * 60 * 60:
-    st.session_state.pop("mobile_supervisor_authenticated", None)
-    st.session_state.pop("mobile_supervisor_name", None)
-    st.session_state.pop("mobile_supervisor_auth_time", None)
-    authenticated = False
-
-if not authenticated:
-    st.info("Ingresa tu nombre y el código privado de supervisor para abrir la cola de auditorías.")
-    attempts = int(st.session_state.get("mobile_supervisor_pin_attempts", 0))
-    if attempts >= 5:
-        st.error("Se alcanzó el límite de intentos en esta sesión. Cierra y vuelve a abrir la app para intentarlo de nuevo.")
-        st.stop()
-    with st.form("mobile_supervisor_login"):
-        supervisor_name = st.text_input("Nombre del supervisor", max_chars=100)
-        entered_pin = st.text_input("Código de acceso", type="password", max_chars=100)
-        login_submitted = st.form_submit_button("Entrar a auditorías", type="primary", use_container_width=True)
-    if login_submitted:
-        if supervisor_name.strip() and supervisor_pin_valid(entered_pin, configured_pin):
-            st.session_state["mobile_supervisor_authenticated"] = True
-            st.session_state["mobile_supervisor_name"] = supervisor_name.strip()
-            st.session_state["mobile_supervisor_auth_time"] = time.time()
-            st.session_state["mobile_supervisor_pin_attempts"] = 0
-            st.rerun()
-        else:
-            st.session_state["mobile_supervisor_pin_attempts"] = attempts + 1
-            st.error("Revisa el nombre y el código e intenta de nuevo.")
-    st.stop()
-
-supervisor_name = str(st.session_state.get("mobile_supervisor_name", "")).strip()
-with st.sidebar:
-    st.caption(f"Supervisor: {supervisor_name}")
-    if st.button("Cerrar sesión", use_container_width=True):
-        for key in (
-            "mobile_supervisor_authenticated",
-            "mobile_supervisor_name",
-            "mobile_supervisor_auth_time",
-            "mobile_supervisor_pin_attempts",
-        ):
-            st.session_state.pop(key, None)
-        st.rerun()
+supervisor_name = st.text_input(
+    "Nombre de quien audita",
+    max_chars=100,
+    key="mobile_reviewer_name",
+)
+st.caption("Escribe tu nombre para que quede registrado en cada revisión.")
 
 try:
     db = MobileAuditDB(
@@ -179,7 +133,9 @@ else:
         submitted = st.form_submit_button("Guardar revisión", type="primary", use_container_width=True)
 
     if submitted:
-        if result != "No se pudo validar" and not confirmed:
+        if not supervisor_name.strip():
+            st.error("Escribe el nombre de quien realiza la auditoría.")
+        elif result != "No se pudo validar" and not confirmed:
             st.error("Confirma que revisaste todos los artículos antes de validar.")
         elif result == "No se pudo validar" and not notes.strip():
             st.error("Describe el motivo para poder registrar el intento.")
