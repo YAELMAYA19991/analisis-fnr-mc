@@ -1684,6 +1684,47 @@ def template_roster_from_upload(data):
             if _header_idx is None:
                 raise ValueError("La hoja Outbound OKI no tiene los encabezados PUESTO, TURNO, NOMBRE, CARGO y CORREO.")
             _rows=[]
+            def _shift_label(value):
+                _key=norm(value)
+                return {
+                    "manana":"Mañana","matutino":"Mañana",
+                    "intermedio":"Intermedio","tarde":"Tarde",
+                    "noche":"Nocturno","nocturno":"Nocturno","mixto":"Mixto",
+                }.get(_key,str(value or "").strip())
+
+            # La misma pestaña incluye arriba el bloque TURNOS LÍDERES.
+            # Incorporar sus personas nombradas, sin vacantes, usando USUARIO como correo.
+            _leader_header_idx=None
+            _leader_header_map={}
+            _leader_required={"puesto","turno","nombre","cargo","usuario"}
+            for _i in range(0,_header_idx):
+                _candidate={norm(v):j for j,v in enumerate(_raw.iloc[_i].tolist()) if pd.notna(v) and str(v).strip()}
+                if _leader_required.issubset(_candidate):
+                    _leader_header_idx=_i
+                    _leader_header_map=_candidate
+                    break
+            if _leader_header_idx is not None:
+                for _i in range(_leader_header_idx+1,_header_idx):
+                    def _leader_value(_field):
+                        _v=_raw.iat[_i,_leader_header_map[_field]]
+                        return "" if pd.isna(_v) else str(_v).strip()
+                    _nombre=_leader_value("nombre")
+                    if not _nombre or norm(_nombre) in {"vacante","nombre","nan","none"}:
+                        continue
+                    _role=_leader_value("cargo") or _leader_value("puesto")
+                    _role_key=norm(_role).replace("_","")
+                    _role_label={"supervisor":"Supervisor","sup":"Supervisor","subgerente":"Subgerente","jefe":"Jefe"}.get(_role_key)
+                    if not _role_label:
+                        continue
+                    _rows.append({
+                        "PICKER":_nombre,
+                        "TURNO_MAESTRO":_shift_label(_leader_value("turno")),
+                        "CORREO":_leader_value("usuario"),
+                        "SUPERVISOR":"",
+                        "AREA_MAESTRO":"Outbound OKI",
+                        "PERSONAL_TIPO":_role_label,
+                        "ESTADO_PLANTILLA":"",
+                    })
             for _i in range(_header_idx+1,len(_raw)):
                 def _value(_field):
                     _v=_raw.iat[_i,_header_map[_field]]
@@ -1699,12 +1740,9 @@ def template_roster_from_upload(data):
                 _nombre=_value("nombre")
                 if not _nombre or norm(_nombre) in {"nombre","nan","none"}:
                     continue
-                _turno=_value("turno")
-                _turno_key=norm(_turno)
-                _turno={"manana":"Mañana","intermedio":"Intermedio","tarde":"Tarde","noche":"Nocturno"}.get(_turno_key,_turno)
                 _rows.append({
                     "PICKER":_nombre,
-                    "TURNO_MAESTRO":_turno,
+                    "TURNO_MAESTRO":_shift_label(_value("turno")),
                     "CORREO":_value("correo"),
                     "SUPERVISOR":"",
                     "AREA_MAESTRO":"Outbound OKI",
@@ -3490,7 +3528,8 @@ def _context_identity_view(roster,base=None,fnr=None,mc=None):
                   | r["AREA_BASE"].map(lambda v:"layout" in re.sub(r"[^a-z0-9]", "", norm(v))))
     r.loc[_layout_mask,"PERSONAL_TIPO"]="Layout"
     r.loc[r["PERSONAL_TIPO"].eq(""),"PERSONAL_TIPO"]="Picker"
-    r["CATEGORIA"]="Picker"
+    _leader_role_mask=r["PERSONAL_TIPO"].map(norm).isin({"supervisor","subgerente","jefe"})
+    r["CATEGORIA"]=np.where(_leader_role_mask,"Supervisor","Picker")
     r["_CONTEXT_KEY"]=r["CORREO_KEY"].map(lambda z:"correo:"+str(z))
     r=r[r["CORREO_KEY"].ne("")].copy()
     extra=[]
@@ -4720,6 +4759,22 @@ if _tab_active(g):
         ctx,_,_,_=global_context(context_identity)
         st.subheader("👥 Supervisores")
         st.caption("Vista operativa bajo el mismo contexto global. Los supervisores registrados por correo se excluyen automáticamente de incidencias y filtros de pickers.")
+        _leaders=pd.DataFrame()
+        if isinstance(roster,pd.DataFrame) and not roster.empty and "PERSONAL_TIPO" in roster.columns:
+            _leader_mask=roster["PERSONAL_TIPO"].fillna("").astype(str).map(norm).isin({"supervisor","subgerente","jefe"})
+            _leaders=roster.loc[_leader_mask].copy()
+        st.markdown("#### Líderes de Outbound OKI · plantilla")
+        if not _leaders.empty:
+            _leader_columns=[c for c in ["PICKER","PERSONAL_TIPO","TURNO_MAESTRO","CORREO","AREA_MAESTRO"] if c in _leaders.columns]
+            st.dataframe(
+                _leaders[_leader_columns].rename(columns={
+                    "PICKER":"Nombre","PERSONAL_TIPO":"Cargo","TURNO_MAESTRO":"Turno",
+                    "CORREO":"Correo","AREA_MAESTRO":"Área",
+                }),
+                use_container_width=True,hide_index=True,
+            )
+        else:
+            st.info("La plantilla actual no contiene personas con cargo Supervisor, Subgerente o Jefe.")
         with st.expander("➕ Dar de alta supervisor",expanded=False):
             with st.form("alta_supervisor_form",clear_on_submit=True):
                 sc1,sc2=st.columns(2)
