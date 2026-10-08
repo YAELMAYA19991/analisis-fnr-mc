@@ -25,7 +25,16 @@ class MobileAuditError(RuntimeError):
 
 def email_from_source(value):
     match = EMAIL_PATTERN.search(str(value or ""))
-    return match.group(0).lower() if match else ""
+    if not match:
+        return ""
+    email = match.group(0).lower()
+    local, domain = email.rsplit("@", 1)
+    # En la plantilla algunos correos vienen precedidos por el código de
+    # empleado (por ejemplo, JT1181700.nombre.apellido@justo.mx). La app
+    # operativa ya trata ese prefijo como metadato y lo elimina para cruzar
+    # la identidad con el correo real de los pedidos.
+    local = re.sub(r"^(?:jt)?\\d+[._-]+", "", local)
+    return f"{local}@{domain}"
 
 
 def verified_identity(user):
