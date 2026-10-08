@@ -3,7 +3,9 @@ import uuid
 
 import streamlit as st
 
-from mobile_audit_backend import MobileAuditDB, MobileAuditError
+from mobile_audit_backend import (
+    MobileAuditDB, MobileAuditError, SUPABASE_PUBLIC_URL, SUPABASE_PUBLISHABLE_KEY,
+)
 
 st.set_page_config(page_title="Validación Coyoacán", page_icon="📱", layout="centered")
 st.title("📱 Validación Coyoacán")
@@ -17,14 +19,11 @@ supervisor_name = st.text_input(
 st.caption("Escribe tu nombre para que quede registrado en cada revisión.")
 
 try:
-    db = MobileAuditDB(
-        st.secrets.get("SUPABASE_URL", ""),
-        st.secrets.get("SUPABASE_SECRET_KEY") or st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", ""),
-    )
+    db = MobileAuditDB(SUPABASE_PUBLIC_URL, SUPABASE_PUBLISHABLE_KEY)
     assignments = db.all_assignments()
 except MobileAuditError as exc:
     st.error(str(exc))
-    st.info("Revisa las credenciales privadas de Supabase y que exista la migración de auditoría móvil.")
+    st.info("Revisa la conexión pública de auditoría móvil y que exista la migración correspondiente.")
     st.stop()
 
 pending = [a for a in assignments if a.get("status") == "pendiente"]
@@ -74,11 +73,8 @@ else:
     )
 
     all_items = order.get("items") or []
-    items = (
-        [item for item in all_items if item.get("picker_email") == assignment.get("assignee_email")]
-        if mode == "autoverificacion"
-        else all_items
-    )
+    # El RPC público ya filtra autoverificaciones y omite correos internos.
+    items = all_items
     if not items:
         st.error("No hay artículos vinculados a esta asignación. Revisa el pedido antes de continuar.")
         st.stop()
