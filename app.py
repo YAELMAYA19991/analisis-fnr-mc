@@ -1348,7 +1348,8 @@ def parse_base(df):
         if extract_email_address(value):
             return False
         label=norm(value).replace("_"," ").strip()
-        return label in {"", "total", "total general", "gran total", "grand total", "sin registrar", "picker"}
+        return (label in {"", "total", "total general", "gran total", "grand total", "sin registrar", "picker"}
+                or label.startswith("filtros aplicados") or label.startswith("filtros"))
     x=x.loc[~x["PICKER"].map(_is_non_person_row)].copy()
     x["_KEY"]=x["PICKER"].map(person_key)
     x["_TOKEN_KEY"]=x["PICKER"].map(token_key)
@@ -2034,6 +2035,12 @@ def summary(base,fnr,mc):
         q["PICKER"]=q.get("PICKER",pd.Series("Sin registrar",index=q.index)).fillna("").astype(str).str.strip()
         q.loc[q["PICKER"].eq(""),"PICKER"]="Sin registrar"
         q["CORREO"]=q.get("CORREO",pd.Series("",index=q.index)).fillna("").astype(str).str.strip()
+        # Una incidencia sin nombre/correo real debe conservarse en su fuente,
+        # pero no inventarse como una persona dentro del detalle por picker.
+        _label=q["PICKER"].map(lambda v:norm(v).replace("_"," ").strip())
+        _email_present=q["CORREO"].map(lambda v:bool(extract_email_address(v)))
+        _placeholder=_label.isin({"sin registrar","picker","total","total general","gran total","grand total"}) | _label.str.startswith("filtros aplicados")
+        q=q.loc[~(_placeholder & ~_email_present)].copy()
         q["CORREO_KEY"]=q["CORREO"].map(email_key)
         q["_PERSON_KEY"]=q.apply(person_context_key,axis=1)
         return q
