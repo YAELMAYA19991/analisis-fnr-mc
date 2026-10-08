@@ -4056,7 +4056,10 @@ if _tab_active(a):
         st.caption(f"Semáforo por picker: FNR verde < {FNR_OBJ*.8:.2f}%, amarillo {FNR_OBJ*.8:.2f}–<{FNR_OBJ:.2f}%, rojo ≥ {FNR_OBJ:.2f}% · MC verde < {MC_OBJ*.8:.2f}%, amarillo {MC_OBJ*.8:.2f}–<{MC_OBJ:.2f}%, rojo ≥ {MC_OBJ:.2f}%.")
         st.caption("En la tabla, FNR_% y MC_% significan incidencias divididas entre líneas × 100; el indicador mensual usa pedidos.")
         st.subheader("Detalle por picker")
-        st.dataframe(_style_severity(s_bodega,{"FNR_%":(FNR_OBJ*.8,FNR_OBJ),"MC_%":(MC_OBJ*.8,MC_OBJ)}),use_container_width=True,hide_index=True)
+        _picker_detail_view=s_bodega[s_bodega.get("CATEGORIA",pd.Series("Picker",index=s_bodega.index)).astype(str).eq("Picker")].copy()
+        st.dataframe(_style_severity(_picker_detail_view,{"FNR_%":(FNR_OBJ*.8,FNR_OBJ),"MC_%":(MC_OBJ*.8,MC_OBJ)}),use_container_width=True,hide_index=True)
+        if _unregistered_count:
+            st.caption(f"{_unregistered_count} registros sin coincidencia con el master se conservan en Herramientas para su revisión; no se mezclan con el detalle de pickers identificados.")
 
         st.divider()
         st.subheader("🏷️ Artículos")
