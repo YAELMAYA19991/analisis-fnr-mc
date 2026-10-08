@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import re
 import unicodedata
@@ -45,6 +46,13 @@ def email_set(raw):
 
 def admin_allowed(email, configured):
     return bool(email) and email in email_set(configured)
+
+
+def supervisor_pin_valid(entered, configured):
+    """Compara el código privado sin exponerlo ni usar correo para iniciar sesión."""
+    candidate = str(entered or "")
+    expected = str(configured or "")
+    return len(expected) >= 8 and hmac.compare_digest(candidate, expected)
 
 
 def domain_allowed(email, configured):
@@ -200,6 +208,17 @@ class MobileAuditDB:
             },
         )
 
+    def all_assignments(self):
+        """La pantalla de supervisor PIN necesita cargar la cola sin pedir correo."""
+        return self.request(
+            "GET", "mobile_audit_assignments",
+            params={
+                "select": "id,assignee_email,mode,status,last_result,order_id,mobile_audit_orders(pedido,slot,items,picker_labels)",
+                "order": "created_at.desc",
+                "limit": "500",
+            },
+        )
+
     def assignments_for_order(self, order_key):
         return self.request(
             "GET", "mobile_audit_assignments",
@@ -229,6 +248,22 @@ class MobileAuditDB:
             payload={
                 "p_assignment_id": assignment_id,
                 "p_reviewer_email": email,
+                "p_result": result,
+                "p_notes": str(notes or "").strip(),
+                "p_differences": differences,
+                "p_checked_items": int(checked_items),
+                "p_idempotency_key": nonce,
+            },
+        )
+
+
+    def submit_supervisor(self, assignment_id, reviewer_name, result, notes, differences, checked_items, nonce):
+        """Registra revisión móvil con nombre del supervisor y sin identidad de correo."""
+        return self.request(
+            "POST", "rpc/submit_mobile_audit_review_supervisor",
+            payload={
+                "p_assignment_id": assignment_id,
+                "p_reviewer_name": str(reviewer_name or "").strip(),
                 "p_result": result,
                 "p_notes": str(notes or "").strip(),
                 "p_differences": differences,
