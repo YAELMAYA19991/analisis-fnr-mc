@@ -10,6 +10,11 @@ class MobileAuditTests(unittest.TestCase):
         self.assertEqual(m.verified_identity({**user,"email_verified":False}),"")
         self.assertEqual(m.verified_identity({**user,"is_logged_in":False}),"")
 
+    def test_supervisor_pin_validates_without_email(self):
+        self.assertTrue(m.supervisor_pin_valid("pin-de-prueba", "pin-de-prueba"))
+        self.assertFalse(m.supervisor_pin_valid("incorrecto", "pin-de-prueba"))
+        self.assertFalse(m.supervisor_pin_valid("123", "123"))
+
     def test_domain_must_be_configured(self):
         self.assertFalse(m.domain_allowed("picker@example.com",""))
         self.assertTrue(m.domain_allowed("picker@example.com","example.com"))
