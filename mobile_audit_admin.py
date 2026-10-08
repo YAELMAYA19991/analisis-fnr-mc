@@ -1,12 +1,12 @@
-"""Panel protegido de asignaciones móviles incrustado en Auditoría de pedidos."""
+"""Panel público para enviar pedidos a la cola de auditoría móvil."""
 import hashlib
 
 import streamlit as st
 
 from mobile_audit_backend import (
-    MobileAuditDB, MobileAuditError, admin_allowed, available_people, domain_allowed,
-    email_from_source, normalized_name, order_id, order_items, owners_for_lines,
-    validated_assignment, verified_identity,
+    MobileAuditDB, MobileAuditError, SUPABASE_PUBLIC_URL, SUPABASE_PUBLISHABLE_KEY,
+    available_people, domain_allowed, email_from_source, normalized_name,
+    order_id, order_items, owners_for_lines, validated_assignment,
 )
 
 
@@ -33,31 +33,8 @@ def _items_with_owner_email(lines, people):
 def render_mobile_assignment(pedido, slot, row, lines, roster, summary, raw_upload, fnr_count=0, mc_count=0):
     """Nadie sin OIDC + lista explícita de administradores puede asignar ni ver revisiones."""
     st.caption("Asigna autoverificaciones y auditorías cruzadas sin modificar el Excel original.")
-    if "auth" not in st.secrets:
-        st.info("Para habilitar las asignaciones, configura el inicio de sesión [auth] de esta aplicación.")
-        return
-    if not st.secrets.get("MOBILE_AUDIT_ADMIN_EMAILS"):
-        st.info("Configura MOBILE_AUDIT_ADMIN_EMAILS con los correos autorizados para asignar pedidos.")
-        return
-    if not st.secrets.get("MOBILE_AUDIT_ALLOWED_DOMAINS"):
-        st.info("Configura MOBILE_AUDIT_ALLOWED_DOMAINS para limitar el acceso a correos corporativos.")
-        return
-    if not st.user.is_logged_in:
-        if st.button("Iniciar sesión como supervisor",key="mobile_manager_signin"):
-            st.login()
-        return
-
-    user=dict(st.user)
-    user["is_logged_in"]=st.user.is_logged_in
-    supervisor=verified_identity(user)
-    if not admin_allowed(supervisor,st.secrets.get("MOBILE_AUDIT_ADMIN_EMAILS","")):
-        st.error("Esta cuenta no está autorizada para asignar pedidos.")
-        return
-
-    people = _staff_emails(
-        available_people(roster,summary),
-        st.secrets.get("MOBILE_AUDIT_ALLOWED_DOMAINS",""),
-    )
+    st.caption("La publicación crea una copia en auditoría móvil; no cambia el pedido original.")
+    people = _staff_emails(available_people(roster,summary), "justo.mx")
     owners,unknown = owners_for_lines(lines,people)
     if unknown or not owners:
         st.warning(
@@ -68,10 +45,7 @@ def render_mobile_assignment(pedido, slot, row, lines, roster, summary, raw_uplo
         return
 
     try:
-        db=MobileAuditDB(
-            st.secrets.get("SUPABASE_URL",""),
-            st.secrets.get("SUPABASE_SECRET_KEY") or st.secrets.get("SUPABASE_SERVICE_ROLE_KEY",""),
-        )
+        db=MobileAuditDB(SUPABASE_PUBLIC_URL, SUPABASE_PUBLISHABLE_KEY)
     except MobileAuditError as exc:
         st.error(str(exc))
         return
@@ -90,7 +64,7 @@ def render_mobile_assignment(pedido, slot, row, lines, roster, summary, raw_uplo
     )
     candidates = (
         owners if kind=="autoverificacion"
-        else sorted(set(people)-set(owners))
+        else ["auditoria-publica@coyoacan.invalid"]
     )
     if not candidates:
         st.info("No hay personal elegible para este tipo de revisión.")
@@ -98,10 +72,13 @@ def render_mobile_assignment(pedido, slot, row, lines, roster, summary, raw_uplo
         assignee=st.selectbox(
             "Responsable",
             candidates,
-            format_func=lambda mail:f"{people[mail]['name']} · {mail}",
+            format_func=lambda mail: (
+                f"{people[mail]['name']} · {mail}"
+                if mail in people else "Supervisión abierta"
+            ),
             key="mobile_assignee_"+key+"_"+kind,
         )
-        if st.button("Asignar pedido al celular",type="primary",key="mobile_assign_submit_"+key+"_"+kind):
+        if st.button("Publicar y enviar al celular",type="primary",key="mobile_assign_submit_"+key+"_"+kind):
             try:
                 validated_assignment(kind,assignee,owners)
                 payload={
@@ -112,19 +89,10 @@ def render_mobile_assignment(pedido, slot, row, lines, roster, summary, raw_uplo
                     "owner_emails":owners,
                     "picker_labels":str(row.get("Pickers asignados","")),
                     "items":_items_with_owner_email(lines,people),
-                    "published_by_email":supervisor,
+                    "published_by_email":"acceso-publico",
                 }
-                db.publish(payload)
-                assigned=db.assign({
-                    "order_id":key,
-                    "mode":kind,
-                    "assignee_email":assignee,
-                    "assigned_by_email":supervisor,
-                })
-                if assigned:
-                    st.success(f"Pedido #{pedido} asignado a {assignee}.")
-                else:
-                    st.info("Esta asignación ya existía; no se creó un duplicado.")
+                db.publish_and_assign_public(payload,kind,assignee)
+                st.success(f"Pedido #{pedido} listo en la cola móvil. No se crean duplicados.")
             except (MobileAuditError,ValueError) as exc:
                 st.error(str(exc))
 
@@ -133,7 +101,7 @@ def render_mobile_assignment(pedido, slot, row, lines, roster, summary, raw_uplo
             rows=db.assignments_for_order(key)
             if rows:
                 st.dataframe([{
-                    "Responsable":rec.get("assignee_email",""),
+                    "Responsable":"Picker asignado" if rec.get("mode")=="autoverificacion" else "Supervisión abierta",
                     "Tipo":"Propio" if rec.get("mode")=="autoverificacion" else "Cruzada",
                     "Estado":"Validado" if rec.get("status")=="validado" else "Pendiente",
                     "Resultado":rec.get("last_result",""),
@@ -145,7 +113,7 @@ def render_mobile_assignment(pedido, slot, row, lines, roster, summary, raw_uplo
                         "Una coincidencia requiere investigación y no determina la causa."
                     )
                     st.dataframe([{
-                        "Revisó":rec.get("reviewer_email",""),
+                        "Revisó":rec.get("reviewer_name",""),
                         "Tipo":"Propio" if rec.get("mode")=="autoverificacion" else "Cruzada",
                         "Resultado":rec.get("result",""),
                         "Artículos con diferencia":len(rec.get("differences",[]) or []),
