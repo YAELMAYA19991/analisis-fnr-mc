@@ -50,12 +50,6 @@ st.caption(
 
 if not visible:
     st.success("No hay pedidos pendientes de este tipo.")
-    st.caption("Para cargar pedidos en esta cola, abre el panel FNR–MC, entra a «Auditoría de pedidos» y publica el pedido desde su detalle.")
-    st.link_button(
-        "Abrir panel para enviar pedidos",
-        "https://fnr-mc-coyoacan.streamlit.app",
-        use_container_width=True,
-    )
 else:
     def order_label(assignment_id):
         assignment = next((row for row in visible if row.get("id") == assignment_id), {})
