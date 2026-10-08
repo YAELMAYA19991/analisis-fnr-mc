@@ -190,6 +190,17 @@ class MobileAuditDB:
             prefer="resolution=ignore-duplicates,return=representation",
         )
 
+    def publish_and_assign_public(self, order, mode, assignee_email):
+        """Publica una copia para auditoría y crea la asignación sin tocar el pedido original."""
+        return self.request(
+            "POST", "rpc/publish_mobile_audit_order_public",
+            payload={
+                "p_order": order,
+                "p_mode": mode,
+                "p_assignee_email": assignee_email,
+            },
+        )
+
     def assign(self, assignment):
         return self.request(
             "POST", "mobile_audit_assignments",
@@ -216,24 +227,14 @@ class MobileAuditDB:
         return self.request("POST", "rpc/list_mobile_audit_assignments_public", payload={})
 
     def assignments_for_order(self, order_key):
-        return self.request(
-            "GET", "mobile_audit_assignments",
-            params={
-                "select": "id,assignee_email,mode,status,last_result,updated_at",
-                "order_id": "eq." + order_key,
-                "order": "created_at.desc",
-            },
-        )
+        """Filtra la cola pública saneada por el ID del pedido."""
+        return [row for row in self.all_assignments() if row.get("order_id") == order_key]
 
     def reviews_for_order(self, order_key):
+        """Consulta historial sin correo de auditor, por RPC público limitado."""
         return self.request(
-            "GET", "mobile_audit_reviews",
-            params={
-                "select": "reviewer_email,reviewer_name,mode,result,notes,differences,created_at",
-                "order_id": "eq." + order_key,
-                "order": "created_at.desc",
-                "limit": "100",
-            },
+            "POST", "rpc/list_mobile_audit_reviews_public",
+            payload={"p_order_id": order_key},
         )
 
     def submit(self, assignment_id, email, result, notes, differences, checked_items, nonce):
