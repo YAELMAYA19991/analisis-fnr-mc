@@ -1348,7 +1348,7 @@ def parse_base(df):
         if extract_email_address(value):
             return False
         label=norm(value).replace("_"," ").strip()
-        return label in {"", "total", "total general", "gran total", "grand total", "sin registrar"}
+        return label in {"", "total", "total general", "gran total", "grand total", "sin registrar", "picker"}
     x=x.loc[~x["PICKER"].map(_is_non_person_row)].copy()
     x["_KEY"]=x["PICKER"].map(person_key)
     x["_TOKEN_KEY"]=x["PICKER"].map(token_key)
@@ -1909,6 +1909,12 @@ def parse_inc(df,tipo):
         "FECHA":df[fe] if fe else "",
         "INCIDENCIAS":pd.to_numeric(df[qty],errors="coerce").fillna(1) if qty else 1,
         "TIPO":tipo})
+    # Los reportes operativos pueden repetir la fila de encabezados dentro de
+    # la hoja. Sin este filtro, "PICKER" termina sumándose como persona/área.
+    _header_or_total=x["PICKER"].map(lambda v:norm(v).replace("_"," ").strip() in {
+        "picker", "picker nombre", "total", "total general", "gran total", "grand total"
+    })
+    x=x.loc[~_header_or_total].copy()
     x["INCIDENCIAS"]=x["INCIDENCIAS"].where(x["INCIDENCIAS"]>0,1)
     return x
 
