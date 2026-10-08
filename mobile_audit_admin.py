@@ -31,7 +31,7 @@ def _items_with_owner_email(lines, people):
 
 
 def render_mobile_assignment(pedido, slot, row, lines, roster, summary, raw_upload, fnr_count=0, mc_count=0):
-    """Nadie sin OIDC + lista explícita de administradores puede asignar ni ver revisiones."""
+    """Publica y consulta copias de auditoría sin modificar los pedidos originales."""
     st.caption("Asigna autoverificaciones y auditorías cruzadas sin modificar el Excel original.")
     st.caption("La publicación crea una copia en auditoría móvil; no cambia el pedido original.")
     people = _staff_emails(available_people(roster,summary), "justo.mx")
@@ -52,9 +52,7 @@ def render_mobile_assignment(pedido, slot, row, lines, roster, summary, raw_uplo
 
     batch=hashlib.sha256(raw_upload).hexdigest()
     key=order_id(batch,pedido)
-    st.caption("Picker(s) identificado(s): "+", ".join(
-        f"{people[email]['name']} ({email})" for email in owners
-    ))
+    st.caption("Picker(s) identificado(s): "+", ".join(people[email]["name"] for email in owners))
     kind=st.radio(
         "Tipo de revisión para asignar",
         ["autoverificacion","auditoria_cruzada"],
