@@ -233,7 +233,7 @@ class MobileAuditDB:
         return self.request(
             "GET", "mobile_audit_reviews",
             params={
-                "select": "reviewer_email,mode,result,notes,differences,created_at",
+                "select": "reviewer_email,reviewer_name,mode,result,notes,differences,created_at",
                 "order_id": "eq." + order_key,
                 "order": "created_at.desc",
                 "limit": "100",
