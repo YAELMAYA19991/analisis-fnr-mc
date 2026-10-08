@@ -166,6 +166,7 @@ def _attendance_roster_shift(value,config=None):
     if "inter" in folded: return "Intermedio"
     if "tarde" in folded: return "Tarde"
     if "noct" in folded: return "Nocturno"
+    if "mixto" in folded: return "Mixto"
     start=_attendance_start_hour(value)
     return _attendance_shift(start,config) if start else "Sin turno"
 def _attendance_person_key(identifier, lastname, firstname):
@@ -1674,7 +1675,7 @@ def canonicalize_incidents(inc,base):
     out.drop(columns=["_EMAIL_KEY"],errors="ignore",inplace=True)
     return out
 
-def template_roster_from_upload(data):
+def template_roster_from_upload(data, include_other_roles=False):
     """Construye la identidad desde la PLANTILLA CONSOLIDADA.
 
     CORREO_KEY es la llave única. La plantilla puede tener información
@@ -1752,14 +1753,17 @@ def template_roster_from_upload(data):
                     return "" if pd.isna(_v) else str(_v).strip()
                 _cargo=_value("cargo")
                 _cargo_key=norm(_cargo).replace("_","")
+                _nombre=_value("nombre")
+                _nombre_key=norm(_nombre).replace("_","")
+                if _nombre_key in {"", "nombre", "pickers", "layoutagregadores", "vacante", "nan", "none"} or _nombre_key.startswith(("total", "gran_total", "grand_total")):
+                    continue
                 if _cargo_key=="picker":
                     _tipo="Picker"
                 elif _cargo_key=="layout":
                     _tipo="Layout"
+                elif include_other_roles and _cargo.strip() and _value("turno").strip() and not _cargo_key.isdigit():
+                    _tipo=_cargo.strip().title()
                 else:
-                    continue
-                _nombre=_value("nombre")
-                if not _nombre or norm(_nombre) in {"nombre","nan","none"}:
                     continue
                 _rows.append({
                     "PICKER":_nombre,
@@ -4883,12 +4887,13 @@ if _tab_active(i):
 
         if attendance_absence_upload is not None and attendance_tardy_upload is not None:
             _abs_bytes=attendance_absence_upload.getvalue(); _late_bytes=attendance_tardy_upload.getvalue()
+            _attendance_roster=template_roster_from_upload(up.getvalue(),include_other_roles=True)
             _att_context=json.dumps({
                 "shift":store.get("attendance_shift_config",{}),
                 "roster":[
                     {"p":str(r.get("PICKER","")),"c":str(r.get("CORREO","")),"t":str(r.get("TURNO_MAESTRO","")),"s":str(r.get("SUPERVISOR","")),"a":str(r.get("AREA_MAESTRO",""))}
-                    for _,r in roster.iterrows()
-                ] if isinstance(roster,pd.DataFrame) else [],
+                    for _,r in _attendance_roster.iterrows()
+                ] if isinstance(_attendance_roster,pd.DataFrame) else [],
             },ensure_ascii=False,sort_keys=True).encode("utf-8")
             _fingerprint=hashlib.sha256(_abs_bytes+b"\0"+_late_bytes+b"\0"+_att_context).hexdigest()
             _old_meta=store.get("attendance_meta",{}) or {}
@@ -4897,7 +4902,7 @@ if _tab_active(i):
                     with st.spinner("Leyendo y cruzando los reportes…"):
                         _attendance_new=build_attendance_summary(
                             _abs_bytes,_late_bytes,attendance_absence_upload.name,attendance_tardy_upload.name,
-                            roster_rows=roster,shift_config=store.get("attendance_shift_config")
+                            roster_rows=_attendance_roster,shift_config=store.get("attendance_shift_config")
                         )
                     _attendance_new["fingerprint"]=_fingerprint
                     store["attendance_summary"]=_attendance_new
@@ -4952,7 +4957,7 @@ if _tab_active(i):
                     st.markdown("**Faltas por turno habitual**")
                     if not _absence_shift_df.empty:
                         st.dataframe(_absence_shift_df,use_container_width=True,hide_index=True)
-                    st.caption("El archivo de faltas no incluye turno. Se usa el turno más frecuente de retardos de cada persona; ‘Sin turno’ indica que no hubo coincidencia en el reporte de retardos.")
+                    st.caption("El archivo de faltas no incluye turno. Se usa primero el turno de Outbound OKI y, si falta, el turno más frecuente de retardos. ‘Sin turno’ indica que la persona no tiene turno en la plantilla ni un retardo que permita deducirlo.")
 
             _att_df=pd.DataFrame(attendance_people)
             def _attendance_app_link(name):
