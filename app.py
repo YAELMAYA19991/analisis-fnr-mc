@@ -1332,6 +1332,16 @@ def parse_base(df):
         "AREA_BASE":df[ar].fillna("").astype(str).str.strip() if ar else "No especificada",
         "CORREO":correo_values
     })
+    # Algunos reportes de operación incluyen filas de cierre dentro de la
+    # misma tabla (Total/Total general) y filas vacías rotuladas como
+    # "Sin registrar". No son personas: si pasan al resumen se muestran como
+    # pickers y duplican todas las líneas/pedidos del reporte.
+    def _is_non_person_row(value):
+        if extract_email_address(value):
+            return False
+        label=norm(value).replace("_"," ").strip()
+        return label in {"", "total", "total general", "gran total", "grand total", "sin registrar"}
+    x=x.loc[~x["PICKER"].map(_is_non_person_row)].copy()
     x["_KEY"]=x["PICKER"].map(person_key)
     x["_TOKEN_KEY"]=x["PICKER"].map(token_key)
     x["_CODE_KEY"]=x["CORREO"].map(extract_code)
