@@ -986,15 +986,14 @@ def save_store(store):
         if not same or field in missing_shards or not remote_same:
             changed_shards.append((field,payload,local_path))
 
-    if not cloud_enabled() and not changed_main and not changed_shards:
-        return
-
-    if changed_main:
-        _json_atomic_write(STORE_FILE,main_data)
-    for field,payload,local_path in changed_shards:
-        _json_atomic_write(local_path,store.get(field))
-
-    if cloud_enabled():
+    if not cloud_enabled():
+        if not changed_main and not changed_shards:
+            return
+        if changed_main:
+            _json_atomic_write(STORE_FILE,main_data)
+        for field,payload,local_path in changed_shards:
+            _json_atomic_write(local_path,store.get(field))
+    else:
         previous_backup=store.get("cloud_backup_at")
         backup_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         store["cloud_backup_at"]=backup_at
@@ -1008,7 +1007,16 @@ def save_store(store):
             if previous_backup is None: store.pop("cloud_backup_at",None)
             else: store["cloud_backup_at"]=previous_backup
             raise
-        _json_atomic_write(STORE_FILE,{k:v for k,v in store.items() if k not in STORE_SHARDS})
+        # La nube es la fuente persistente. En Streamlit Cloud el directorio
+        # local puede ser efímero o no permitir reemplazos; el espejo local es
+        # best-effort y nunca debe impedir guardar correctamente en Supabase.
+        try:
+            _json_atomic_write(STORE_FILE,{k:v for k,v in store.items() if k not in STORE_SHARDS})
+        except OSError:
+            pass
+        for field,(_,local_path,_) in STORE_SHARDS.items():
+            try: _json_atomic_write(local_path,store.get(field))
+            except OSError: pass
 
 def parse_powerbi_krs_excel(data, filename=""):
     """Extrae On Time, FNR y Mala Calidad de la hoja exportada desde Power BI."""
