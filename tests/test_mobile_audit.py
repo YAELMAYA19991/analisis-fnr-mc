@@ -4,6 +4,16 @@ import mobile_audit_backend as m
 
 
 class MobileAuditTests(unittest.TestCase):
+    def test_employee_code_prefix_is_removed_from_email(self):
+        self.assertEqual(
+            m.email_from_source("JT1181700.almayelli.gavia@justo.mx"),
+            "almayelli.gavia@justo.mx",
+        )
+        self.assertEqual(
+            m.email_from_source("1188342.aaron.lopez@justo.mx"),
+            "aaron.lopez@justo.mx",
+        )
+
     def test_verified_identity(self):
         user={"is_logged_in":True,"email_verified":True,"email":"picker@example.com"}
         self.assertEqual(m.verified_identity(user),"picker@example.com")
