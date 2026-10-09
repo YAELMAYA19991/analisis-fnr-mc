@@ -1976,7 +1976,7 @@ def attach(inc,base):
         "_REF_SUPERVISOR","_REF_CORREO","_REF_EXCLUDED",
     ],errors="ignore")
 
-@st.cache_data(show_spinner="Procesando los Excel por primera vez…",max_entries=2,ttl=1800)
+@st.cache_data(show_spinner="Procesando los Excel por primera vez…",max_entries=2,ttl=86400)
 def prepare_source_frames(base_data,fnr_data,mc_data,roster_data,personnel_config_json):
     """Procesa y cruza las fuentes una vez por versión de archivos/configuración."""
     config=json.loads(personnel_config_json)
@@ -2002,7 +2002,7 @@ def prepare_source_frames(base_data,fnr_data,mc_data,roster_data,personnel_confi
     fnr=_dedupe_columns(fnr); mc=_dedupe_columns(mc)
     return base,fnr,mc,roster
 
-@st.cache_data(show_spinner="Procesando histórico del mes anterior…",max_entries=4,ttl=1800)
+@st.cache_data(show_spinner="Procesando histórico del mes anterior…",max_entries=4,ttl=86400)
 def prepare_history_frames(base_data,fnr_data,mc_data,roster,personnel_config_json):
     """Procesa los mismos 3 Excel operativos de un periodo anterior.
 
@@ -2029,7 +2029,7 @@ def prepare_history_frames(base_data,fnr_data,mc_data,roster,personnel_config_js
     hist_mc["CORREO_KEY"]=hist_mc.get("CORREO",pd.Series("",index=hist_mc.index)).map(email_key)
     return _dedupe_columns(hist_base),_dedupe_columns(hist_fnr),_dedupe_columns(hist_mc)
 
-@st.cache_data(show_spinner=False,max_entries=8,ttl=1800)
+@st.cache_data(show_spinner=False,max_entries=8,ttl=86400)
 def summary(base,fnr,mc):
     """Resumen por identidad canónica: correo cuando existe, nombre solo como fallback."""
     def prepare(frame,is_incident=False):
@@ -3245,8 +3245,10 @@ store.setdefault("attendance_shift_config",{"Mañana":[6,7,8,9,10],"Intermedio":
 store.setdefault("order_audits", [])
 store.setdefault("monthly_history", {})
 store.setdefault("powerbi_krs_history", [])
-if normalize_saved_followup_categories(store):
-    save_store(store)
+if not st.session_state.get("_followup_categories_normalized"):
+    if normalize_saved_followup_categories(store):
+        save_store(store)
+    st.session_state["_followup_categories_normalized"] = True
 
 with st.sidebar:
     st.header("Control operativo")
@@ -3303,20 +3305,25 @@ with st.sidebar:
     if guardados:
         st.success("Archivos guardados: " + ", ".join(guardados))
     with st.expander("🗂️ Historial de archivos Excel",expanded=False):
-        _history=upload_history_rows()
-        if _history:
-            # Importación local defensiva: esta tabla es la línea señalada por
-            # Streamlit cuando una copia de app.py quedó sin el alias global.
-            import pandas as pd
-            st.dataframe(pd.DataFrame(_history),use_container_width=True,hide_index=True)
-            if st.button("Preparar ZIP de respaldo",key="prepare_excel_history_zip"):
-                with st.spinner("Preparando el respaldo de archivos…"):
-                    st.session_state["_excel_history_zip_ready"]=upload_history_zip()
-            if st.session_state.get("_excel_history_zip_ready"):
-                st.download_button("Descargar respaldo del historial (.zip)",st.session_state["_excel_history_zip_ready"],"Historial_Excel_FNR_MC.zip","application/zip",key="download_excel_history")
-            st.caption("El ZIP se prepara solo cuando solicitas el respaldo.")
+        if st.button("Consultar historial de Excel",key="consult_excel_history"):
+            st.session_state["_show_excel_history"] = True
+        if st.session_state.get("_show_excel_history"):
+            _history=upload_history_rows()
+            if _history:
+                # Importación local defensiva: esta tabla es la línea señalada por
+                # Streamlit cuando una copia de app.py quedó sin el alias global.
+                import pandas as pd
+                st.dataframe(pd.DataFrame(_history),use_container_width=True,hide_index=True)
+                if st.button("Preparar ZIP de respaldo",key="prepare_excel_history_zip"):
+                    with st.spinner("Preparando el respaldo de archivos…"):
+                        st.session_state["_excel_history_zip_ready"]=upload_history_zip()
+                if st.session_state.get("_excel_history_zip_ready"):
+                    st.download_button("Descargar respaldo del historial (.zip)",st.session_state["_excel_history_zip_ready"],"Historial_Excel_FNR_MC.zip","application/zip",key="download_excel_history")
+                st.caption("El ZIP se prepara solo cuando solicitas el respaldo.")
+            else:
+                st.info("Aún no hay versiones en el historial. Se registra una versión al cargar cada Excel.")
         else:
-            st.info("Aún no hay versiones en el historial. Se registra una versión al cargar cada Excel.")
+            st.caption("Consulta las versiones guardadas solo cuando necesites revisarlas.")
     st.caption("Los 3 Excel operativos se cruzan con la PLANTILLA CONSOLIDADA usando CORREO como llave principal. Si falta el correo, la app intenta una resolución conservadora por código/nombre y deja pendientes los casos ambiguos.")
     st.divider()
     periodo=st.text_input("Periodo",value=str(store.get("periodo",datetime.now().strftime("%Y-%m"))),key="periodo_persistente")
@@ -3461,15 +3468,20 @@ master_match=base.get("_MASTER_MATCH",pd.Series(False,index=base.index)).copy()
 base_display=base.drop(columns=["_MASTER_MATCH"],errors="ignore")
 s=s.drop(columns=["_MASTER_MATCH"],errors="ignore")
 # Registrar automáticamente pickers vistos en la operación solo si aparecen por primera vez.
-_picker_registry_changed=False
-for _idx,_row in base.iterrows():
-    _p=str(_row.get("PICKER","")).strip()
-    _src=str(_row.get("_SOURCE_PICKER","")).strip()
-    if not _p: continue
-    _before=set((store.get("pickers",{}) or {}).keys())
-    picker_record(store,_p,aliases=[_src] if _src else [])
-    if set((store.get("pickers",{}) or {}).keys())!=_before:
-        _picker_registry_changed=True
+_picker_registry_before=set((store.get("pickers",{}) or {}).keys())
+if not base.empty:
+    _picker_sources=base[[c for c in ["PICKER","_SOURCE_PICKER"] if c in base.columns]].copy()
+    if "PICKER" not in _picker_sources:
+        _picker_sources["PICKER"]=""
+    if "_SOURCE_PICKER" not in _picker_sources:
+        _picker_sources["_SOURCE_PICKER"]=""
+    _picker_sources=_picker_sources.fillna("").astype(str)
+    _picker_sources["PICKER"]=_picker_sources["PICKER"].str.strip()
+    _picker_sources["_SOURCE_PICKER"]=_picker_sources["_SOURCE_PICKER"].str.strip()
+    _picker_sources=_picker_sources[_picker_sources["PICKER"].ne("")].drop_duplicates()
+    for _p,_src in _picker_sources.itertuples(index=False,name=None):
+        picker_record(store,_p,aliases=[_src] if _src else [])
+_picker_registry_changed=set((store.get("pickers",{}) or {}).keys())!=_picker_registry_before
 if _picker_registry_changed:
     save_store(store)
 
