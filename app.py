@@ -2460,6 +2460,191 @@ def audit_record_is_complete(record):
     return bool(checked)
 
 
+def appsheet_bridge_settings():
+    """La conexión permanece apagada hasta configurar dos secretos en Streamlit."""
+    try:
+        url=str(st.secrets.get("APPSHEET_BRIDGE_URL","")).strip()
+        token=str(st.secrets.get("APPSHEET_BRIDGE_TOKEN","")).strip()
+    except Exception:
+        return "", ""
+    return url, token
+
+
+def appsheet_bridge_call(action, **payload):
+    """Llama el puente privado de Apps Script. El token solo viaja en el cuerpo POST."""
+    url,token=appsheet_bridge_settings()
+    if not url or not token:
+        raise RuntimeError("Conexión AppSheet sin configurar")
+    if not url.startswith("https://script.google.com/macros/s/") or not url.endswith("/exec"):
+        raise RuntimeError("La URL del puente de Google no es válida")
+    body=json.dumps({"token":token,"action":action,**payload},ensure_ascii=False,default=str).encode("utf-8")
+    request=urllib.request.Request(url,data=body,headers={"Content-Type":"application/json"},method="POST")
+    try:
+        with urllib.request.urlopen(request,timeout=35) as response:
+            result=json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"No se pudo consultar el puente AppSheet ({type(exc).__name__})") from exc
+    if not isinstance(result,dict) or not result.get("ok"):
+        raise RuntimeError(str(result.get("error","Respuesta inválida del puente AppSheet")) if isinstance(result,dict) else "Respuesta inválida del puente AppSheet")
+    return result
+
+
+def appsheet_rows_to_audits(tables, detail):
+    """Convierte las validaciones por artículo en el formato histórico de FNR/MC."""
+    if not isinstance(tables,dict):
+        return []
+    articles=tables.get("Articulos",[]) or []
+    validations=tables.get("Validaciones",[]) or []
+    by_article={str(row.get("ID_Articulo","")):row for row in articles if row.get("ID_Articulo")}
+    latest={}
+    for row in validations:
+        article_id=str(row.get("ID_Articulo","") or "")
+        if not article_id or article_id not in by_article:
+            continue
+        previous=latest.get(article_id)
+        if previous is None or str(row.get("Fecha_Validacion",""))>=str(previous.get("Fecha_Validacion","")):
+            latest[article_id]=row
+    detail=detail.copy() if isinstance(detail,pd.DataFrame) else pd.DataFrame()
+    out=[]
+    grouped={}
+    for article_id,validation in latest.items():
+        article=by_article[article_id]
+        order=str(article.get("ID_Pedido",validation.get("ID_Pedido","")) or "").strip()
+        if not order:
+            continue
+        grouped.setdefault(order,[]).append((article_id,article,validation))
+    for order,items in grouped.items():
+        local=detail[detail.get("Número de pedido",pd.Series(dtype=str)).astype(str).eq(order)] if not detail.empty and "Número de pedido" in detail else pd.DataFrame()
+        lines=[]
+        for article_id,article,validation in items:
+            try:
+                quantity=float(validation.get("Cantidad_Verificada",0) or 0)
+            except (TypeError,ValueError):
+                quantity=0.0
+            try:
+                ordered=float(article.get("Cantidad_Pedida",0) or 0)
+            except (TypeError,ValueError):
+                ordered=0.0
+            quality=str(validation.get("Calidad_Correcta","")).strip().casefold() in {"true","1","yes","si","sí","verdadero"}
+            checked=str(validation.get("Validado","")).strip().casefold() in {"true","1","yes","si","sí","verdadero"}
+            source=local[local.get("SKU",pd.Series(dtype=str)).astype(str).eq(str(article.get("SKU","")))] if not local.empty else pd.DataFrame()
+            line=source.iloc[0].to_dict() if not source.empty else {}
+            diff=(not quality) or abs(quantity-ordered)>0.000001
+            lines.append({
+                "SKU":str(article.get("SKU","")),"Artículo":str(article.get("Articulo","")),
+                "Picker relacionado":str(article.get("Picker",line.get("Picker relacionado",""))),
+                "Cantidad pedida":str(article.get("Cantidad_Pedida","")),
+                "Cantidad pickeada":str(article.get("Cantidad_Pickeada","")),
+                "Diferencia encontrada":bool(diff),
+                "Corrección / observación":str(validation.get("Observaciones","") or ("Calidad por revisar" if not quality else "")),
+                "_appsheet_validado":checked,
+            })
+        # Una orden queda cerrada en FNR/MC cuando todas sus líneas tienen la última
+        # validación marcada. Revalidar una línea puede volverla a dejar pendiente.
+        complete=bool(lines) and all(x["_appsheet_validado"] for x in lines)
+        fecha=max((str(v.get("Fecha_Validacion","")) for _,_,v in items),default="")
+        auditor=next((str(v.get("Auditor","")) for _,_,v in reversed(items) if v.get("Auditor")),"")
+        slot=str(items[0][1].get("ID_Pedido",order))
+        if not local.empty and "Slot" in local:
+            slot=str(local.iloc[0].get("Slot",""))
+        out.append({
+            "id":"appsheet-"+hashlib.sha256((order+"|"+fecha).encode()).hexdigest()[:18],
+            "pedido":order,"slot":slot,"fecha_auditoria":fecha,"auditor":auditor,
+            "resultado":"Con diferencias" if any(x["Diferencia encontrada"] for x in lines) else "Pedido correcto",
+            "pedido_validado":complete,"observaciones":"Validaciones por artículo recibidas desde AppSheet",
+            "diferencias":sum(1 for x in lines if x["Diferencia encontrada"]),"lineas":lines,
+            "fuente_archivo":"AppSheet","appsheet":True,
+        })
+    return out
+
+
+def appsheet_order_payload(detail, summary, existing_articles):
+    """Prepara la carga idempotente de pedidos y artículos por sus claves relacionadas."""
+    old={}
+    for row in existing_articles or []:
+        key=(str(row.get("ID_Pedido","")),str(row.get("SKU","")),str(row.get("Picker","")),str(row.get("Articulo","")))
+        old.setdefault(key,[]).append(str(row.get("ID_Articulo","")))
+    order_rows=[]
+    for _,row in summary.iterrows():
+        order=str(row.get("Número de pedido",""))
+        _score=pd.to_numeric(row.get("Puntaje alarma",0),errors="coerce")
+        order_rows.append({
+            "ID_Pedido":order,"Pedido":order,"Slot":str(row.get("Slot","")),
+            "Turno_Picker":str(row.get("Turno picker","Sin identificar")),
+            "Pickers":str(row.get("Pickers asignados","")),"Prioridad":str(row.get("Prioridad","")),
+            "Alarma":str(row.get("Alarma","")),"Puntaje_Alarma":int(_score) if pd.notna(_score) else 0,
+            "Factores":str(row.get("Factores","")),"Cobertura":str(row.get("Cobertura equipo","")),
+            "Fecha_Exportacion":datetime.now(ZoneInfo("America/Mexico_City")).isoformat(timespec="seconds"),
+        })
+    article_rows=[]
+    seen={}
+    for _,row in detail.iterrows():
+        order=str(row.get("Número de pedido","")); sku=str(row.get("SKU","")); picker=str(row.get("Picker relacionado","")); name=str(row.get("Artículo",""))
+        key=(order,sku,picker,name); occurrence=seen.get(key,0); seen[key]=occurrence+1
+        matches=old.get(key,[])
+        article_id=matches[occurrence] if occurrence<len(matches) else hashlib.sha256(("|".join(key)+"|"+str(occurrence)).encode()).hexdigest()[:20]
+        article_rows.append({
+            "ID_Articulo":article_id,"ID_Pedido":order,"SKU":sku,"Articulo":name,"Picker":picker,
+            "Cantidad_Pedida":str(row.get("Cantidad pedida","")),"Cantidad_Pickeada":str(row.get("Cantidad pickeada","")),
+        })
+    return {"Pedidos":order_rows,"Articulos":article_rows}
+
+
+def build_saved_order_audit_pdf(record):
+    """PDF final con resultado y revisión real guardada por pedido."""
+    out=io.BytesIO()
+    doc=SimpleDocTemplate(out,pagesize=landscape(A4),leftMargin=12*mm,rightMargin=12*mm,topMargin=11*mm,bottomMargin=11*mm,
+                          title=f"Auditoría {record.get('pedido','')}",author="Control FNR & Mala Calidad - Coyoacán")
+    styles=getSampleStyleSheet()
+    story=[Paragraph(f"Auditoría de pedido · {html.escape(str(record.get('pedido','')))}",styles["Title"]),
+           Paragraph(f"Fecha: {html.escape(str(record.get('fecha_auditoria','')))} &nbsp;|&nbsp; Auditor: {html.escape(str(record.get('auditor','')))} &nbsp;|&nbsp; Resultado: {html.escape(str(record.get('resultado','')))}",styles["BodyText"]),
+           Paragraph(f"Slot: {html.escape(str(record.get('slot','')))} &nbsp;|&nbsp; Picker(s): {html.escape(str(record.get('picker','')))} &nbsp;|&nbsp; Validado: {'Sí' if record.get('pedido_validado') else 'No'}",styles["BodyText"]),Spacer(1,5*mm)]
+    rows=[["SKU","Artículo","Picker","Pedida","Pickeada","Diferencia","Observación"]]
+    for line in record.get("lineas",[]) or []:
+        rows.append([str(line.get("SKU","")),str(line.get("Artículo","")),str(line.get("Picker relacionado","")),
+                     str(line.get("Cantidad pedida","")),str(line.get("Cantidad pickeada","")),
+                     "Sí" if line.get("Diferencia encontrada") else "No",str(line.get("Corrección / observación",""))])
+    table=Table(rows,colWidths=[25*mm,67*mm,40*mm,18*mm,20*mm,19*mm,68*mm],repeatRows=1)
+    table.setStyle(TableStyle([("GRID",(0,0),(-1,-1),.35,colors.HexColor("#c7c9ce")),
+                               ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#e9ecef")),
+                               ("VALIGN",(0,0),(-1,-1),"TOP"),
+                               ("FONTSIZE",(0,0),(-1,-1),7),
+                               ("LEFTPADDING",(0,0),(-1,-1),3),("RIGHTPADDING",(0,0),(-1,-1),3)]))
+    story.extend([table,Spacer(1,5*mm),Paragraph(f"Observaciones: {html.escape(str(record.get('observaciones','') or 'Sin observaciones'))}",styles["BodyText"]),
+                  Paragraph(f"Cruce histórico al auditar: FNR {int(record.get('fnr_al_guardar',0) or 0)} · MC {int(record.get('mc_al_guardar',0) or 0)}",styles["BodyText"])] )
+    doc.build(story)
+    return out.getvalue()
+
+
+def appsheet_publish_saved_audit(record):
+    """Guarda el resultado y el PDF del pedido en las tablas de AppSheet/Drive."""
+    tables=appsheet_bridge_call("read").get("data",{})
+    article_rows=tables.get("Articulos",[]) or []
+    lookup={}
+    for row in article_rows:
+        key=(str(row.get("ID_Pedido","")),str(row.get("SKU","")),str(row.get("Picker","")),str(row.get("Articulo","")))
+        lookup.setdefault(key,[]).append(str(row.get("ID_Articulo","")))
+    counts={}; differences=[]
+    for line in record.get("lineas",[]) or []:
+        key=(str(record.get("pedido","")),str(line.get("SKU","")),str(line.get("Picker relacionado","")),str(line.get("Artículo","")))
+        occurrence=counts.get(key,0); counts[key]=occurrence+1
+        ids=lookup.get(key,[])
+        if line.get("Diferencia encontrada") and occurrence<len(ids):
+            differences.append({
+                "ID_Diferencia":hashlib.sha256((str(record.get("id",""))+"|"+"|".join(key)+"|"+str(occurrence)).encode()).hexdigest()[:20],
+                "ID_Auditoria":str(record.get("id","")),"ID_Articulo":ids[occurrence],
+                "Diferencia_Encontrada":"Sí","Correccion":"","Observaciones":str(line.get("Corrección / observación","")),
+            })
+    audit={
+        "ID_Auditoria":str(record.get("id","")),"ID_Pedido":str(record.get("pedido","")),
+        "Auditor":str(record.get("auditor","")),"Fecha_Auditoria":str(record.get("fecha_auditoria","")),
+        "Validado":bool(record.get("pedido_validado")),"Resultado":str(record.get("resultado","")),
+        "Observaciones":str(record.get("observaciones","")),"Evidencia":"","PDF_Archivo":"",
+    }
+    pdf=build_saved_order_audit_pdf(record)
+    return appsheet_bridge_call("audit",audit=audit,Diferencias=differences,pdf_base64=__import__("base64").b64encode(pdf).decode("ascii"))
+
+
 def order_risk_analysis(audit_lines,picker_summary,fnr_inc,mc_inc,prior_audits=None):
     """Prioriza pedidos por coincidencias históricas concretas de picker y artículo.
 
@@ -4294,6 +4479,26 @@ if _tab_active(o):
                                 _risk_summary["Puntaje selección"]=_risk_summary["Puntaje alarma"]+_risk_summary["Picker nocturno"].astype(int)*2
 
                                 _saved_audits=store.get("order_audits",[]) or []
+                                _bridge_remote_audits=[]
+                                _bridge_url,_bridge_token=appsheet_bridge_settings()
+                                if _bridge_url and _bridge_token:
+                                    try:
+                                        _bridge_tables=appsheet_bridge_call("read").get("data",{})
+                                        _bridge_payload=appsheet_order_payload(_audit_detail,_risk_summary,_bridge_tables.get("Articulos",[]))
+                                        _bridge_fingerprint=hashlib.sha256(json.dumps(
+                                            {"Pedidos":[{k:v for k,v in row.items() if k!="Fecha_Exportacion"} for row in _bridge_payload["Pedidos"]],
+                                             "Articulos":_bridge_payload["Articulos"]},sort_keys=True,ensure_ascii=False,default=str
+                                        ).encode()).hexdigest()
+                                        if st.session_state.get("_appsheet_last_publish")!=_bridge_fingerprint:
+                                            appsheet_bridge_call("publish",**_bridge_payload)
+                                            st.session_state["_appsheet_last_publish"]=_bridge_fingerprint
+                                            st.success(f"AppSheet recibió {len(_bridge_payload['Pedidos']):,} pedidos y {len(_bridge_payload['Articulos']):,} artículos.")
+                                        _bridge_remote_audits=appsheet_rows_to_audits(_bridge_tables,_audit_detail)
+                                    except Exception as _bridge_error:
+                                        st.warning(f"No pude sincronizar con AppSheet: {_bridge_error}")
+                                else:
+                                    st.caption("AppSheet: integración preparada; falta habilitar la conexión segura para sincronizar cargas y validaciones.")
+                                _saved_audits=list(_saved_audits)+[a for a in _bridge_remote_audits if a.get("id") not in {x.get("id") for x in _saved_audits}]
                                 _audited_orders={
                                     norm(a.get("pedido","")) for a in _saved_audits
                                     if audit_record_is_complete(a) and str(a.get("pedido","")).strip()
@@ -4490,10 +4695,21 @@ if _tab_active(o):
                                                         store["order_audits"].pop()
                                                     st.error(f"No se pudo guardar la auditoría: {_audit_save_error}")
                                                 else:
+                                                    _bridge_url,_bridge_token=appsheet_bridge_settings()
+                                                    if _bridge_url and _bridge_token:
+                                                        try:
+                                                            _bridge_result=appsheet_publish_saved_audit(_audit_record)
+                                                            _audit_record["pdf_archivo"]=_bridge_result.get("pdf","")
+                                                            save_store(store)
+                                                            st.session_state["_order_audit_flash"]="Auditoría y PDF enviados a AppSheet."
+                                                        except Exception as _bridge_error:
+                                                            st.session_state["_order_audit_flash"]=f"Auditoría guardada en FNR/MC; AppSheet quedó pendiente de sincronizar ({_bridge_error})."
                                                     st.session_state["_order_audit_flash"]=(
-                                                        f"Pedido {_order}: intento registrado; sigue pendiente."
-                                                        if _result=="No se pudo validar"
-                                                        else f"Pedido {_order}: auditoría validada y guardada."
+                                                        st.session_state.get("_order_audit_flash") or (
+                                                            f"Pedido {_order}: intento registrado; sigue pendiente."
+                                                            if _result=="No se pudo validar"
+                                                            else f"Pedido {_order}: auditoría validada y guardada."
+                                                        )
                                                     )
                                                     st.rerun()
                                 else:
@@ -5558,3 +5774,4 @@ if _tab_active(j):
                                 if st.button("Cancelar",key=f"proc_del_cancel_{proc['id']}"):
                                     st.session_state.pop("confirm_delete_process_id",None)
                                     st.rerun()
+
