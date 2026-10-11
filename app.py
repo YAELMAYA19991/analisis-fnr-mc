@@ -4292,6 +4292,16 @@ if _tab_active(o):
         st.subheader("📦 Auditoría rápida de pedidos")
         st.caption("Carga el archivo de pedidos, elige uno de la lista y guarda el resultado. Los archivos originales solo se consultan; las auditorías quedan guardadas por separado.")
 
+        if st.button("🔌 Probar conexión AppSheet (solo lectura)", key="appsheet_readonly_test"):
+            try:
+                _test_result=appsheet_bridge_call("read")
+                _test_tables=_test_result.get("data",{})
+                _test_counts={name:len(_test_tables.get(name,[]) or []) for name in ["Pedidos","Articulos","Validaciones","Auditorias","Diferencias"]}
+                st.success("Conexión AppSheet correcta. Consulta de solo lectura; no se escribieron datos.")
+                st.write("Registros disponibles:",_test_counts)
+            except Exception as _test_error:
+                st.error(f"No se pudo completar la prueba de solo lectura: {_test_error}")
+
         _audit_flash=st.session_state.pop("_order_audit_flash",None)
         if _audit_flash:
             st.success(_audit_flash)
@@ -5765,13 +5775,3 @@ if _tab_active(j):
                         if st.session_state.get("confirm_delete_process_id")==proc.get("id"):
                             st.warning(f"¿Eliminar el proceso ‘{proc.get('titulo','Sin título')}’?")
                             yes_col,no_col=st.columns(2)
-                            with yes_col:
-                                if st.button("Sí, eliminar",key=f"proc_del_confirm_{proc['id']}",type="primary"):
-                                    store["procesos"]=[pp for pp in store["procesos"] if pp.get("id")!=proc.get("id")]
-                                    st.session_state.pop("confirm_delete_process_id",None)
-                                    save_store(store); st.rerun()
-                            with no_col:
-                                if st.button("Cancelar",key=f"proc_del_cancel_{proc['id']}"):
-                                    st.session_state.pop("confirm_delete_process_id",None)
-                                    st.rerun()
-
