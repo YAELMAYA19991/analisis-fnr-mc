@@ -2251,7 +2251,31 @@ def products(inc,picker=None):
 
 def orders(inc,picker=None):
     x=inc if not picker or picker=="Todos" else inc[inc.PICKER==picker]
-    return x.groupby("ORDER_NUMBER",as_index=False).agg(INCIDENCIAS=("INCIDENCIAS","sum"),PICKERS=("PICKER","nunique"),PRODUCTOS=("PRODUCTO","nunique")).sort_values(["INCIDENCIAS","PICKERS"],ascending=False)
+    aggregations={"INCIDENCIAS":("INCIDENCIAS","sum"),"PICKERS":("PICKER","nunique"),"PRODUCTOS":("PRODUCTO","nunique")}
+    # Include the incident date when the source FNR/MC file provides one.
+    # Parse ISO dates year-first and other text dates day-first, one value at a time,
+    # so a mixed/blank column cannot make pandas infer the wrong date format.
+    if "FECHA" in x.columns:
+        def _parse_order_date(value):
+            if value is None or (not isinstance(value,(list,dict)) and pd.isna(value)):
+                return pd.NaT
+            if isinstance(value,str):
+                value=value.strip()
+                if not value:
+                    return pd.NaT
+                if re.match(r"^\\d{4}[-/]\\d{1,2}[-/]\\d{1,2}",value):
+                    return pd.to_datetime(value,errors="coerce",yearfirst=True)
+                return pd.to_datetime(value,errors="coerce",dayfirst=True)
+            return pd.to_datetime(value,errors="coerce")
+        _date_values=x["FECHA"].map(_parse_order_date)
+        if _date_values.notna().any():
+            x=x.copy()
+            x["_FECHA_PEDIDO"]=_date_values
+            aggregations["FECHA"]=("_FECHA_PEDIDO","min")
+    result=x.groupby("ORDER_NUMBER",as_index=False).agg(**aggregations)
+    if "FECHA" in result.columns:
+        result["FECHA"]=pd.to_datetime(result["FECHA"],errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
+    return result.sort_values(["INCIDENCIAS","PICKERS"],ascending=False)
 
 
 def _audit_item_key(sku="", product=""):
