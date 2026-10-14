@@ -2263,7 +2263,7 @@ def orders(inc,picker=None):
                 value=value.strip()
                 if not value:
                     return pd.NaT
-                if re.match(r"^\\d{4}[-/]\\d{1,2}[-/]\\d{1,2}",value):
+                if re.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}",value):
                     return pd.to_datetime(value,errors="coerce",yearfirst=True)
                 return pd.to_datetime(value,errors="coerce",dayfirst=True)
             return pd.to_datetime(value,errors="coerce")
