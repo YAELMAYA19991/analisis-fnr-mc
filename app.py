@@ -4361,7 +4361,7 @@ if _tab_active(o):
                 else:
                     _sheet_name=st.selectbox("Hoja",list(_audit_sheets),key="order_audit_sheet") if len(_audit_sheets)>1 else next(iter(_audit_sheets))
                     _audit_df=_audit_sheets[_sheet_name].copy()
-                    _audit_df.columns=[str(c).strip() for c in _audit_df.columns]
+                    _audit_df.columns=[str(c).replace("\ufeff","").strip() for c in _audit_df.columns]
                     _audit_cols=list(_audit_df.columns)
                     _normalized_cols={norm(c):c for c in _audit_cols}
 
@@ -4374,7 +4374,7 @@ if _tab_active(o):
                     _fields=[
                         ("pedido","Pedido",["orden","order","numero_pedido","número de pedido","order_number","order_no","order_id","numero_orden","pedido"]),
                         ("slot","Hora / slot",["slot","horario","hora entrega","hora de entrega","delivery slot","time slot","hora pedido","hora del pedido","order_time","created_at","created","fecha_hora","order_created_at","hora","time"]),
-                        ("sku","SKU",["sku","seller_sku","product_sku","codigo_sku","código sku","item_sku"]),
+                        ("sku","SKU",["sku","seller_sku","product_sku","codigo_sku","código sku","item_sku","codigo","código","code","barcode","ean"]),
                         ("articulo","Artículo",["producto","product","articulo","artículo","product_name","item_name","item","nombre_articulo"]),
                         ("cantidad_pedida","Cantidad",["qty pedido","qtypedido","cantidad pedida","cantidad solicitada","quantity ordered","qty_ordered","quantity","qty","cantidad","unidades","cant"]),
                         ("picker","Picker",["picker","picker asignado","picker_name","nombre picker","pickeador"]),
@@ -4395,10 +4395,17 @@ if _tab_active(o):
                     if any(_mapping.get(_k)=="— Sin columna —" for _k in _required_keys):
                         st.warning("No pude detectar todas las columnas necesarias. Abre «Corregir columnas detectadas» y selecciona pedido, hora/slot, SKU, artículo y cantidad.")
                     else:
+                        _sku_values=_audit_df[_mapping["sku"]].astype(str).str.strip()
+                        _sku_missing=_sku_values.eq("") | _sku_values.str.casefold().isin({"nan","none","<na>"})
+                        for _sku_alias in ("codigo","código","barcode","ean"):
+                            _sku_fallback=_normalized_cols.get(norm(_sku_alias))
+                            if _sku_fallback and _sku_fallback!=_mapping["sku"]:
+                                _sku_values=_sku_values.mask(_sku_missing,_audit_df[_sku_fallback].astype(str).str.strip())
+                                _sku_missing=_sku_values.eq("") | _sku_values.str.casefold().isin({"nan","none","<na>"})
                         _audit_data=pd.DataFrame({
                             "Número de pedido":_audit_df[_mapping["pedido"]].astype(str).str.strip(),
                             "Slot":_audit_df[_mapping["slot"]].astype(str).str.strip(),
-                            "SKU":_audit_df[_mapping["sku"]].astype(str).str.strip(),
+                            "SKU":_sku_values,
                             "Artículo":_audit_df[_mapping["articulo"]].astype(str).str.strip(),
                             "Cantidad pedida":_audit_df[_mapping["cantidad_pedida"]].astype(str).str.strip(),
                             "Cantidad pickeada":_audit_df[_mapping["cantidad_pickeada"]].astype(str).str.strip() if _mapping["cantidad_pickeada"]!="— Sin columna —" else "",
@@ -4427,7 +4434,11 @@ if _tab_active(o):
                             )
                             _included_orders=set(_slot_stats.loc[~_slot_stats["_slot_missing"],"Número de pedido"])
                             _bad_time_orders=int(_slot_stats["_slot_missing"].sum())
-                            _eligible=_audit_data[_audit_data["Número de pedido"].isin(_included_orders)].drop(columns="_slot_min").copy()
+                            _after_noon_orders=set(_slot_stats.loc[_slot_stats["_slot_max"]>12*60,"Número de pedido"])
+                            _eligible=_audit_data[
+                                _audit_data["Número de pedido"].isin(_included_orders)
+                                & ~_audit_data["Número de pedido"].isin(_after_noon_orders)
+                            ].drop(columns="_slot_min").copy()
 
                             if _eligible.empty:
                                 st.warning(f"No hay pedidos con hora legible. Pedidos sin hora válida: {_bad_time_orders:,}.")
@@ -4465,6 +4476,12 @@ if _tab_active(o):
                                     )
                                 _audit_detail,_risk_summary=order_risk_analysis(
                                     _eligible,s,_audit_hist_fnr,_audit_hist_mc,store.get("order_audits",[])
+                                )
+                                st.success(
+                                    f"Archivo leído: {len(_audit_detail):,} renglones de artículo en "
+                                    f"{_risk_summary['Número de pedido'].nunique():,} pedidos hasta las 12:00. "
+                                    f"Se omitieron {len(_after_noon_orders):,} pedidos posteriores al corte "
+                                    f"y {_bad_time_orders:,} sin hora válida."
                                 )
                                 _risk_summary=_risk_summary.merge(
                                     _slot_stats[["Número de pedido","_slot_min","_slot_max"]],
