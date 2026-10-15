@@ -3547,6 +3547,12 @@ with st.sidebar:
         store["excluded_orders"]=_new_excluded
         save_store(store)
 
+    with st.expander("🔗 Enlaces de operación",expanded=False):
+        st.link_button("Power BI · Detalle FNR y MC", "https://app.powerbi.com/reportEmbed?reportId=a57cb86c-0a7f-4ff3-ac58-8ff539023e2f&autoAuth=true&ctid=5d351724-1912-42ea-81fa-07e50cd2d589", use_container_width=True)
+        st.link_button("Power BI · Indicadores del mes", "https://app.powerbi.com/groups/8b489903-544e-4207-943a-335385d5adf4/reports/198ebd62-599f-48ad-b120-6e85626dde4b/v_3568b7925b8b5c438b68?experience=power-bi&clientSideAuth=0", use_container_width=True)
+        st.link_button("GeoVictoria · Entradas y salidas", "https://clients.geovictoria.com", use_container_width=True)
+        st.link_button("Atlassian · Reportar problemas de básculas, equipos y sistema", "https://justo.atlassian.net/servicedesk/customer/portals", use_container_width=True)
+
 # Indicadores compactos de Power BI: siempre visibles en portada, fuera de las pestañas.
 with st.container(border=True):
     st.markdown("### 📊 Indicadores Power BI · Coyoacán")
