@@ -2502,15 +2502,31 @@ def appsheet_bridge_call(action, **payload):
     if not url.startswith("https://script.google.com/macros/s/") or not url.endswith("/exec"):
         raise RuntimeError("La URL del puente de Google no es válida")
     body=json.dumps({"token":token,"action":action,**payload},ensure_ascii=False,default=str).encode("utf-8")
-    request=urllib.request.Request(url,data=body,headers={"Content-Type":"application/json"},method="POST")
+    request=urllib.request.Request(
+        url,data=body,
+        headers={"Content-Type":"application/json","Accept":"application/json"},
+        method="POST",
+    )
     try:
         with urllib.request.urlopen(request,timeout=35) as response:
-            result=json.loads(response.read().decode("utf-8"))
+            response_body=response.read()
+            response_status=response.status
+            response_type=response.headers.get_content_type()
     except urllib.error.HTTPError as exc:
         # No incluir cuerpo ni URL completa: Google puede devolver datos de la solicitud.
         raise RuntimeError(f"No se pudo consultar el puente AppSheet (HTTP {exc.code}: {exc.reason})") from exc
     except Exception as exc:
         raise RuntimeError(f"No se pudo consultar el puente AppSheet ({type(exc).__name__})") from exc
+    if not response_body.strip():
+        raise RuntimeError(f"El puente respondió vacío (HTTP {response_status}; {response_type}).")
+    try:
+        result=json.loads(response_body.decode("utf-8"))
+    except (UnicodeDecodeError,json.JSONDecodeError) as exc:
+        # No mostrar el contenido: podría incluir información de la solicitud.
+        raise RuntimeError(
+            f"Google respondió algo que no es JSON (HTTP {response_status}; "
+            f"formato {response_type}; {len(response_body)} bytes)."
+        ) from exc
     if not isinstance(result,dict) or not result.get("ok"):
         raise RuntimeError(str(result.get("error","Respuesta inválida del puente AppSheet")) if isinstance(result,dict) else "Respuesta inválida del puente AppSheet")
     return result
