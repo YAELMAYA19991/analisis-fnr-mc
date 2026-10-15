@@ -2506,6 +2506,9 @@ def appsheet_bridge_call(action, **payload):
     try:
         with urllib.request.urlopen(request,timeout=35) as response:
             result=json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        # No incluir cuerpo ni URL completa: Google puede devolver datos de la solicitud.
+        raise RuntimeError(f"No se pudo consultar el puente AppSheet (HTTP {exc.code}: {exc.reason})") from exc
     except Exception as exc:
         raise RuntimeError(f"No se pudo consultar el puente AppSheet ({type(exc).__name__})") from exc
     if not isinstance(result,dict) or not result.get("ok"):
