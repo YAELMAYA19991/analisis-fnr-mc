@@ -2680,9 +2680,11 @@ def read_appsheet_export_workbook(uploaded_file):
 def appsheet_order_payload(detail, summary, existing_articles):
     """Prepara la carga idempotente de pedidos y artículos por sus claves relacionadas."""
     old={}
+    old_barcodes={}
     for row in existing_articles or []:
         key=(str(row.get("ID_Pedido","")),str(row.get("SKU","")),str(row.get("Picker","")),str(row.get("Articulo","")))
         old.setdefault(key,[]).append(str(row.get("ID_Articulo","")))
+        old_barcodes.setdefault(key,[]).append(str(row.get("Codigo_Barras",row.get("Código de barras","")) or "").strip())
     order_rows=[]
     for _,row in summary.iterrows():
         order=str(row.get("Número de pedido",""))
@@ -2702,8 +2704,13 @@ def appsheet_order_payload(detail, summary, existing_articles):
         key=(order,sku,picker,name); occurrence=seen.get(key,0); seen[key]=occurrence+1
         matches=old.get(key,[])
         article_id=matches[occurrence] if occurrence<len(matches) else hashlib.sha256(("|".join(key)+"|"+str(occurrence)).encode()).hexdigest()[:20]
+        barcode=str(row.get("Codigo_Barras",row.get("Código de barras","")) or "").strip()
+        if not barcode:
+            previous_barcodes=old_barcodes.get(key,[])
+            if occurrence<len(previous_barcodes):
+                barcode=previous_barcodes[occurrence]
         article_rows.append({
-            "ID_Articulo":article_id,"ID_Pedido":order,"SKU":sku,"Articulo":name,"Picker":picker,
+            "ID_Articulo":article_id,"ID_Pedido":order,"SKU":sku,"Codigo_Barras":barcode,"Articulo":name,"Picker":picker,
             "Cantidad_Pedida":str(row.get("Cantidad pedida","")),"Cantidad_Pickeada":str(row.get("Cantidad pickeada","")),
         })
     return {"Pedidos":order_rows,"Articulos":article_rows}
@@ -4504,6 +4511,7 @@ if _tab_active(o):
                         ("pedido","Pedido",["orden","order","numero_pedido","número de pedido","order_number","order_no","order_id","numero_orden","pedido"]),
                         ("slot","Hora / slot",["slot","horario","hora entrega","hora de entrega","delivery slot","time slot","hora pedido","hora del pedido","order_time","created_at","created","fecha_hora","order_created_at","hora","time"]),
                         ("sku","SKU",["sku","seller_sku","product_sku","codigo_sku","código sku","item_sku","codigo","código","code","barcode","ean"]),
+                        ("codigo_barras","Código de barras",["codigo_barras","código_barras","codigo de barras","código de barras","codigo barra","código barra","barcode","ean","upc","codigo","código","code"]),
                         ("articulo","Artículo",["producto","product","articulo","artículo","product_name","item_name","item","nombre_articulo"]),
                         ("cantidad_pedida","Cantidad",["qty pedido","qtypedido","cantidad pedida","cantidad solicitada","quantity ordered","qty_ordered","quantity","qty","cantidad","unidades","cant"]),
                         ("picker","Picker",["picker","picker asignado","picker_name","nombre picker","pickeador"]),
@@ -4535,6 +4543,7 @@ if _tab_active(o):
                             "Número de pedido":_audit_df[_mapping["pedido"]].astype(str).str.strip(),
                             "Slot":_audit_df[_mapping["slot"]].astype(str).str.strip(),
                             "SKU":_sku_values,
+                            "Codigo_Barras":_audit_df[_mapping["codigo_barras"]].astype(str).str.strip() if _mapping["codigo_barras"]!="— Sin columna —" else "",
                             "Artículo":_audit_df[_mapping["articulo"]].astype(str).str.strip(),
                             "Cantidad pedida":_audit_df[_mapping["cantidad_pedida"]].astype(str).str.strip(),
                             "Cantidad pickeada":_audit_df[_mapping["cantidad_pickeada"]].astype(str).str.strip() if _mapping["cantidad_pickeada"]!="— Sin columna —" else "",
