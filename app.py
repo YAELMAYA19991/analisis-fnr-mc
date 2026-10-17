@@ -4441,12 +4441,22 @@ if _tab_active(o):
 
         if st.button("🔌 Probar conexión AppSheet (solo lectura)", key="appsheet_readonly_test"):
             try:
-                _health_result=appsheet_bridge_call("health")
+                _legacy_bridge=False
+                try:
+                    _health_result=appsheet_bridge_call("health")
+                except RuntimeError as _health_error:
+                    if "Operación no permitida" not in str(_health_error):
+                        raise
+                    _legacy_bridge=True
+                    _health_result={"message":"Apps Script activo; versión anterior sin health"}
                 _test_result=appsheet_bridge_call("read")
                 _test_tables=_test_result.get("data",{})
                 _test_counts={name:len(_test_tables.get(name,[]) or []) for name in ["Pedidos","Articulos","Validaciones","Auditorias","Diferencias"]}
-                st.success("Conexión AppSheet correcta. Puente y hoja respondieron; no se escribieron datos.")
-                st.write("Estado del puente:",_health_result.get("message","Activo"))
+                if _legacy_bridge:
+                    st.warning("Lectura correcta con el Apps Script actual. Falta desplegar la versión nueva para habilitar el diagnóstico health.")
+                else:
+                    st.success("Conexión AppSheet correcta. Puente y hoja respondieron; no se escribieron datos.")
+                    st.write("Estado del puente:",_health_result.get("message","Activo"))
                 st.write("Registros disponibles:",_test_counts)
             except Exception as _test_error:
                 st.error(f"No se pudo completar la prueba de solo lectura: {_test_error}")
