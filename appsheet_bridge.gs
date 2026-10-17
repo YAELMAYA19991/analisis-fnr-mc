@@ -8,6 +8,19 @@ function configurarConexion() {
   }
 }
 
+// Run manually in the Apps Script editor if Streamlit needs the existing token.
+// The execution log is visible only to project editors; never publish this value.
+function mostrarTokenConexion() {
+  const token = PropertiesService.getScriptProperties().getProperty('AUDIT_TOKEN');
+  if (!token) throw new Error('Primero ejecuta configurarConexion().');
+  Logger.log('Copia este valor a APPSHEET_BRIDGE_TOKEN en Streamlit Secrets: ' + token);
+}
+
+// Read-only health check; it exposes no sheet data or token.
+function doGet(e) {
+  return respuesta({ok:true,service:'appsheet-audit-bridge',message:'Endpoint activo; POST protegido por token.'});
+}
+
 function doPost(e) {
   const lock = LockService.getScriptLock();
   try {
@@ -15,6 +28,17 @@ function doPost(e) {
     const body = JSON.parse(e.postData.contents);
     const token = PropertiesService.getScriptProperties().getProperty('AUDIT_TOKEN');
     if (!token || body.token !== token) return respuesta({ok:false,error:'No autorizado'});
+    if (body.action === 'health') {
+      const ss = SpreadsheetApp.openById(AUDIT_SHEET);
+      const required = ['Pedidos','Articulos','Validaciones','Auditorias','Diferencias'];
+      const missing = required.filter(name => !ss.getSheetByName(name));
+      if (missing.length) throw new Error('Faltan hojas requeridas: ' + missing.join(', '));
+      const counts = {};
+      required.forEach(name => {
+        counts[name] = Math.max(0, ss.getSheetByName(name).getLastRow() - 1);
+      });
+      return respuesta({ok:true,message:'Puente y hoja conectados',tables:counts});
+    }
     if (!lock.tryLock(25000)) return respuesta({ok:false,error:'Ocupado; reintentar'});
     const ss = SpreadsheetApp.openById(AUDIT_SHEET);
     if (body.action === 'read') {
