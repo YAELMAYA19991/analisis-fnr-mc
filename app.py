@@ -2498,7 +2498,13 @@ def appsheet_bridge_call(action, **payload):
     """Llama el puente privado de Apps Script. El token solo viaja en el cuerpo POST."""
     url,token=appsheet_bridge_settings()
     if not url or not token:
-        raise RuntimeError("Conexión AppSheet sin configurar")
+        missing=[]
+        if not url: missing.append("APPSHEET_BRIDGE_URL")
+        if not token: missing.append("APPSHEET_BRIDGE_TOKEN")
+        raise RuntimeError(
+            "Faltan secretos de conexión en Streamlit: " + ", ".join(missing) +
+            ". Configúralos en Manage app > Settings > Secrets."
+        )
     if not url.startswith("https://script.google.com/macros/s/") or not url.endswith("/exec"):
         raise RuntimeError("La URL del puente de Google no es válida")
     body=json.dumps({"token":token,"action":action,**payload},ensure_ascii=False,default=str).encode("utf-8")
@@ -2522,44 +2528,72 @@ def appsheet_bridge_call(action, **payload):
     try:
         result=json.loads(response_body.decode("utf-8"))
     except (UnicodeDecodeError,json.JSONDecodeError) as exc:
-        # No mostrar el contenido: podría incluir información de la solicitud.
+        # No mostrar el cuerpo: Google puede devolver contenido de acceso o datos de la solicitud.
+        is_html=(response_type=="text/html" or response_body.lstrip().lower().startswith((b"<!doctype html",b"<html")))
+        if is_html:
+            raise RuntimeError(
+                f"Google devolvió una página HTML en vez del JSON del puente "
+                f"(HTTP {response_status}; {response_type}; {len(response_body)} bytes). "
+                "La URL /exec responde, pero el Web App no está atendiendo el script publicado "
+                "o exige iniciar sesión. Revisa el despliegue vigente y su acceso."
+            ) from exc
         raise RuntimeError(
             f"Google respondió algo que no es JSON (HTTP {response_status}; "
             f"formato {response_type}; {len(response_body)} bytes)."
         ) from exc
     if not isinstance(result,dict) or not result.get("ok"):
-        raise RuntimeError(str(result.get("error","Respuesta inválida del puente AppSheet")) if isinstance(result,dict) else "Respuesta inválida del puente AppSheet")
+        error=str(result.get("error","Respuesta inválida del puente AppSheet")) if isinstance(result,dict) else "Respuesta inválida del puente AppSheet"
+        if error=="No autorizado":
+            error += " Verifica que AUDIT_TOKEN en Apps Script coincida con APPSHEET_BRIDGE_TOKEN en Streamlit Secrets."
+        elif error=="Operación no permitida":
+            error += " El /exec puede estar ejecutando una versión antigua del Apps Script; actualiza y vuelve a desplegar el Web App."
+        raise RuntimeError(error)
     return result
 
 
 def appsheet_rows_to_audits(tables, detail):
-    """Convierte las validaciones por artículo en el formato histórico de FNR/MC."""
+    """Convierte validaciones AppSheet en auditorías; una orden solo cierra al validar todas sus líneas."""
     if not isinstance(tables,dict):
         return []
     articles=tables.get("Articulos",[]) or []
     validations=tables.get("Validaciones",[]) or []
-    by_article={str(row.get("ID_Articulo","")):row for row in articles if row.get("ID_Articulo")}
+    by_article={str(row.get("ID_Articulo","")).strip():row for row in articles if row.get("ID_Articulo")}
     latest={}
+
+    def _validation_key(row):
+        raw=str(row.get("Fecha_Validacion","") or "").strip()
+        parsed=pd.to_datetime(raw,errors="coerce",dayfirst=True)
+        if pd.isna(parsed):
+            parsed=pd.to_datetime(raw,errors="coerce",dayfirst=False)
+        return (1,int(parsed.value)) if not pd.isna(parsed) else (0,raw)
+
     for row in validations:
-        article_id=str(row.get("ID_Articulo","") or "")
+        article_id=str(row.get("ID_Articulo","") or "").strip()
         if not article_id or article_id not in by_article:
             continue
         previous=latest.get(article_id)
-        if previous is None or str(row.get("Fecha_Validacion",""))>=str(previous.get("Fecha_Validacion","")):
+        if previous is None or _validation_key(row)>=_validation_key(previous):
             latest[article_id]=row
+
     detail=detail.copy() if isinstance(detail,pd.DataFrame) else pd.DataFrame()
     out=[]
+    orders_with_reviews={
+        str(by_article[article_id].get("ID_Pedido","") or "").strip()
+        for article_id in latest
+        if str(by_article[article_id].get("ID_Pedido","") or "").strip()
+    }
     grouped={}
-    for article_id,validation in latest.items():
-        article=by_article[article_id]
-        order=str(article.get("ID_Pedido",validation.get("ID_Pedido","")) or "").strip()
-        if not order:
-            continue
-        grouped.setdefault(order,[]).append((article_id,article,validation))
+    for article_id,article in by_article.items():
+        order=str(article.get("ID_Pedido","") or "").strip()
+        if order in orders_with_reviews:
+            grouped.setdefault(order,[]).append((article_id,article,latest.get(article_id)))
+
     for order,items in grouped.items():
         local=detail[detail.get("Número de pedido",pd.Series(dtype=str)).astype(str).eq(order)] if not detail.empty and "Número de pedido" in detail else pd.DataFrame()
         lines=[]
         for article_id,article,validation in items:
+            validation=validation or {}
+            has_validation=bool(validation)
             try:
                 quantity=float(validation.get("Cantidad_Verificada",0) or 0)
             except (TypeError,ValueError):
@@ -2568,37 +2602,79 @@ def appsheet_rows_to_audits(tables, detail):
                 ordered=float(article.get("Cantidad_Pedida",0) or 0)
             except (TypeError,ValueError):
                 ordered=0.0
-            quality=str(validation.get("Calidad_Correcta","")).strip().casefold() in {"true","1","yes","si","sí","verdadero"}
-            checked=str(validation.get("Validado","")).strip().casefold() in {"true","1","yes","si","sí","verdadero"}
+            quality=(str(validation.get("Calidad_Correcta","")).strip().casefold()
+                     in {"true","1","yes","si","sí","verdadero"}) if has_validation else True
+            checked=has_validation and str(validation.get("Validado","")).strip().casefold() in {
+                "true","1","yes","si","sí","verdadero"
+            }
             source=local[local.get("SKU",pd.Series(dtype=str)).astype(str).eq(str(article.get("SKU","")))] if not local.empty else pd.DataFrame()
             line=source.iloc[0].to_dict() if not source.empty else {}
-            diff=(not quality) or abs(quantity-ordered)>0.000001
+            diff=has_validation and ((not quality) or abs(quantity-ordered)>0.000001)
+            note=str(validation.get("Observaciones","") or (
+                "Pendiente de validar" if not has_validation else
+                "Calidad por revisar" if not quality else ""
+            ))
             lines.append({
                 "SKU":str(article.get("SKU","")),"Artículo":str(article.get("Articulo","")),
                 "Picker relacionado":str(article.get("Picker",line.get("Picker relacionado",""))),
                 "Cantidad pedida":str(article.get("Cantidad_Pedida","")),
                 "Cantidad pickeada":str(article.get("Cantidad_Pickeada","")),
                 "Diferencia encontrada":bool(diff),
-                "Corrección / observación":str(validation.get("Observaciones","") or ("Calidad por revisar" if not quality else "")),
-                "_appsheet_validado":checked,
+                "Corrección / observación":note,
+                "_appsheet_validado":bool(checked),
             })
-        # Una orden queda cerrada en FNR/MC cuando todas sus líneas tienen la última
-        # validación marcada. Revalidar una línea puede volverla a dejar pendiente.
         complete=bool(lines) and all(x["_appsheet_validado"] for x in lines)
-        fecha=max((str(v.get("Fecha_Validacion","")) for _,_,v in items),default="")
-        auditor=next((str(v.get("Auditor","")) for _,_,v in reversed(items) if v.get("Auditor")),"")
+        fecha=max((str(v.get("Fecha_Validacion","") or "") for _,_,v in items if v),default="")
+        auditor=next((str(v.get("Auditor","")) for _,_,v in reversed(items) if v and v.get("Auditor")),"")
         slot=str(items[0][1].get("ID_Pedido",order))
         if not local.empty and "Slot" in local:
             slot=str(local.iloc[0].get("Slot",""))
+        has_difference=any(x["Diferencia encontrada"] for x in lines)
+        result=("No se pudo validar" if not complete else
+                "Con diferencias" if has_difference else "Pedido correcto")
+        notes=("Validaciones recibidas desde AppSheet; hay artículos pendientes de validar."
+               if not complete else "Validaciones por artículo recibidas desde AppSheet.")
         out.append({
             "id":"appsheet-"+hashlib.sha256((order+"|"+fecha).encode()).hexdigest()[:18],
             "pedido":order,"slot":slot,"fecha_auditoria":fecha,"auditor":auditor,
-            "resultado":"Con diferencias" if any(x["Diferencia encontrada"] for x in lines) else "Pedido correcto",
-            "pedido_validado":complete,"observaciones":"Validaciones por artículo recibidas desde AppSheet",
+            "resultado":result,"pedido_validado":complete,"observaciones":notes,
             "diferencias":sum(1 for x in lines if x["Diferencia encontrada"]),"lineas":lines,
             "fuente_archivo":"AppSheet","appsheet":True,
         })
     return out
+
+
+def read_appsheet_export_workbook(uploaded_file):
+    """Lee el libro descargado de Google Sheets/AppSheet sin conectarse a servicios externos."""
+    try:
+        uploaded_file.seek(0)
+        workbook=pd.ExcelFile(uploaded_file)
+    except Exception as exc:
+        raise ValueError("No pude abrir el archivo. Descarga la hoja fuente como Microsoft Excel (.xlsx).") from exc
+    sheet_names={str(name).strip().casefold():name for name in workbook.sheet_names}
+    required=("articulos","validaciones")
+    missing=[name for name in required if name not in sheet_names]
+    if missing:
+        raise ValueError("El libro debe incluir las pestañas Articulos y Validaciones.")
+    tables={}
+    for key in ("Pedidos","Articulos","Validaciones","Auditorias","Diferencias"):
+        actual=sheet_names.get(key.casefold())
+        if actual is None:
+            continue
+        frame=pd.read_excel(workbook,sheet_name=actual,dtype=str).fillna("")
+        frame.columns=[str(column).strip() for column in frame.columns]
+        tables[key]=frame.to_dict(orient="records")
+    article_rows=tables.get("Articulos",[])
+    detail=pd.DataFrame([{
+        "Número de pedido":str(row.get("ID_Pedido","") or ""),
+        "SKU":str(row.get("SKU","") or ""),
+        "Artículo":str(row.get("Articulo","") or ""),
+        "Picker relacionado":str(row.get("Picker","") or ""),
+        "Cantidad pedida":str(row.get("Cantidad_Pedida","") or ""),
+        "Cantidad pickeada":str(row.get("Cantidad_Pickeada","") or ""),
+        "Slot":str(row.get("Slot","") or ""),
+    } for row in article_rows])
+    return tables,detail
 
 
 def appsheet_order_payload(detail, summary, existing_articles):
@@ -2686,6 +2762,28 @@ def appsheet_publish_saved_audit(record):
     }
     pdf=build_saved_order_audit_pdf(record)
     return appsheet_bridge_call("audit",audit=audit,Diferencias=differences,pdf_base64=__import__("base64").b64encode(pdf).decode("ascii"))
+
+
+def appsheet_orders_import_zip(detail, summary):
+    """Crea CSV idempotentes para importar Pedidos y Articulos sin usar el puente."""
+    payload=appsheet_order_payload(detail,summary,[])
+    out=io.BytesIO()
+    with zipfile.ZipFile(out,"w",compression=zipfile.ZIP_DEFLATED) as archive:
+        for table,rows in payload.items():
+            csv_bytes=pd.DataFrame(rows).to_csv(index=False).encode("utf-8-sig")
+            archive.writestr(table+".csv",csv_bytes)
+        readme=(
+            "CARGA MANUAL A APPSHEET\n"
+            "1) Importa Pedidos.csv en la tabla/vista Pedidos.\n"
+            "2) Importa Articulos.csv en la tabla/vista Articulos.\n"
+            "3) Conserva exactamente los encabezados y usa ID_Pedido / ID_Articulo como llaves.\n"
+            "4) Sincroniza la app antes de comenzar la auditoria. La importacion CSV de AppSheet "
+            "actualiza filas con la misma llave y agrega las nuevas.\n"
+            "5) Al terminar, descarga el Google Sheet fuente como Microsoft Excel (.xlsx) e "
+            "importalo en Control FNR/MC para reflejar las validaciones.\n"
+        )
+        archive.writestr("LEEME.txt",readme.encode("utf-8"))
+    return out.getvalue()
 
 
 def order_risk_analysis(audit_lines,picker_summary,fnr_inc,mc_inc,prior_audits=None):
@@ -4343,10 +4441,12 @@ if _tab_active(o):
 
         if st.button("🔌 Probar conexión AppSheet (solo lectura)", key="appsheet_readonly_test"):
             try:
+                _health_result=appsheet_bridge_call("health")
                 _test_result=appsheet_bridge_call("read")
                 _test_tables=_test_result.get("data",{})
                 _test_counts={name:len(_test_tables.get(name,[]) or []) for name in ["Pedidos","Articulos","Validaciones","Auditorias","Diferencias"]}
-                st.success("Conexión AppSheet correcta. Consulta de solo lectura; no se escribieron datos.")
+                st.success("Conexión AppSheet correcta. Puente y hoja respondieron; no se escribieron datos.")
+                st.write("Estado del puente:",_health_result.get("message","Activo"))
                 st.write("Registros disponibles:",_test_counts)
             except Exception as _test_error:
                 st.error(f"No se pudo completar la prueba de solo lectura: {_test_error}")
@@ -4553,6 +4653,17 @@ if _tab_active(o):
                                                      for part in str(value).split(", "))
                                 )
                                 _risk_summary["Puntaje selección"]=_risk_summary["Puntaje alarma"]+_risk_summary["Picker nocturno"].astype(int)*2
+
+                                _manual_appsheet_zip=appsheet_orders_import_zip(_audit_detail,_risk_summary)
+                                with st.expander("📤 Preparar carga manual a AppSheet (sin puente)",expanded=False):
+                                    st.caption("El ZIP contiene un CSV para Pedidos y otro para Articulos. Requiere una acción de importación CSV por tabla en AppSheet; después de validar, descarga el libro fuente de Google Sheets como Excel y súbelo en el importador de auditorías de esta página.")
+                                    st.download_button(
+                                        "Descargar carga de pedidos y artículos (.zip)",
+                                        _manual_appsheet_zip,
+                                        "Carga_manual_AppSheet.zip",
+                                        "application/zip",
+                                        key="appsheet_manual_order_package",
+                                    )
 
                                 _saved_audits=store.get("order_audits",[]) or []
                                 _bridge_remote_audits=[]
@@ -4794,6 +4905,52 @@ if _tab_active(o):
                                         st.caption("No se encontraron pedidos dentro de esta cobertura.")
             except Exception as _audit_error:
                 st.error(f"No pude leer el archivo de pedidos: {_audit_error}")
+
+        with st.expander("📥 Importar auditorías desde AppSheet (sin puente)",expanded=False):
+            st.caption("Descarga el Google Sheet fuente desde Archivo > Descargar > Microsoft Excel (.xlsx). El libro debe conservar las pestañas Articulos y Validaciones. Solo se importan pedidos con al menos una línea validada; una orden parcial seguirá pendiente.")
+            _appsheet_export_file=st.file_uploader(
+                "Libro de auditorías descargado de Google Sheets",
+                type=["xlsx"],
+                key="appsheet_manual_audit_export",
+            )
+            if _appsheet_export_file is not None and st.button(
+                "Importar validaciones a Control FNR/MC",
+                key="appsheet_manual_audit_import",
+                type="primary",
+            ):
+                try:
+                    _export_tables,_export_detail=read_appsheet_export_workbook(_appsheet_export_file)
+                    _imported_audits=appsheet_rows_to_audits(_export_tables,_export_detail)
+                    if not _imported_audits:
+                        st.warning("El libro se leyó, pero no contiene validaciones relacionadas con artículos.")
+                    else:
+                        _previous_audits=store.get("order_audits",[]) or []
+                        _merged_audits=[dict(row) for row in _previous_audits]
+                        _audit_positions={str(row.get("id","")):i for i,row in enumerate(_merged_audits)}
+                        _new_count=0
+                        _updated_count=0
+                        for _incoming_audit in _imported_audits:
+                            _incoming_id=str(_incoming_audit.get("id",""))
+                            if _incoming_id in _audit_positions:
+                                _at=_audit_positions[_incoming_id]
+                                _merged_audits[_at]={**_merged_audits[_at],**_incoming_audit}
+                                _updated_count+=1
+                            else:
+                                _audit_positions[_incoming_id]=len(_merged_audits)
+                                _merged_audits.append(_incoming_audit)
+                                _new_count+=1
+                        store["order_audits"]=_merged_audits
+                        try:
+                            save_store(store)
+                        except Exception:
+                            store["order_audits"]=_previous_audits
+                            raise
+                        st.success(
+                            f"Importación lista: {_new_count:,} auditorías nuevas y "
+                            f"{_updated_count:,} actualizadas; archivo leído sin editarlo."
+                        )
+                except Exception as _import_error:
+                    st.error(f"No pude importar las auditorías de AppSheet: {_import_error}")
 
         _saved_audits=store.get("order_audits",[]) or []
         with st.expander(f"📚 Historial de auditorías ({len(_saved_audits)})",expanded=False):
