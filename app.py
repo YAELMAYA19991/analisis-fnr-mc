@@ -2552,12 +2552,16 @@ def appsheet_bridge_call(action, **payload):
 
 
 def appsheet_rows_to_audits(tables, detail):
-    """Convierte validaciones AppSheet en auditorías; una orden solo cierra al validar todas sus líneas."""
+    """Convierte el lote activo de AppSheet en registros históricos para Control FNR/MC."""
     if not isinstance(tables,dict):
         return []
     articles=tables.get("Articulos",[]) or []
     validations=tables.get("Validaciones",[]) or []
-    by_article={str(row.get("ID_Articulo","")).strip():row for row in articles if row.get("ID_Articulo")}
+    orders=tables.get("Pedidos",[]) or []
+    audits=tables.get("Auditorias",[]) or []
+    differences=tables.get("Diferencias",[]) or []
+    by_article={str(row.get("ID_Articulo","") or "").strip():row for row in articles if row.get("ID_Articulo")}
+    by_order={str(row.get("ID_Pedido","") or "").strip():row for row in orders if row.get("ID_Pedido")}
     latest={}
 
     def _validation_key(row):
@@ -2567,6 +2571,9 @@ def appsheet_rows_to_audits(tables, detail):
             parsed=pd.to_datetime(raw,errors="coerce",dayfirst=False)
         return (1,int(parsed.value)) if not pd.isna(parsed) else (0,raw)
 
+    def _truth(value):
+        return str(value or "").strip().casefold() in {"true","1","yes","si","sí","verdadero","ok"}
+
     for row in validations:
         article_id=str(row.get("ID_Articulo","") or "").strip()
         if not article_id or article_id not in by_article:
@@ -2575,21 +2582,39 @@ def appsheet_rows_to_audits(tables, detail):
         if previous is None or _validation_key(row)>=_validation_key(previous):
             latest[article_id]=row
 
+    diff_by_article={}
+    for row in differences:
+        article_id=str(row.get("ID_Articulo","") or "").strip()
+        if article_id:
+            diff_by_article.setdefault(article_id,[]).append(row)
+
+    audit_by_order={}
+    for row in audits:
+        order=str(row.get("ID_Pedido","") or "").strip()
+        if not order:
+            continue
+        previous=audit_by_order.get(order)
+        stamp=str(row.get("Fecha_Auditoria","") or "")
+        old_stamp=str((previous or {}).get("Fecha_Auditoria","") or "")
+        if previous is None or stamp>=old_stamp:
+            audit_by_order[order]=row
+
     detail=detail.copy() if isinstance(detail,pd.DataFrame) else pd.DataFrame()
-    out=[]
-    orders_with_reviews={
-        str(by_article[article_id].get("ID_Pedido","") or "").strip()
-        for article_id in latest
-        if str(by_article[article_id].get("ID_Pedido","") or "").strip()
-    }
     grouped={}
     for article_id,article in by_article.items():
         order=str(article.get("ID_Pedido","") or "").strip()
-        if order in orders_with_reviews:
+        if order:
             grouped.setdefault(order,[]).append((article_id,article,latest.get(article_id)))
 
-    for order,items in grouped.items():
-        local=detail[detail.get("Número de pedido",pd.Series(dtype=str)).astype(str).eq(order)] if not detail.empty and "Número de pedido" in detail else pd.DataFrame()
+    reviewed_orders={
+        str(by_article[article_id].get("ID_Pedido","") or "").strip()
+        for article_id in latest if article_id in by_article
+    }
+    target_orders=reviewed_orders | set(audit_by_order)
+    out=[]
+    for order in target_orders:
+        items=grouped.get(order,[])
+        audit=audit_by_order.get(order,{})
         lines=[]
         for article_id,article,validation in items:
             validation=validation or {}
@@ -2602,46 +2627,128 @@ def appsheet_rows_to_audits(tables, detail):
                 ordered=float(article.get("Cantidad_Pedida",0) or 0)
             except (TypeError,ValueError):
                 ordered=0.0
-            quality=(str(validation.get("Calidad_Correcta","")).strip().casefold()
-                     in {"true","1","yes","si","sí","verdadero"}) if has_validation else True
-            checked=has_validation and str(validation.get("Validado","")).strip().casefold() in {
-                "true","1","yes","si","sí","verdadero"
-            }
-            source=local[local.get("SKU",pd.Series(dtype=str)).astype(str).eq(str(article.get("SKU","")))] if not local.empty else pd.DataFrame()
-            line=source.iloc[0].to_dict() if not source.empty else {}
-            diff=has_validation and ((not quality) or abs(quantity-ordered)>0.000001)
-            note=str(validation.get("Observaciones","") or (
-                "Pendiente de validar" if not has_validation else
-                "Calidad por revisar" if not quality else ""
-            ))
+            quality=_truth(validation.get("Calidad_Correcta","")) if has_validation else True
+            checked=_truth(validation.get("Validado","")) if has_validation else False
+            article_diffs=diff_by_article.get(article_id,[])
+            has_saved_difference=any(_truth(x.get("Diferencia_Encontrada","")) for x in article_diffs)
+            has_validation_difference=has_validation and ((not quality) or abs(quantity-ordered)>0.000001)
+            note=str(validation.get("Observaciones","") or "")
+            if not note:
+                note=next((str(x.get("Observaciones","") or x.get("Correccion","") or "")
+                           for x in article_diffs if x.get("Observaciones") or x.get("Correccion")),"")
+            if not note and not has_validation:
+                note="Pendiente de validar"
+            code=str(article.get("Codigo_Barras",article.get("Código","")) or "").strip()
+            picker=str(article.get("Picker",article.get("Correo_Picker","")) or "").strip()
             lines.append({
-                "SKU":str(article.get("SKU","")),"Artículo":str(article.get("Articulo","")),
-                "Picker relacionado":str(article.get("Picker",line.get("Picker relacionado",""))),
-                "Cantidad pedida":str(article.get("Cantidad_Pedida","")),
-                "Cantidad pickeada":str(article.get("Cantidad_Pickeada","")),
-                "Diferencia encontrada":bool(diff),
+                "SKU":"",
+                "Código":code,
+                "Zona":str(article.get("Zona","") or "").strip(),
+                "Artículo":str(article.get("Articulo","") or "").strip(),
+                "Picker relacionado":picker,
+                "Correo del picker":picker,
+                "Cantidad pedida":str(article.get("Cantidad_Pedida","") or ""),
+                "Cantidad pickeada":str(article.get("Cantidad_Pickeada","") or ""),
+                "Diferencia encontrada":bool(has_saved_difference or has_validation_difference),
                 "Corrección / observación":note,
                 "_appsheet_validado":bool(checked),
             })
-        complete=bool(lines) and all(x["_appsheet_validado"] for x in lines)
-        fecha=max((str(v.get("Fecha_Validacion","") or "") for _,_,v in items if v),default="")
-        auditor=next((str(v.get("Auditor","")) for _,_,v in reversed(items) if v and v.get("Auditor")),"")
-        slot=str(items[0][1].get("ID_Pedido",order))
-        if not local.empty and "Slot" in local:
-            slot=str(local.iloc[0].get("Slot",""))
+        complete=bool(_truth(audit.get("Validado",""))) if audit else bool(lines) and all(x["_appsheet_validado"] for x in lines)
+        fecha=str(audit.get("Fecha_Auditoria","") or "") or max(
+            (str(v.get("Fecha_Validacion","") or "") for _,_,v in items if v),default=""
+        )
+        auditor=str(audit.get("Auditor","") or "") or next(
+            (str(v.get("Auditor","")) for _,_,v in reversed(items) if v and v.get("Auditor")),""
+        )
+        order_row=by_order.get(order,{})
+        slot=str(order_row.get("Slot","") or "")
+        if not slot and not detail.empty and "Número de pedido" in detail:
+            local=detail[detail["Número de pedido"].astype(str).eq(order)]
+            if not local.empty:
+                slot=str(local.iloc[0].get("Slot","") or "")
         has_difference=any(x["Diferencia encontrada"] for x in lines)
-        result=("No se pudo validar" if not complete else
-                "Con diferencias" if has_difference else "Pedido correcto")
-        notes=("Validaciones recibidas desde AppSheet; hay artículos pendientes de validar."
-               if not complete else "Validaciones por artículo recibidas desde AppSheet.")
+        result=str(audit.get("Resultado","") or "") or (
+            "No se pudo validar" if not complete else
+            "Con diferencias" if has_difference else "Pedido correcto"
+        )
+        notes=str(audit.get("Observaciones","") or "")
+        if not notes:
+            notes=("Validaciones recibidas desde AppSheet; hay artículos pendientes de validar."
+                   if not complete else "Validaciones por artículo recibidas desde AppSheet.")
+        audit_id=str(audit.get("ID_Auditoria","") or "")
+        stable_key=("audit|"+audit_id) if audit_id else ("validation|"+order+"|"+fecha)
         out.append({
-            "id":"appsheet-"+hashlib.sha256((order+"|"+fecha).encode()).hexdigest()[:18],
+            "id":"appsheet-"+hashlib.sha256(stable_key.encode()).hexdigest()[:18],
+            "appsheet_audit_id":audit_id,
             "pedido":order,"slot":slot,"fecha_auditoria":fecha,"auditor":auditor,
             "resultado":result,"pedido_validado":complete,"observaciones":notes,
             "diferencias":sum(1 for x in lines if x["Diferencia encontrada"]),"lineas":lines,
             "fuente_archivo":"AppSheet","appsheet":True,
         })
     return out
+
+
+def appsheet_archive_preflight(tables, detail):
+    """Verifica que los registros AppSheet se puedan archivar antes de vaciar el lote."""
+    tables=tables if isinstance(tables,dict) else {}
+    articles=tables.get("Articulos",[]) or []
+    orders=tables.get("Pedidos",[]) or []
+    validations=tables.get("Validaciones",[]) or []
+    audits=tables.get("Auditorias",[]) or []
+    differences=tables.get("Diferencias",[]) or []
+    article_ids={str(r.get("ID_Articulo","") or "").strip() for r in articles}
+    order_ids={str(r.get("ID_Pedido","") or "").strip() for r in orders}
+    audit_ids={str(r.get("ID_Auditoria","") or "").strip() for r in audits}
+    article_order={str(a.get("ID_Articulo","") or "").strip():str(a.get("ID_Pedido","") or "").strip() for a in articles}
+    errors=[]
+    for row in validations:
+        article_id=str(row.get("ID_Articulo","") or "").strip()
+        if not article_id or article_id not in article_ids:
+            errors.append("Hay validaciones sin artículo relacionado.")
+            break
+        linked_order=str(row.get("ID_Pedido","") or "").strip()
+        if linked_order and article_order.get(article_id) and linked_order!=article_order[article_id]:
+            errors.append("Hay validaciones ligadas a un pedido distinto del artículo.")
+            break
+    for row in audits:
+        order=str(row.get("ID_Pedido","") or "").strip()
+        if not order or order not in order_ids:
+            errors.append("Hay auditorías sin pedido relacionado.")
+            break
+    for row in differences:
+        article_id=str(row.get("ID_Articulo","") or "").strip()
+        audit_id=str(row.get("ID_Auditoria","") or "").strip()
+        if not article_id or article_id not in article_ids or not audit_id or audit_id not in audit_ids:
+            errors.append("Hay diferencias sin artículo o auditoría relacionados.")
+            break
+    archived=appsheet_rows_to_audits(tables,detail)
+    archived_audit_ids={str(row.get("appsheet_audit_id","")) for row in archived if row.get("appsheet_audit_id")}
+    if any(audit_id not in archived_audit_ids for audit_id in audit_ids):
+        errors.append("No se pudieron convertir todas las auditorías de AppSheet al historial.")
+    if validations and not archived:
+        errors.append("Hay validaciones, pero no se generó ningún registro histórico.")
+    return archived,errors
+
+
+def merge_order_audit_records(existing, incoming):
+    """Fusiona auditorías por ID sin duplicar registros importados."""
+    merged=[dict(row) for row in (existing or []) if isinstance(row,dict)]
+    positions={str(row.get("id","")):i for i,row in enumerate(merged) if row.get("id")}
+    for source in incoming or []:
+        if not isinstance(source,dict):
+            continue
+        row=dict(source)
+        key=str(row.get("id","") or "")
+        if key and key in positions:
+            at=positions[key]
+            merged[at]={**merged[at],**row}
+        else:
+            if key:
+                positions[key]=len(merged)
+            merged.append(row)
+    return merged
+
+
 
 
 def read_appsheet_export_workbook(uploaded_file):
@@ -2665,48 +2772,95 @@ def read_appsheet_export_workbook(uploaded_file):
         frame.columns=[str(column).strip() for column in frame.columns]
         tables[key]=frame.to_dict(orient="records")
     article_rows=tables.get("Articulos",[])
+    order_lookup={str(row.get("ID_Pedido","") or ""):row for row in tables.get("Pedidos",[])}
     detail=pd.DataFrame([{
         "Número de pedido":str(row.get("ID_Pedido","") or ""),
-        "SKU":str(row.get("SKU","") or ""),
+        "SKU":"",
+        "Código":str(row.get("Codigo_Barras","") or ""),
+        "Zona":str(row.get("Zona","") or ""),
         "Artículo":str(row.get("Articulo","") or ""),
         "Picker relacionado":str(row.get("Picker","") or ""),
+        "Correo del picker":str(row.get("Picker","") or ""),
         "Cantidad pedida":str(row.get("Cantidad_Pedida","") or ""),
         "Cantidad pickeada":str(row.get("Cantidad_Pickeada","") or ""),
-        "Slot":str(row.get("Slot","") or ""),
+        "Slot":str(order_lookup.get(str(row.get("ID_Pedido","") or ""),{}).get("Slot","") or ""),
     } for row in article_rows])
     return tables,detail
 
 
+def appsheet_batch_fingerprint(tables):
+    """Huella estable del lote activo, basada solo en los campos que identifican su contenido."""
+    tables=tables if isinstance(tables,dict) else {}
+    def _rows(table,fields):
+        out=[]
+        for row in tables.get(table,[]) or []:
+            out.append([str(row.get(field,"") or "").strip() for field in fields])
+        return sorted(out)
+    payload={
+        "Pedidos":_rows("Pedidos",["ID_Pedido","Slot"]),
+        "Articulos":_rows("Articulos",[
+            "ID_Articulo","ID_Pedido","Codigo_Barras","Zona","Articulo","Picker",
+            "Cantidad_Pedida","Cantidad_Pickeada",
+        ]),
+    }
+    canonical=json.dumps(payload,ensure_ascii=False,separators=(",",":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def appsheet_order_payload(detail, summary, existing_articles):
-    """Prepara la carga idempotente de pedidos y artículos por sus claves relacionadas."""
+    """Prepara el lote con código, zona, cantidades y correo del picker; SKU queda vacío."""
     old={}
     for row in existing_articles or []:
-        key=(str(row.get("ID_Pedido","")),str(row.get("SKU","")),str(row.get("Picker","")),str(row.get("Articulo","")))
-        old.setdefault(key,[]).append(str(row.get("ID_Articulo","")))
+        key=(
+            str(row.get("ID_Pedido","") or "").strip(),
+            str(row.get("Codigo_Barras","") or "").strip(),
+            str(row.get("Picker","") or "").strip(),
+            str(row.get("Articulo","") or "").strip(),
+        )
+        old.setdefault(key,[]).append(str(row.get("ID_Articulo","") or ""))
     order_rows=[]
     for _,row in summary.iterrows():
-        order=str(row.get("Número de pedido",""))
-        _score=pd.to_numeric(row.get("Puntaje alarma",0),errors="coerce")
+        order=str(row.get("Número de pedido","") or "").strip()
+        score=pd.to_numeric(row.get("Puntaje alarma",0),errors="coerce")
         order_rows.append({
-            "ID_Pedido":order,"Pedido":order,"Slot":str(row.get("Slot","")),
-            "Turno_Picker":str(row.get("Turno picker","Sin identificar")),
-            "Pickers":str(row.get("Pickers asignados","")),"Prioridad":str(row.get("Prioridad","")),
-            "Alarma":str(row.get("Alarma","")),"Puntaje_Alarma":int(_score) if pd.notna(_score) else 0,
-            "Factores":str(row.get("Factores","")),"Cobertura":str(row.get("Cobertura equipo","")),
+            "ID_Pedido":order,"Pedido":order,"Slot":str(row.get("Slot","") or "").strip(),
+            "Turno_Picker":str(row.get("Turno picker","Sin identificar") or ""),
+            "Pickers":str(row.get("Pickers asignados","") or ""),
+            "Prioridad":str(row.get("Prioridad","") or ""),
+            "Alarma":str(row.get("Alarma","") or ""),
+            "Puntaje_Alarma":int(score) if pd.notna(score) else 0,
+            "Factores":str(row.get("Factores","") or ""),
+            "Cobertura":str(row.get("Cobertura equipo","") or ""),
             "Fecha_Exportacion":datetime.now(ZoneInfo("America/Mexico_City")).isoformat(timespec="seconds"),
         })
     article_rows=[]
     seen={}
     for _,row in detail.iterrows():
-        order=str(row.get("Número de pedido","")); sku=str(row.get("SKU","")); picker=str(row.get("Picker relacionado","")); name=str(row.get("Artículo",""))
-        key=(order,sku,picker,name); occurrence=seen.get(key,0); seen[key]=occurrence+1
+        order=str(row.get("Número de pedido","") or "").strip()
+        code=str(row.get("Código",row.get("Codigo_Barras","")) or "").strip()
+        zone=str(row.get("Zona","") or "").strip()
+        slot=str(row.get("Slot","") or "").strip()
+        picker=str(row.get("Correo del picker",row.get("Picker relacionado",row.get("Picker",""))) or "").strip()
+        name=str(row.get("Artículo",row.get("Producto","")) or "").strip()
+        ordered=str(row.get("Cantidad pedida","") or "").strip()
+        picked=str(row.get("Cantidad pickeada","") or "").strip()
+        if not all((order,slot,code,zone,picker,name,ordered,picked)):
+            raise ValueError("El lote contiene una fila sin orden, slot, zona, código, producto, cantidades o correo del picker.")
+        key=(order,code,picker,name)
+        occurrence=seen.get(key,0)
+        seen[key]=occurrence+1
         matches=old.get(key,[])
-        article_id=matches[occurrence] if occurrence<len(matches) else hashlib.sha256(("|".join(key)+"|"+str(occurrence)).encode()).hexdigest()[:20]
+        article_id=matches[occurrence] if occurrence<len(matches) else hashlib.sha256(
+            ("\x1f".join(key)+"|"+str(occurrence)).encode("utf-8")
+        ).hexdigest()[:20]
         article_rows.append({
-            "ID_Articulo":article_id,"ID_Pedido":order,"SKU":sku,"Articulo":name,"Picker":picker,
-            "Cantidad_Pedida":str(row.get("Cantidad pedida","")),"Cantidad_Pickeada":str(row.get("Cantidad pickeada","")),
+            "ID_Articulo":article_id,"ID_Pedido":order,"SKU":"","Articulo":name,"Picker":picker,
+            "Cantidad_Pedida":ordered,"Cantidad_Pickeada":picked,
+            "Codigo_Barras":code,"Zona":zone,
         })
     return {"Pedidos":order_rows,"Articulos":article_rows}
+
+
 
 
 def build_saved_order_audit_pdf(record):
@@ -2718,12 +2872,12 @@ def build_saved_order_audit_pdf(record):
     story=[Paragraph(f"Auditoría de pedido · {html.escape(str(record.get('pedido','')))}",styles["Title"]),
            Paragraph(f"Fecha: {html.escape(str(record.get('fecha_auditoria','')))} &nbsp;|&nbsp; Auditor: {html.escape(str(record.get('auditor','')))} &nbsp;|&nbsp; Resultado: {html.escape(str(record.get('resultado','')))}",styles["BodyText"]),
            Paragraph(f"Slot: {html.escape(str(record.get('slot','')))} &nbsp;|&nbsp; Picker(s): {html.escape(str(record.get('picker','')))} &nbsp;|&nbsp; Validado: {'Sí' if record.get('pedido_validado') else 'No'}",styles["BodyText"]),Spacer(1,5*mm)]
-    rows=[["SKU","Artículo","Picker","Pedida","Pickeada","Diferencia","Observación"]]
+    rows=[["Código","Zona","Producto","Correo del picker","Pedida","Piqueada","Diferencia","Observación"]]
     for line in record.get("lineas",[]) or []:
-        rows.append([str(line.get("SKU","")),str(line.get("Artículo","")),str(line.get("Picker relacionado","")),
-                     str(line.get("Cantidad pedida","")),str(line.get("Cantidad pickeada","")),
+        rows.append([str(line.get("Código","")),str(line.get("Zona","")),str(line.get("Artículo","")),
+                     str(line.get("Correo del picker",line.get("Picker relacionado",""))),str(line.get("Cantidad pedida","")),str(line.get("Cantidad pickeada","")),
                      "Sí" if line.get("Diferencia encontrada") else "No",str(line.get("Corrección / observación",""))])
-    table=Table(rows,colWidths=[25*mm,67*mm,40*mm,18*mm,20*mm,19*mm,68*mm],repeatRows=1)
+    table=Table(rows,colWidths=[24*mm,16*mm,55*mm,46*mm,18*mm,19*mm,19*mm,60*mm],repeatRows=1)
     table.setStyle(TableStyle([("GRID",(0,0),(-1,-1),.35,colors.HexColor("#c7c9ce")),
                                ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#e9ecef")),
                                ("VALIGN",(0,0),(-1,-1),"TOP"),
@@ -2741,11 +2895,21 @@ def appsheet_publish_saved_audit(record):
     article_rows=tables.get("Articulos",[]) or []
     lookup={}
     for row in article_rows:
-        key=(str(row.get("ID_Pedido","")),str(row.get("SKU","")),str(row.get("Picker","")),str(row.get("Articulo","")))
-        lookup.setdefault(key,[]).append(str(row.get("ID_Articulo","")))
+        key=(
+            str(row.get("ID_Pedido","") or "").strip(),
+            str(row.get("Codigo_Barras","") or "").strip(),
+            str(row.get("Picker","") or "").strip(),
+            str(row.get("Articulo","") or "").strip(),
+        )
+        lookup.setdefault(key,[]).append(str(row.get("ID_Articulo","") or ""))
     counts={}; differences=[]
     for line in record.get("lineas",[]) or []:
-        key=(str(record.get("pedido","")),str(line.get("SKU","")),str(line.get("Picker relacionado","")),str(line.get("Artículo","")))
+        key=(
+            str(record.get("pedido","") or "").strip(),
+            str(line.get("Código","") or "").strip(),
+            str(line.get("Correo del picker",line.get("Picker relacionado","")) or "").strip(),
+            str(line.get("Artículo","") or "").strip(),
+        )
         occurrence=counts.get(key,0); counts[key]=occurrence+1
         ids=lookup.get(key,[])
         if line.get("Diferencia encontrada") and occurrence<len(ids):
@@ -2762,6 +2926,8 @@ def appsheet_publish_saved_audit(record):
     }
     pdf=build_saved_order_audit_pdf(record)
     return appsheet_bridge_call("audit",audit=audit,Diferencias=differences,pdf_base64=__import__("base64").b64encode(pdf).decode("ascii"))
+
+
 
 
 def appsheet_orders_import_zip(detail, summary):
@@ -4473,7 +4639,7 @@ if _tab_active(o):
         )
         if audit_upload is None:
             st.info("Carga el archivo del día para ver los pedidos pendientes de auditoría.")
-            st.markdown("**Columnas necesarias:** pedido, hora/slot, SKU, artículo y cantidad pedida. Picker y cantidad pickeada son opcionales.")
+            st.markdown("**Columnas necesarias:** orden, slot, zona, código, producto, cantidad pedida, cantidad piqueada y correo del picker. No se importa fecha de entrega ni SKU.")
         else:
             try:
                 _audit_raw=audit_upload.getvalue()
@@ -4501,19 +4667,20 @@ if _tab_active(o):
                         return "— Sin columna —"
 
                     _fields=[
-                        ("pedido","Pedido",["orden","order","numero_pedido","número de pedido","order_number","order_no","order_id","numero_orden","pedido"]),
-                        ("slot","Hora / slot",["slot","horario","hora entrega","hora de entrega","delivery slot","time slot","hora pedido","hora del pedido","order_time","created_at","created","fecha_hora","order_created_at","hora","time"]),
-                        ("sku","SKU",["sku","seller_sku","product_sku","codigo_sku","código sku","item_sku","codigo","código","code","barcode","ean"]),
-                        ("articulo","Artículo",["producto","product","articulo","artículo","product_name","item_name","item","nombre_articulo"]),
-                        ("cantidad_pedida","Cantidad",["qty pedido","qtypedido","cantidad pedida","cantidad solicitada","quantity ordered","qty_ordered","quantity","qty","cantidad","unidades","cant"]),
-                        ("picker","Picker",["picker","picker asignado","picker_name","nombre picker","pickeador"]),
-                        ("cantidad_pickeada","Cantidad pickeada",["qty picked","qtypicked","cantidad pickeada","cantidad preparada","quantity picked"]),
+                        ("pedido","Número de orden",["orden","order","numero_pedido","número de pedido","order_number","order_no","order_id","numero_orden","pedido"]),
+                        ("slot","Slot",["slot","horario","hora entrega","hora de entrega","delivery slot","time slot","hora pedido","hora del pedido","order_time","created_at","created","fecha_hora","order_created_at","hora","time"]),
+                        ("zona","Zona",["zona","zone","area"]),
+                        ("codigo_barras","Código",["codigo","código","code","codigo barras","código de barras","barcode","bar code","ean","gtin"]),
+                        ("articulo","Producto",["producto","product","articulo","artículo","product_name","item_name","item","nombre_articulo"]),
+                        ("cantidad_pedida","Cantidad del pedido",["qty pedido","qtypedido","cantidad pedida","cantidad solicitada","quantity ordered","qty_ordered","quantity","qty","cantidad","unidades","cant"]),
+                        ("cantidad_pickeada","Cantidad piqueada",["qty picked","qtypicked","cantidad piqueada","cantidad pickeada","cantidad preparada","quantity picked"]),
+                        ("picker","Correo del picker",["picker email","picker_email","correo picker","correo del picker","email picker","picker","correo","email"]),
                         ("estatus","Estatus",["estatus orden","order status","estatus","status"]),
                     ]
                     with st.expander("⚙️ Corregir columnas detectadas",expanded=False):
-                        st.caption("Normalmente se detectan solas. Cambia solo las que aparezcan incorrectas.")
+                        st.caption("La carga usa solo orden, slot, zona, código, producto, cantidades y correo del picker.")
                         _mapping={}
-                        _required_keys={"pedido","slot","sku","articulo","cantidad_pedida"}
+                        _required_keys={"pedido","slot","zona","codigo_barras","articulo","cantidad_pedida","cantidad_pickeada","picker"}
                         for _key,_label,_aliases in _fields:
                             _options=["— Sin columna —"]+_audit_cols
                             _default=_audit_guess(_aliases)
@@ -4522,32 +4689,37 @@ if _tab_active(o):
                                 key=f"order_audit_map_{_key}",
                             )
                     if any(_mapping.get(_k)=="— Sin columna —" for _k in _required_keys):
-                        st.warning("No pude detectar todas las columnas necesarias. Abre «Corregir columnas detectadas» y selecciona pedido, hora/slot, SKU, artículo y cantidad.")
+                        st.warning("Selecciona las columnas de orden, slot, zona, código, producto, cantidades pedida y piqueada, y correo del picker.")
                     else:
-                        _sku_values=_audit_df[_mapping["sku"]].astype(str).str.strip()
-                        _sku_missing=_sku_values.eq("") | _sku_values.str.casefold().isin({"nan","none","<na>"})
-                        for _sku_alias in ("codigo","código","barcode","ean"):
-                            _sku_fallback=_normalized_cols.get(norm(_sku_alias))
-                            if _sku_fallback and _sku_fallback!=_mapping["sku"]:
-                                _sku_values=_sku_values.mask(_sku_missing,_audit_df[_sku_fallback].astype(str).str.strip())
-                                _sku_missing=_sku_values.eq("") | _sku_values.str.casefold().isin({"nan","none","<na>"})
+                        _code_values=_audit_df[_mapping["codigo_barras"]].astype(str).str.strip()
+                        _zone_values=_audit_df[_mapping["zona"]].astype(str).str.strip()
+                        _picker_values=_audit_df[_mapping["picker"]].astype(str).str.strip()
                         _audit_data=pd.DataFrame({
                             "Número de pedido":_audit_df[_mapping["pedido"]].astype(str).str.strip(),
                             "Slot":_audit_df[_mapping["slot"]].astype(str).str.strip(),
-                            "SKU":_sku_values,
+                            "Zona":_zone_values,
+                            "Código":_code_values,
+                            "SKU":"",
                             "Artículo":_audit_df[_mapping["articulo"]].astype(str).str.strip(),
                             "Cantidad pedida":_audit_df[_mapping["cantidad_pedida"]].astype(str).str.strip(),
-                            "Cantidad pickeada":_audit_df[_mapping["cantidad_pickeada"]].astype(str).str.strip() if _mapping["cantidad_pickeada"]!="— Sin columna —" else "",
-                            "Picker":_audit_df[_mapping["picker"]].astype(str).str.strip() if _mapping["picker"]!="— Sin columna —" else "",
+                            "Cantidad pickeada":_audit_df[_mapping["cantidad_pickeada"]].astype(str).str.strip(),
+                            "Picker":_picker_values,
+                            "Picker relacionado":_picker_values,
+                            "Correo del picker":_picker_values,
                             "Estatus":_audit_df[_mapping["estatus"]].astype(str).str.strip() if _mapping["estatus"]!="— Sin columna —" else "",
                         })
                         _audit_data=_audit_data[
                             _audit_data["Número de pedido"].ne("")
-                            & _audit_data["Número de pedido"].str.casefold().ne("nan")
-                            & (_audit_data["Artículo"].ne("") | _audit_data["SKU"].ne(""))
+                            & _audit_data["Slot"].ne("")
+                            & _audit_data["Zona"].ne("")
+                            & _audit_data["Código"].ne("")
+                            & _audit_data["Artículo"].ne("")
+                            & _audit_data["Cantidad pedida"].ne("")
+                            & _audit_data["Cantidad pickeada"].ne("")
+                            & _audit_data["Picker"].ne("")
                         ]
                         if _audit_data.empty:
-                            st.error("No encontré pedidos con artículo/SKU. Revisa el archivo o las columnas.")
+                            st.error("No encontré filas completas con orden, slot, zona, código, producto, cantidades y correo del picker.")
                         else:
                             def _slot_minutes(value):
                                 _match=re.search(r"(?<!\d)(\d{1,2}):(\d{2})(?!\d)",str(value or ""))
@@ -4666,7 +4838,7 @@ if _tab_active(o):
 
                                 _manual_appsheet_zip=appsheet_orders_import_zip(_audit_detail,_risk_summary)
                                 with st.expander("📤 Preparar carga manual a AppSheet (sin puente)",expanded=False):
-                                    st.caption("El ZIP contiene un CSV para Pedidos y otro para Articulos. Requiere una acción de importación CSV por tabla en AppSheet; después de validar, descarga el libro fuente de Google Sheets como Excel y súbelo en el importador de auditorías de esta página.")
+                                    st.caption("El ZIP incluye orden y slot en Pedidos; en Articulos incluye zona, código, producto, cantidades y correo del picker. La importación manual agrega/actualiza filas, pero no limpia el lote previo. Después de validar, descarga el libro fuente como Excel y súbelo en el importador de auditorías.")
                                     st.download_button(
                                         "Descargar carga de pedidos y artículos (.zip)",
                                         _manual_appsheet_zip,
@@ -4680,22 +4852,63 @@ if _tab_active(o):
                                 _bridge_url,_bridge_token=appsheet_bridge_settings()
                                 if _bridge_url and _bridge_token:
                                     try:
+                                        _bridge_health=appsheet_bridge_call("health")
                                         _bridge_tables=appsheet_bridge_call("read").get("data",{})
                                         _bridge_payload=appsheet_order_payload(_audit_detail,_risk_summary,_bridge_tables.get("Articulos",[]))
-                                        _bridge_fingerprint=hashlib.sha256(json.dumps(
-                                            {"Pedidos":[{k:v for k,v in row.items() if k!="Fecha_Exportacion"} for row in _bridge_payload["Pedidos"]],
-                                             "Articulos":_bridge_payload["Articulos"]},sort_keys=True,ensure_ascii=False,default=str
-                                        ).encode()).hexdigest()
-                                        if st.session_state.get("_appsheet_last_publish")!=_bridge_fingerprint:
+                                        _incoming_fp=appsheet_batch_fingerprint(_bridge_payload)
+                                        _current_fp=appsheet_batch_fingerprint(_bridge_tables)
+                                        _has_old_rows=any(_bridge_tables.get(name,[]) for name in ["Pedidos","Articulos","Validaciones","Auditorias","Diferencias"])
+                                        _same_batch=_has_old_rows and _incoming_fp==_current_fp
+                                        _replace_ready=bool((_bridge_health.get("capabilities") or {}).get("replaceBatch"))
+                                        if not _has_old_rows:
                                             appsheet_bridge_call("publish",**_bridge_payload)
-                                            st.session_state["_appsheet_last_publish"]=_bridge_fingerprint
+                                            st.session_state["_appsheet_last_publish"]=_incoming_fp
                                             st.success(f"AppSheet recibió {len(_bridge_payload['Pedidos']):,} pedidos y {len(_bridge_payload['Articulos']):,} artículos.")
+                                        elif _same_batch:
+                                            st.caption("AppSheet ya contiene este mismo lote; no se volvió a importar.")
+                                            st.session_state["_appsheet_last_publish"]=_incoming_fp
+                                        elif not _replace_ready:
+                                            st.warning("Hay un lote anterior en AppSheet. No lo reemplacé porque el puente activo todavía no confirma la función de archivado y limpieza segura; el lote anterior sigue intacto.")
+                                        else:
+                                            _archive_records,_archive_errors=appsheet_archive_preflight(_bridge_tables,_audit_detail)
+                                            if _archive_errors:
+                                                st.error("No limpié el lote anterior: "+ " ".join(_archive_errors))
+                                            else:
+                                                _merged_audits=merge_order_audit_records(_saved_audits,_archive_records)
+                                                _archive_log=list(store.get("appsheet_archive_log",[]) or [])
+                                                if not any(str(x.get("fingerprint",""))==_current_fp for x in _archive_log if isinstance(x,dict)):
+                                                    _archive_log.append({
+                                                        "fingerprint":_current_fp,
+                                                        "fecha":datetime.now(ZoneInfo("America/Mexico_City")).isoformat(timespec="seconds"),
+                                                        "pedidos":len(_bridge_tables.get("Pedidos",[]) or []),
+                                                        "articulos":len(_bridge_tables.get("Articulos",[]) or []),
+                                                        "validaciones":len(_bridge_tables.get("Validaciones",[]) or []),
+                                                        "auditorias":len(_bridge_tables.get("Auditorias",[]) or []),
+                                                        "diferencias":len(_bridge_tables.get("Diferencias",[]) or []),
+                                                    })
+                                                store["order_audits"]=_merged_audits
+                                                store["appsheet_archive_log"]=_archive_log
+                                                save_store(store)
+                                                appsheet_bridge_call(
+                                                    "publish",replaceBatch=True,archiveConfirmed=True,
+                                                    expectedFingerprint=_current_fp,**_bridge_payload
+                                                )
+                                                _verified_tables=appsheet_bridge_call("read").get("data",{})
+                                                if appsheet_batch_fingerprint(_verified_tables)!=_incoming_fp:
+                                                    raise RuntimeError("La carga terminó, pero la verificación del lote nuevo no coincidió.")
+                                                st.session_state["_appsheet_last_publish"]=_incoming_fp
+                                                st.success(
+                                                    f"Lote anterior archivado en la página y reemplazado: "
+                                                    f"{len(_bridge_payload['Pedidos']):,} pedidos y "
+                                                    f"{len(_bridge_payload['Articulos']):,} artículos."
+                                                )
+                                                _bridge_tables=_verified_tables
                                         _bridge_remote_audits=appsheet_rows_to_audits(_bridge_tables,_audit_detail)
                                     except Exception as _bridge_error:
-                                        st.warning(f"No pude sincronizar con AppSheet: {_bridge_error}")
+                                        st.warning(f"No pude sincronizar el lote con AppSheet: {_bridge_error}")
                                 else:
                                     st.caption("AppSheet: integración preparada; falta habilitar la conexión segura para sincronizar cargas y validaciones.")
-                                _saved_audits=list(_saved_audits)+[a for a in _bridge_remote_audits if a.get("id") not in {x.get("id") for x in _saved_audits}]
+                                _saved_audits=merge_order_audit_records(_saved_audits,_bridge_remote_audits)
                                 _audited_orders={
                                     norm(a.get("pedido","")) for a in _saved_audits
                                     if audit_record_is_complete(a) and str(a.get("pedido","")).strip()
@@ -4769,7 +4982,7 @@ if _tab_active(o):
                                         _head2.metric("Hora / slot",_order_slot)
                                         _head3.metric("Picker",str(_order_row.get("Pickers asignados","Sin asignar")))
                                         st.caption(f"Turno del picker: {_order_row.get('Turno picker','Sin identificar')}")
-                                        _item_cols=[c for c in ["SKU","Artículo","Picker relacionado","Cantidad pedida","Cantidad pickeada"] if c in _lines.columns]
+                                        _item_cols=[c for c in ["Código","Zona","Artículo","Correo del picker","Cantidad pedida","Cantidad pickeada"] if c in _lines.columns]
                                         _items=_lines[_item_cols].copy().rename(columns={"Picker relacionado":"Picker"})
                                         st.markdown("**Artículos del pedido**")
                                         st.dataframe(_items,use_container_width=True,hide_index=True)
@@ -4813,7 +5026,7 @@ if _tab_active(o):
                                             key="audit_result_simple_"+_audit_key,
                                         )
                                         _line_options=[
-                                            f"{idx+1}. {row.get('SKU','')} · {row.get('Artículo','')} · Cantidad {row.get('Cantidad pedida','')}"
+                                            f"{idx+1}. {row.get('Código','')} · {row.get('Artículo','')} · Cantidad {row.get('Cantidad pedida','')}"
                                             for idx,row in _lines.iterrows()
                                         ]
                                         with st.form("audit_save_form_"+_audit_key,clear_on_submit=False):
@@ -4853,9 +5066,12 @@ if _tab_active(o):
                                                 for _idx,_line in _lines.iterrows():
                                                     _label=_line_options[_idx]
                                                     _line_records.append({
-                                                        "SKU":str(_line.get("SKU","")),
+                                                        "SKU":"",
+                                                        "Código":str(_line.get("Código","")),
+                                                        "Zona":str(_line.get("Zona","")),
                                                         "Artículo":str(_line.get("Artículo","")),
-                                                        "Picker relacionado":str(_line.get("Picker relacionado","")),
+                                                        "Picker relacionado":str(_line.get("Correo del picker",_line.get("Picker relacionado",""))),
+                                                        "Correo del picker":str(_line.get("Correo del picker",_line.get("Picker relacionado",""))),
                                                         "Cantidad pedida":str(_line.get("Cantidad pedida","")),
                                                         "Cantidad pickeada":str(_line.get("Cantidad pickeada","")),
                                                         "Diferencia encontrada":_label in _diff_items,
@@ -4917,7 +5133,7 @@ if _tab_active(o):
                 st.error(f"No pude leer el archivo de pedidos: {_audit_error}")
 
         with st.expander("📥 Importar auditorías desde AppSheet (sin puente)",expanded=False):
-            st.caption("Descarga el Google Sheet fuente desde Archivo > Descargar > Microsoft Excel (.xlsx). El libro debe conservar las pestañas Articulos y Validaciones. Solo se importan pedidos con al menos una línea validada; una orden parcial seguirá pendiente.")
+            st.caption("Descarga el Google Sheet fuente desde Archivo > Descargar > Microsoft Excel (.xlsx). Se archivan las auditorías y validaciones ligadas antes de reemplazar el lote activo.")
             _appsheet_export_file=st.file_uploader(
                 "Libro de auditorías descargado de Google Sheets",
                 type=["xlsx"],
