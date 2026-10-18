@@ -37,7 +37,7 @@ function doPost(e) {
       required.forEach(name => {
         counts[name] = Math.max(0, ss.getSheetByName(name).getLastRow() - 1);
       });
-      return respuesta({ok:true,message:'Puente y hoja conectados',tables:counts});
+      return respuesta({ok:true,message:'Puente y hoja conectados',tables:counts,capabilities:{replaceBatch:true}});
     }
     if (!lock.tryLock(25000)) return respuesta({ok:false,error:'Ocupado; reintentar'});
     const ss = SpreadsheetApp.openById(AUDIT_SHEET);
@@ -49,10 +49,26 @@ function doPost(e) {
       return respuesta({ok:true,data:data});
     }
     if (body.action === 'publish') {
+      if (body.replaceBatch === true) {
+        if (body.archiveConfirmed !== true) throw new Error('El reemplazo requiere confirmar el archivado previo.');
+        const current = {};
+        ['Pedidos','Articulos','Validaciones','Auditorias','Diferencias'].forEach(name => {
+          current[name] = registros(ss.getSheetByName(name));
+        });
+        if (!body.expectedFingerprint || body.expectedFingerprint !== huellaLote(current)) {
+          throw new Error('El lote cambió desde la lectura; no se borró ningún dato. Vuelve a cargar y reintenta.');
+        }
+        validarNuevoLote(ss,body);
+        ['Pedidos','Articulos','Validaciones','Auditorias','Diferencias'].forEach(name => limpiarDatos(ss.getSheetByName(name)));
+        formatoCodigoTexto(ss.getSheetByName('Articulos'));
+        guardar(ss.getSheetByName('Pedidos'),body.Pedidos);
+        guardar(ss.getSheetByName('Articulos'),body.Articulos);
+        return respuesta({ok:true,replaced:true,message:'Lote anterior archivado y lote nuevo cargado.'});
+      }
       ['Pedidos','Articulos'].forEach(name => {
         if (Array.isArray(body[name]) && body[name].length) guardar(ss.getSheetByName(name),body[name]);
       });
-      return respuesta({ok:true});
+      return respuesta({ok:true,replaced:false});
     }
     if (body.action === 'audit') {
       const audit = body.audit;
@@ -83,6 +99,84 @@ function doPost(e) {
   } finally {
     if (lock.hasLock()) lock.releaseLock();
   }
+}
+
+function huellaLote(tables) {
+  function rowValues(table, fields) {
+    const rows = (tables[table] || []).map(row => fields.map(field => String(row[field] == null ? '' : row[field]).trim()));
+    rows.sort((a,b) => {
+      for (let i = 0; i < a.length; i++) {
+        if (a[i] < b[i]) return -1;
+        if (a[i] > b[i]) return 1;
+      }
+      return 0;
+    });
+    return rows;
+  }
+  const payload = {
+    Pedidos: rowValues('Pedidos',['ID_Pedido','Slot']),
+    Articulos: rowValues('Articulos',['ID_Articulo','ID_Pedido','Codigo_Barras','Zona','Articulo','Picker','Cantidad_Pedida','Cantidad_Pickeada'])
+  };
+  const digest = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256,
+    JSON.stringify(payload),
+    Utilities.Charset.UTF_8
+  );
+  return digest.map(byte => ('0' + ((byte + 256) % 256).toString(16)).slice(-2)).join('');
+}
+
+function validarNuevoLote(ss, body) {
+  const orders = body.Pedidos;
+  const articles = body.Articulos;
+  if (!Array.isArray(orders) || !orders.length || orders.length > 20000) throw new Error('El lote nuevo no contiene pedidos válidos.');
+  if (!Array.isArray(articles) || !articles.length || articles.length > 20000) throw new Error('El lote nuevo no contiene artículos válidos.');
+  const orderSheet = ss.getSheetByName('Pedidos');
+  const articleSheet = ss.getSheetByName('Articulos');
+  const orderHeaders = orderSheet.getRange(1,1,1,orderSheet.getLastColumn()).getValues()[0];
+  const articleHeaders = articleSheet.getRange(1,1,1,articleSheet.getLastColumn()).getValues()[0];
+  ['ID_Pedido','Slot'].forEach(name => { if (orderHeaders.indexOf(name) < 0) throw new Error('Falta la columna ' + name + ' en Pedidos.'); });
+  ['ID_Articulo','ID_Pedido','Articulo','Picker','Cantidad_Pedida','Cantidad_Pickeada','Codigo_Barras','Zona'].forEach(name => {
+    if (articleHeaders.indexOf(name) < 0) throw new Error('Falta la columna ' + name + ' en Articulos.');
+  });
+  const orderIds = new Set();
+  orders.forEach(row => {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) throw new Error('Registro inválido en Pedidos.');
+    const id = String(row.ID_Pedido || '').trim();
+    if (!id || !String(row.Slot || '').trim() || orderIds.has(id)) throw new Error('Pedido incompleto o duplicado.');
+    orderIds.add(id);
+  });
+  const articleIds = new Set();
+  articles.forEach(row => {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) throw new Error('Registro inválido en Articulos.');
+    const id = String(row.ID_Articulo || '').trim();
+    const order = String(row.ID_Pedido || '').trim();
+    const code = String(row.Codigo_Barras || '').trim();
+    const zone = String(row.Zona || '').trim();
+    const picker = String(row.Picker || '').trim();
+    if (!id || articleIds.has(id) || !orderIds.has(order) || !code || !zone ||
+        !String(row.Articulo || '').trim() || !String(row.Cantidad_Pedida || '').trim() ||
+        !String(row.Cantidad_Pickeada || '').trim() || !picker || picker.indexOf('@') < 1) {
+      throw new Error('Artículo incompleto, duplicado o ligado a un pedido inexistente.');
+    }
+    articleIds.add(id);
+  });
+}
+
+function limpiarDatos(sheet) {
+  if (!sheet) throw new Error('Tabla ausente durante el reemplazo.');
+  const lastRow = sheet.getLastRow();
+  const lastColumn = sheet.getLastColumn();
+  if (lastRow > 1 && lastColumn > 0) sheet.getRange(2,1,lastRow - 1,lastColumn).clearContent();
+}
+
+function formatoCodigoTexto(sheet) {
+  if (!sheet) throw new Error('Tabla Articulos ausente.');
+  const width = sheet.getLastColumn();
+  if (!width) throw new Error('Tabla Articulos sin encabezados.');
+  const headers = sheet.getRange(1,1,1,width).getValues()[0];
+  const codeColumn = headers.indexOf('Codigo_Barras') + 1;
+  if (codeColumn < 1) throw new Error('Falta Codigo_Barras en Articulos.');
+  sheet.getRange(2,codeColumn,Math.max(1,sheet.getMaxRows() - 1),1).setNumberFormat('@');
 }
 
 function respuesta(value) {
