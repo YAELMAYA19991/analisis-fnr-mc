@@ -4802,7 +4802,6 @@ if _tab_active(o):
                             "Cantidad pedida":_audit_df[_mapping["cantidad_pedida"]].astype(str).str.strip(),
                             "Cantidad pickeada":_audit_df[_mapping["cantidad_pickeada"]].astype(str).str.strip(),
                             "Picker":_picker_values,
-                            "Picker relacionado":_picker_values,
                             "Correo del picker":_picker_values,
                             "Estatus":_audit_df[_mapping["estatus"]].astype(str).str.strip() if _mapping["estatus"]!="— Sin columna —" else "",
                         })
