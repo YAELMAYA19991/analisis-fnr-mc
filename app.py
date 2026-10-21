@@ -175,6 +175,104 @@ def _attendance_person_key(identifier, lastname, firstname):
     if value and value not in {"NAN","NONE","NAT"}: return "id:"+value
     return "nombre:"+(token_key(f"{lastname} {firstname}") or person_key(f"{lastname} {firstname}"))
 
+def _meal_clock_text(value):
+    """Convierte una checada de Excel a HH:MM sin confundir duraciones mayores a 24 h."""
+    if value is None or pd.isna(value): return ""
+    if hasattr(value,"hour") and hasattr(value,"minute"):
+        return f"{int(value.hour):02d}:{int(value.minute):02d}"
+    try:
+        if isinstance(value,(int,float,np.integer,np.floating)):
+            total=int(round(float(value)*86400))
+        else:
+            total=int(round(pd.to_timedelta(value).total_seconds()))
+        total%=86400
+        return f"{total//3600:02d}:{(total%3600)//60:02d}"
+    except Exception:
+        match=re.search(r"(?:^|\s)(\d{1,2}):(\d{2})",str(value))
+        return f"{int(match.group(1)):02d}:{match.group(2)}" if match else ""
+
+def _meal_date_value(value):
+    """Lee fechas ISO, seriales de Excel y fechas con día de semana."""
+    if value is None or pd.isna(value): return pd.NaT
+    if isinstance(value,(datetime,pd.Timestamp)): return pd.Timestamp(value).normalize()
+    text=str(value).strip()
+    match=re.search(r"(\d{1,2})[-/](\d{1,2})[-/](\d{4})",text)
+    if match:
+        return pd.to_datetime("-".join(match.groups()),format="%d-%m-%Y",errors="coerce")
+    return pd.to_datetime(value,errors="coerce",dayfirst=True)
+
+@st.cache_data(show_spinner=False,max_entries=4)
+def parse_night_meal_attendance(data):
+    """Extrae checadas de comida nocturna; mantiene el día del turno como fecha operativa."""
+    try: raw=pd.read_excel(io.BytesIO(data),header=None,dtype=object)
+    except Exception as exc: raise ValueError(f"No pude abrir el Excel de asistencia: {exc}") from exc
+    header_i=None; headers=[]
+    for i in range(min(len(raw),20)):
+        candidate=[norm(x) if pd.notna(x) else "" for x in raw.iloc[i].tolist()]
+        if (any(x in {"apellidos","apellido","last_name"} for x in candidate)
+            and any(x in {"nombre","first_name","name"} for x in candidate)
+            and any(x in {"fecha","date"} for x in candidate)
+            and any(x in {"turno","shift","horario"} for x in candidate)):
+            header_i=i; headers=candidate; break
+    if header_i is None: raise ValueError("No localicé encabezados de apellidos, nombre, fecha y turno en las primeras 20 filas.")
+    def find_one(aliases):
+        return next((i for i,x in enumerate(headers) if x in aliases),None)
+    last_i=find_one({"apellidos","apellido","last_name"})
+    first_i=find_one({"nombre","first_name","name"})
+    date_i=find_one({"fecha","date"})
+    shift_i=find_one({"turno","shift","horario"})
+    identifier_i=find_one({"identificador","id","curp","employee_id"})
+    in_cols=[i for i,x in enumerate(headers) if x.startswith("entro") or x.startswith("entrada")]
+    out_cols=[i for i,x in enumerate(headers) if x.startswith("salio") or x.startswith("salida")]
+    # En el reporte de checador, el primer Salió es salida a comida,
+    # el segundo Entró es regreso de comida y el último Salió es salida del turno.
+    meal_out_i=next((i for i in out_cols if "comida" in headers[i] or "break" in headers[i]),out_cols[0] if out_cols else None)
+    meal_in_i=next((i for i in in_cols if "comida" in headers[i] or "break" in headers[i]),in_cols[1] if len(in_cols)>1 else None)
+    shift_out_i=out_cols[-1] if len(out_cols)>1 else None
+    shift_in_i=in_cols[0] if in_cols else None
+    if None in (last_i,first_i,date_i,shift_i,meal_out_i,meal_in_i):
+        raise ValueError("Faltan columnas para identificar persona, fecha, turno, salida a comida y regreso de comida. Este reporte debe tener dos columnas de entrada y dos de salida, o nombres explícitos de comida.")
+    def get(row,index):
+        return row.iloc[index] if index is not None and index<len(row) else None
+    result=[]
+    for _,row in raw.iloc[header_i+1:].iterrows():
+        lastname=str(get(row,last_i) or "").strip()
+        firstname=str(get(row,first_i) or "").strip()
+        if not lastname and not firstname: continue
+        shift=str(get(row,shift_i) or "").strip()
+        start_match=re.search(r"(\d{1,2}):(\d{2})",shift)
+        is_night=bool(start_match and int(start_match.group(1))>=22) or "noct" in norm(shift)
+        if not is_night: continue
+        operational_date=_meal_date_value(get(row,date_i))
+        if pd.isna(operational_date): continue
+        meal_out=_meal_clock_text(get(row,meal_out_i))
+        meal_in=_meal_clock_text(get(row,meal_in_i))
+        shift_in=_meal_clock_text(get(row,shift_in_i))
+        shift_out=_meal_clock_text(get(row,shift_out_i))
+        if not meal_out and not meal_in and not shift_in and not shift_out:
+            status="Sin checadas de turno"
+        elif not meal_out and not meal_in:
+            status="Faltan salida y regreso de comida"
+        elif not meal_out:
+            status="Falta salida a comida"
+        elif not meal_in:
+            status="Falta regreso de comida"
+        else:
+            def within_window(clock):
+                h,m=map(int,clock.split(":")); minutes=h*60+m
+                return 60<=minutes<=180
+            status="Comida completa" if within_window(meal_out) and within_window(meal_in) else "Checada fuera de 01:00–03:00"
+        result.append({
+            "Fecha operativa":operational_date.strftime("%Y-%m-%d"),
+            "Fecha calendario de comida":(operational_date+pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+            "Apellidos":lastname,"Nombre":firstname,
+            "Identificador":str(get(row,identifier_i) or "").strip() if identifier_i is not None else "",
+            "Turno":shift,"Salida a comida":meal_out,"Regreso de comida":meal_in,
+            "Salida de turno":shift_out,"Estado de comida":status,
+        })
+    if not result: raise ValueError("No encontré filas de turno nocturno con fecha válida en este Excel.")
+    return pd.DataFrame(result)
+
 def build_attendance_summary(absence_bytes,tardy_bytes,absence_name="Faltas",tardy_name="Retardos",roster_rows=None,shift_config=None):
     """Cruza faltas/retardos y completa turno/supervisor/área desde plantilla."""
     absent=_attendance_find_sheet(absence_bytes,["apellidos","nombre","fecha"],"faltas")
@@ -5539,6 +5637,34 @@ if _tab_active(i):
     with i:
         st.subheader("📅 Faltas y retardos")
         st.caption("Carga los dos reportes para ver incidencias por persona y turno. Si una falta no trae turno, se completa desde la plantilla consolidada.")
+        with st.expander("🍽️ Checadas de comida · turno nocturno",expanded=True):
+            st.caption("La fecha operativa es el día en que inicia el turno. La comida de 01:00 a 03:00 se busca en el día calendario siguiente. En el reporte de checador, ‘Salió’ del primer bloque es salida a comida y el segundo ‘Entró’ es regreso.")
+            _meal_upload=st.file_uploader("Cargar Excel de asistencias",type=["xlsx","xls"],key="night_meal_attendance_upload")
+            if _meal_upload is not None:
+                try:
+                    _meal_df=parse_night_meal_attendance(_meal_upload.getvalue())
+                    _mc1,_mc2,_mc3,_mc4=st.columns(4)
+                    _mc1.metric("Turnos nocturnos",f"{len(_meal_df):,}")
+                    _mc2.metric("Comida completa",f"{int(_meal_df['Estado de comida'].eq('Comida completa').sum()):,}")
+                    _mc3.metric("Checadas incompletas",f"{int(_meal_df['Estado de comida'].str.startswith(('Falta','Faltan')).sum()):,}")
+                    _mc4.metric("Sin checadas del turno",f"{int(_meal_df['Estado de comida'].eq('Sin checadas de turno').sum()):,}")
+                    _mf1,_mf2,_mf3=st.columns([1,1,2])
+                    _meal_date_options=sorted(_meal_df["Fecha operativa"].unique().tolist())
+                    _meal_date_filter=_mf1.selectbox("Fecha operativa",["Todas"]+_meal_date_options,key="night_meal_date_filter")
+                    _meal_status_options=sorted(_meal_df["Estado de comida"].unique().tolist())
+                    _meal_status_filter=_mf2.selectbox("Estado",["Todos"]+_meal_status_options,key="night_meal_status_filter")
+                    _meal_person_search=_mf3.text_input("Buscar persona",placeholder="Nombre o identificador",key="night_meal_person_search")
+                    _meal_view=_meal_df.copy()
+                    if _meal_date_filter!="Todas": _meal_view=_meal_view[_meal_view["Fecha operativa"]==_meal_date_filter]
+                    if _meal_status_filter!="Todos": _meal_view=_meal_view[_meal_view["Estado de comida"]==_meal_status_filter]
+                    if _meal_person_search.strip():
+                        _meal_needle=norm(_meal_person_search)
+                        _meal_view=_meal_view[_meal_view.apply(lambda row:_meal_needle in norm(f"{row['Apellidos']} {row['Nombre']} {row['Identificador']}"),axis=1)]
+                    st.dataframe(_meal_view,use_container_width=True,hide_index=True)
+                    st.download_button("Descargar tabla de comida (CSV)",_meal_view.to_csv(index=False).encode("utf-8-sig"),file_name="checadas_comida_nocturna.csv",mime="text/csv",key="download_night_meal_attendance")
+                    st.caption("El Excel se analiza en la carga y no modifica los registros guardados de faltas, retardos ni seguimientos.")
+                except Exception as _meal_error:
+                    st.error(f"No pude procesar las checadas de comida: {_meal_error}")
         _shift_cfg=store.get("attendance_shift_config",{}) or {"Mañana":[6,7,8,9,10],"Intermedio":[11],"Tarde":[13,14],"Nocturno":[22]}
         with st.expander("⚙️ Configurar horarios de turno",expanded=False):
             _sc1,_sc2,_sc3,_sc4=st.columns(4)
