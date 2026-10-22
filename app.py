@@ -4721,6 +4721,11 @@ if _tab_active(o):
                 else:
                     st.success("Conexión AppSheet correcta. Puente y hoja respondieron; no se escribieron datos.")
                     st.write("Estado del puente:",_health_result.get("message","Activo"))
+                    _bridge_capabilities=_health_result.get("capabilities") or {}
+                    if _bridge_capabilities.get("replaceBatch"):
+                        st.info("Reemplazo automático habilitado: el siguiente CSV sustituye el lote activo y conserva el historial de auditorías.")
+                    else:
+                        st.warning("La lectura funciona, pero el puente no confirma el reemplazo automático. El lote anterior se conservará hasta habilitar esa capacidad.")
                 st.write("Registros disponibles:",_test_counts)
             except Exception as _test_error:
                 st.error(f"No se pudo completar la prueba de solo lectura: {_test_error}")
@@ -4733,7 +4738,7 @@ if _tab_active(o):
             "1. Cargar pedidos (Excel o CSV)",
             type=["xlsx","xls","csv"],
             key="order_audit_upload",
-            help="Usa el archivo de picking exportado. No se modifica ni se reemplaza.",
+            help="El archivo original no se modifica. Con el puente activo, el CSV sincroniza el lote del día; revisa el estado del reemplazo en pantalla.",
         )
         if audit_upload is None:
             st.info("Carga el archivo del día para ver los pedidos pendientes de auditoría.")
@@ -4933,16 +4938,18 @@ if _tab_active(o):
                                 )
                                 _risk_summary["Puntaje selección"]=_risk_summary["Puntaje alarma"]+_risk_summary["Picker nocturno"].astype(int)*2
 
-                                _manual_appsheet_zip=appsheet_orders_import_zip(_audit_detail,_risk_summary)
-                                with st.expander("📤 Preparar carga manual a AppSheet (sin puente)",expanded=False):
-                                    st.caption("El ZIP incluye orden y slot en Pedidos; en Articulos incluye zona, código, producto, cantidades y correo del picker. La importación manual agrega/actualiza filas, pero no limpia el lote previo. Después de validar, descarga el libro fuente como Excel y súbelo en el importador de auditorías.")
-                                    st.download_button(
-                                        "Descargar carga de pedidos y artículos (.zip)",
-                                        _manual_appsheet_zip,
-                                        "Carga_manual_AppSheet.zip",
-                                        "application/zip",
-                                        key="appsheet_manual_order_package",
-                                    )
+                                _bridge_url_for_manual,_bridge_token_for_manual=appsheet_bridge_settings()
+                                if not _bridge_url_for_manual or not _bridge_token_for_manual:
+                                    _manual_appsheet_zip=appsheet_orders_import_zip(_audit_detail,_risk_summary)
+                                    with st.expander("📤 Preparar carga manual a AppSheet (alternativa)",expanded=False):
+                                        st.caption("La carga manual no elimina el lote anterior. Usa el puente automático cuando esté configurado para sustituir el lote activo y conservar el historial.")
+                                        st.download_button(
+                                            "Descargar carga de pedidos y artículos (.zip)",
+                                            _manual_appsheet_zip,
+                                            "Carga_manual_AppSheet.zip",
+                                            "application/zip",
+                                            key="appsheet_manual_order_package",
+                                        )
 
                                 _saved_audits=store.get("order_audits",[]) or []
                                 _bridge_remote_audits=[]
