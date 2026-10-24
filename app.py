@@ -5034,10 +5034,8 @@ if _tab_active(o):
                             )
                             _included_orders=set(_slot_stats.loc[~_slot_stats["_slot_missing"],"Número de pedido"])
                             _bad_time_orders=int(_slot_stats["_slot_missing"].sum())
-                            _after_noon_orders=set(_slot_stats.loc[_slot_stats["_slot_max"]>12*60,"Número de pedido"])
                             _eligible=_audit_data[
                                 _audit_data["Número de pedido"].isin(_included_orders)
-                                & ~_audit_data["Número de pedido"].isin(_after_noon_orders)
                             ].drop(columns="_slot_min").copy()
 
                             if _eligible.empty:
@@ -5078,10 +5076,9 @@ if _tab_active(o):
                                     _eligible,s,_audit_hist_fnr,_audit_hist_mc,store.get("order_audits",[])
                                 )
                                 st.success(
-                                    f"Archivo leído: {len(_audit_detail):,} renglones de artículo en "
-                                    f"{_risk_summary['Número de pedido'].nunique():,} pedidos hasta las 12:00. "
-                                    f"Se omitieron {len(_after_noon_orders):,} pedidos posteriores al corte "
-                                    f"y {_bad_time_orders:,} sin hora válida."
+                                    f"Datos listos para auditoría: {len(_audit_detail):,} artículos en "
+                                    f"{_risk_summary['Número de pedido'].nunique():,} pedidos con slot válido. "
+                                    f"Se omitieron {_bad_time_orders:,} pedidos sin hora válida."
                                 )
                                 _risk_summary=_risk_summary.merge(
                                     _slot_stats[["Número de pedido","_slot_min","_slot_max"]],
@@ -5223,8 +5220,8 @@ if _tab_active(o):
 
                                 _coverage_label=st.selectbox(
                                     "2. Pedidos a revisar",
-                                    ["Mi turno: slots antes de 10:00","Equipo de día: slots desde 10:00","Todo el día"],
-                                    key="audit_coverage_simple",
+                                    ["Todo el día","Mi turno: slots antes de 10:00","Equipo de día: slots desde 10:00"],
+                                    key="audit_coverage_simple_v2",
                                 )
                                 _coverage_mode="early" if _coverage_label.startswith("Mi turno") else "day" if _coverage_label.startswith("Equipo") else "all"
                                 _coverage_summary=audit_coverage_filter(_risk_summary,_coverage_mode)
