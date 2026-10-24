@@ -2836,8 +2836,11 @@ def appsheet_rows_to_audits(tables, detail):
             grouped.setdefault(order,[]).append((article_id,article,latest.get(article_id)))
 
     reviewed_orders={
-        str(by_article[article_id].get("ID_Pedido","") or "").strip()
-        for article_id in latest if article_id in by_article
+        str(article.get("ID_Pedido","") or "").strip()
+        for article_id,article in by_article.items()
+        if article_id in latest or any(
+            _truth(article.get(key,"")) for key in ("Validado_Rapido","Validado_AppSheet","Validado")
+        )
     }
     target_orders=reviewed_orders | set(audit_by_order)
     out=[]
@@ -2857,10 +2860,12 @@ def appsheet_rows_to_audits(tables, detail):
             except (TypeError,ValueError):
                 ordered=0.0
             quality=_truth(validation.get("Calidad_Correcta","")) if has_validation else True
-            checked=_truth(validation.get("Validado","")) if has_validation else False
+            checked=_truth(validation.get("Validado","")) or any(
+                _truth(article.get(key,"")) for key in ("Validado_Rapido","Validado_AppSheet","Validado")
+            )
             article_diffs=diff_by_article.get(article_id,[])
             has_saved_difference=any(_truth(x.get("Diferencia_Encontrada","")) for x in article_diffs)
-            has_validation_difference=has_validation and ((not quality) or abs(quantity-ordered)>0.000001)
+            has_validation_difference=has_validation and _truth(validation.get("Validado","")) and ((not quality) or abs(quantity-ordered)>0.000001)
             note=str(validation.get("Observaciones","") or "")
             if not note:
                 note=next((str(x.get("Observaciones","") or x.get("Correccion","") or "")
@@ -2882,7 +2887,7 @@ def appsheet_rows_to_audits(tables, detail):
                 "Corrección / observación":note,
                 "_appsheet_validado":bool(checked),
             })
-        complete=bool(_truth(audit.get("Validado",""))) if audit else bool(lines) and all(x["_appsheet_validado"] for x in lines)
+        complete=bool(lines) and all(x["_appsheet_validado"] for x in lines)
         fecha=str(audit.get("Fecha_Auditoria","") or "") or max(
             (str(v.get("Fecha_Validacion","") or "") for _,_,v in items if v),default=""
         )
@@ -2915,6 +2920,39 @@ def appsheet_rows_to_audits(tables, detail):
             "fuente_archivo":"AppSheet","appsheet":True,
         })
     return out
+
+
+def persist_completed_appsheet_audits(store,tables):
+    """Guarda auditorías completas recibidas de AppSheet sin duplicarlas."""
+    incoming=appsheet_rows_to_audits(tables,pd.DataFrame())
+    completed=[
+        row for row in incoming
+        if audit_record_is_complete(row) and str(row.get("pedido","")).strip()
+    ]
+    existing=[dict(row) for row in (store.get("order_audits",[]) or []) if isinstance(row,dict)]
+
+    def _signature(record):
+        return json.dumps(record,sort_keys=True,ensure_ascii=False,default=str,separators=(",",":"))
+
+    old_by_id={str(row.get("id","") or ""):row for row in existing if row.get("id")}
+    new_count=0
+    updated_count=0
+    for row in completed:
+        key=str(row.get("id","") or "")
+        previous=old_by_id.get(key)
+        if not previous:
+            new_count+=1
+        elif _signature(previous)!=_signature(row):
+            updated_count+=1
+    if new_count or updated_count:
+        merged=merge_order_audit_records(existing,completed)
+        store["order_audits"]=merged
+        try:
+            save_store(store)
+        except Exception:
+            store["order_audits"]=existing
+            raise
+    return new_count,updated_count
 
 
 def appsheet_archive_preflight(tables, detail):
@@ -4842,6 +4880,60 @@ if _tab_active(a):
 
 if _tab_active(o):
     with o:
+        @st.fragment(run_every=30)
+        def _sync_completed_appsheet_orders():
+            _now=datetime.now(ZoneInfo("America/Mexico_City")).timestamp()
+            try:
+                _last_poll=float(st.session_state.get("_appsheet_auto_sync_last_poll",0) or 0)
+            except (TypeError,ValueError):
+                _last_poll=0.0
+            st.caption("AppSheet se consulta automáticamente cada 30 segundos mientras esta página está abierta.")
+            if _last_poll and _now-_last_poll<25:
+                return
+            st.session_state["_appsheet_auto_sync_last_poll"]=_now
+            st.session_state["_appsheet_active_orders_attempted"]=True
+            try:
+                _sync_response=appsheet_bridge_call("read")
+                _sync_tables=_sync_response.get("data",{}) or {}
+                _previous_cache=st.session_state.get("_appsheet_active_orders_cache",{}) or {}
+                _previous_tables=_previous_cache.get("tables",{}) or {}
+                _missing_tables=[
+                    name for name in ("Pedidos","Articulos")
+                    if _previous_tables.get(name) and not _sync_tables.get(name)
+                ]
+                if _missing_tables:
+                    raise RuntimeError("AppSheet no devolvió las tablas "+", ".join(_missing_tables)+"; conservé la última lectura válida.")
+                _sync_fingerprint=hashlib.sha256(
+                    json.dumps(_sync_tables,ensure_ascii=False,sort_keys=True,default=str,separators=(",",":")).encode("utf-8")
+                ).hexdigest()
+                _previous_fingerprint=st.session_state.get("_appsheet_bridge_read_fingerprint","")
+                _sync_csv,_sync_order_count,_sync_article_count,_sync_skipped=appsheet_active_orders_csv(_sync_tables)
+                _sync_new,_sync_updated=persist_completed_appsheet_audits(load_store(),_sync_tables)
+                st.session_state["_appsheet_active_orders_cache"]={
+                    "csv":_sync_csv,"tables":_sync_tables,
+                    "health":st.session_state.get("_appsheet_active_orders_health",{}),
+                    "pedidos":_sync_order_count,"articulos":_sync_article_count,
+                    "pedidos_tabla":len(_sync_tables.get("Pedidos",[]) or []),
+                    "articulos_tabla":len(_sync_tables.get("Articulos",[]) or []),
+                    "omitidos":_sync_skipped,
+                    "loaded_at":datetime.now(ZoneInfo("America/Mexico_City")).isoformat(timespec="seconds"),
+                }
+                st.session_state["_appsheet_active_orders_error"]=""
+                st.session_state["_appsheet_bridge_read_fingerprint"]=_sync_fingerprint
+                if _sync_new or _sync_updated:
+                    st.session_state["_appsheet_auto_sync_notice"]=(
+                        f"AppSheet sincronizó automáticamente {_sync_new:,} pedidos completos"
+                        + (f" y actualizó {_sync_updated:,}." if _sync_updated else ".")
+                    )
+                if _sync_fingerprint!=_previous_fingerprint or _sync_new or _sync_updated:
+                    st.rerun()
+            except Exception as _sync_error:
+                st.session_state["_appsheet_active_orders_error"]=str(_sync_error)
+
+        _sync_completed_appsheet_orders()
+        _auto_sync_notice=st.session_state.pop("_appsheet_auto_sync_notice",None)
+        if _auto_sync_notice:
+            st.success(_auto_sync_notice)
         st.subheader("📦 Auditoría rápida de pedidos")
         st.caption("Carga el archivo de pedidos, elige uno de la lista y guarda el resultado. Los archivos originales solo se consultan; las auditorías quedan guardadas por separado.")
 
@@ -4898,6 +4990,24 @@ if _tab_active(o):
                         _active_health={"message":"Puente activo; diagnóstico health no disponible"}
                     _active_result=appsheet_bridge_call("read")
                     _active_tables=_active_result.get("data",{}) or {}
+                    _previous_cache=st.session_state.get("_appsheet_active_orders_cache",{}) or {}
+                    _previous_tables=_previous_cache.get("tables",{}) or {}
+                    _missing_tables=[
+                        name for name in ("Pedidos","Articulos")
+                        if _previous_tables.get(name) and not _active_tables.get(name)
+                    ]
+                    if _missing_tables:
+                        raise RuntimeError("AppSheet no devolvió las tablas "+", ".join(_missing_tables)+"; conservé la última lectura válida.")
+                    _active_new,_active_updated=persist_completed_appsheet_audits(load_store(),_active_tables)
+                    st.session_state["_appsheet_auto_sync_last_poll"]=datetime.now(ZoneInfo("America/Mexico_City")).timestamp()
+                    st.session_state["_appsheet_bridge_read_fingerprint"]=hashlib.sha256(
+                        json.dumps(_active_tables,ensure_ascii=False,sort_keys=True,default=str,separators=(",",":")).encode("utf-8")
+                    ).hexdigest()
+                    if _active_new or _active_updated:
+                        st.success(
+                            f"Se sincronizaron {_active_new:,} pedidos completos desde AppSheet"
+                            + (f" y se actualizaron {_active_updated:,}." if _active_updated else ".")
+                        )
                     _active_csv,_active_order_count,_active_article_count,_active_skipped=appsheet_active_orders_csv(_active_tables)
                     _active_cache={
                         "csv":_active_csv,
