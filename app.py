@@ -1794,15 +1794,17 @@ def template_roster_from_upload(data, include_other_roles=False):
             _raw=pd.read_excel(io.BytesIO(data),sheet_name=_outbound_sheet,header=None,dtype=object)
             _header_idx=None
             _header_map={}
-            _required={"puesto","turno","nombre","cargo","correo"}
+            _required={"puesto","turno","nombre","cargo"}
+            _email_headers=("correo","usuario","email","mail")
             for _i in range(8,len(_raw)):
                 _candidate={norm(v):j for j,v in enumerate(_raw.iloc[_i].tolist()) if pd.notna(v) and str(v).strip()}
-                if _required.issubset(_candidate):
+                if _required.issubset(_candidate) and any(_field in _candidate for _field in _email_headers):
                     _header_idx=_i
                     _header_map=_candidate
                     break
             if _header_idx is None:
-                raise ValueError("La hoja Outbound OKI no tiene los encabezados PUESTO, TURNO, NOMBRE, CARGO y CORREO.")
+                raise ValueError("La hoja Outbound OKI necesita PUESTO, TURNO, NOMBRE, CARGO y una columna CORREO/USUARIO.")
+            _email_field=next(_field for _field in _email_headers if _field in _header_map)
             _rows=[]
             def _shift_label(value):
                 _key=norm(value)
@@ -1869,7 +1871,7 @@ def template_roster_from_upload(data, include_other_roles=False):
                     # Algunas filas de Outbound OKI dejan CORREO vacío, pero
                     # sí tienen el correo corporativo en USUARIO. Usarlo como
                     # respaldo mantiene la llave de identidad y el expediente.
-                    "CORREO":_value("correo") or _value("usuario"),
+                    "CORREO":_value(_email_field),
                     "SUPERVISOR":"",
                     "AREA_MAESTRO":"Outbound OKI",
                     "PERSONAL_TIPO":_tipo,
