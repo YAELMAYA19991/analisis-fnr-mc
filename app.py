@@ -2731,6 +2731,55 @@ def appsheet_bridge_call(action, **payload):
     return result
 
 
+def appsheet_active_orders_csv(tables):
+    """Prepara en memoria las filas activas de AppSheet para la cola de auditoría."""
+    if not isinstance(tables,dict):
+        return "",0,0,0
+
+    def _value(row,*names):
+        for name in names:
+            value=row.get(name)
+            if value is None:
+                continue
+            text=str(value).strip()
+            if text and text.casefold() not in {"nan","none","null"}:
+                return text
+        return ""
+
+    orders={}
+    for row in tables.get("Pedidos",[]) or []:
+        order_id=_value(row,"ID_Pedido","Pedido","Order_ID","Numero_Pedido")
+        if order_id:
+            orders[order_id]=row
+
+    records=[]
+    order_ids=set()
+    skipped=0
+    for row in tables.get("Articulos",[]) or []:
+        order_id=_value(row,"ID_Pedido","Pedido","Order_ID")
+        parent=orders.get(order_id,{})
+        record={
+            "Orden":order_id or _value(parent,"ID_Pedido","Pedido"),
+            "Slot":_value(parent,"Slot","Horario") or _value(row,"Slot","Horario"),
+            "Zona":_value(row,"Zona","Zone","Area"),
+            "Código":_value(row,"Codigo_Barras","Código","Codigo","Barcode"),
+            "Producto":_value(row,"Articulo","Artículo","Producto","Product"),
+            "Cantidad pedida":_value(row,"Cantidad_Pedida","Cantidad pedida","Quantity_Ordered"),
+            "Cantidad piqueada":_value(row,"Cantidad_Pickeada","Cantidad piqueada","Cantidad pickeada","Quantity_Picked"),
+            "Correo del picker":_value(row,"Picker","Correo_Picker","Picker_Email","Correo del picker")
+                or _value(parent,"Pickers","Picker","Correo_Picker","Correo"),
+        }
+        if all(str(record[key]).strip() for key in record):
+            records.append(record)
+            order_ids.add(record["Orden"])
+        else:
+            skipped+=1
+
+    columns=["Orden","Slot","Zona","Código","Producto","Cantidad pedida","Cantidad piqueada","Correo del picker"]
+    csv_text=pd.DataFrame(records,columns=columns).to_csv(index=False)
+    return csv_text,len(order_ids),len(records),skipped
+
+
 def appsheet_rows_to_audits(tables, detail):
     """Convierte el lote activo de AppSheet en registros históricos para Control FNR/MC."""
     if not isinstance(tables,dict):
@@ -4828,15 +4877,70 @@ if _tab_active(o):
             st.success(_audit_flash)
 
         audit_upload=st.file_uploader(
-            "1. Cargar pedidos (Excel o CSV)",
+            "1. Cargar pedidos (Excel o CSV, opcional si están en AppSheet)",
             type=["xlsx","xls","csv"],
             key="order_audit_upload",
-            help="El archivo original no se modifica. Con el puente activo, el CSV sincroniza el lote del día; revisa el estado del reemplazo en pantalla.",
+            help="Si no eliges un archivo, la página lee el lote activo de AppSheet en modo solo lectura. El archivo original tampoco se modifica.",
         )
+        _audit_source_appsheet=False
         if audit_upload is None:
-            st.info("Carga el archivo del día para ver los pedidos pendientes de auditoría.")
-            st.markdown("**Columnas necesarias:** orden, slot, zona, código, producto, cantidad pedida, cantidad piqueada y correo del picker. No se importa fecha de entrega ni SKU.")
-        else:
+            _refresh_appsheet=st.button("🔄 Actualizar pedidos activos desde AppSheet",key="refresh_appsheet_active_orders")
+            _active_cache=st.session_state.get("_appsheet_active_orders_cache")
+            _already_attempted=st.session_state.get("_appsheet_active_orders_attempted",False)
+            if _refresh_appsheet or (_active_cache is None and not _already_attempted):
+                st.session_state["_appsheet_active_orders_attempted"]=True
+                try:
+                    try:
+                        _active_health=appsheet_bridge_call("health")
+                    except RuntimeError as _health_error:
+                        if "operación no permitida" not in str(_health_error).casefold():
+                            raise
+                        _active_health={"message":"Puente activo; diagnóstico health no disponible"}
+                    _active_result=appsheet_bridge_call("read")
+                    _active_tables=_active_result.get("data",{}) or {}
+                    _active_csv,_active_order_count,_active_article_count,_active_skipped=appsheet_active_orders_csv(_active_tables)
+                    _active_cache={
+                        "csv":_active_csv,
+                        "tables":_active_tables,
+                        "health":_active_health,
+                        "pedidos":_active_order_count,
+                        "articulos":_active_article_count,
+                        "pedidos_tabla":len(_active_tables.get("Pedidos",[]) or []),
+                        "articulos_tabla":len(_active_tables.get("Articulos",[]) or []),
+                        "omitidos":_active_skipped,
+                        "loaded_at":datetime.now(ZoneInfo("America/Mexico_City")).isoformat(timespec="seconds"),
+                    }
+                    st.session_state["_appsheet_active_orders_cache"]=_active_cache
+                    st.session_state["_appsheet_active_orders_error"]=""
+                except Exception as _active_load_error:
+                    st.session_state["_appsheet_active_orders_error"]=str(_active_load_error)
+            _active_cache=st.session_state.get("_appsheet_active_orders_cache")
+            _active_error=str(st.session_state.get("_appsheet_active_orders_error","") or "").strip()
+            if _active_cache and _active_cache.get("csv"):
+                audit_upload=io.BytesIO(str(_active_cache["csv"]).encode("utf-8"))
+                audit_upload.name="Pedidos_AppSheet.csv"
+                _audit_source_appsheet=True
+                st.success(
+                    f"Pedidos cargados desde AppSheet: {_active_cache.get('pedidos',0):,} pedidos y "
+                    f"{_active_cache.get('articulos',0):,} artículos completos."
+                )
+                st.caption(
+                    f"Lote activo leído en modo solo lectura · última actualización "
+                    f"{_active_cache.get('loaded_at','')} · los pedidos originales permanecen intactos."
+                )
+                if _active_cache.get("omitidos",0):
+                    st.warning(
+                        f"Se omitieron {_active_cache.get('omitidos',0):,} artículos con algún dato requerido vacío."
+                    )
+                if _active_error:
+                    st.warning("No se pudo actualizar AppSheet; se muestra la última lectura guardada en esta sesión.")
+            elif _active_error:
+                st.error(f"No se pudieron leer los pedidos de AppSheet: {_active_error}")
+                st.info("Puedes cargar un archivo Excel o CSV aquí como alternativa.")
+            else:
+                st.warning("AppSheet respondió, pero no hay artículos completos para mostrar.")
+                st.markdown("**Columnas requeridas:** pedido, slot, zona, código, producto, cantidades pedida y piqueada, y correo del picker.")
+        if audit_upload is not None:
             try:
                 _audit_raw=audit_upload.getvalue()
                 if audit_upload.name.lower().endswith(".csv"):
@@ -5047,7 +5151,12 @@ if _tab_active(o):
                                 _saved_audits=store.get("order_audits",[]) or []
                                 _bridge_remote_audits=[]
                                 _bridge_url,_bridge_token=appsheet_bridge_settings()
-                                if _bridge_url and _bridge_token:
+                                if _audit_source_appsheet:
+                                    _active_cache=st.session_state.get("_appsheet_active_orders_cache",{}) or {}
+                                    _bridge_tables=_active_cache.get("tables",{}) or {}
+                                    _bridge_remote_audits=appsheet_rows_to_audits(_bridge_tables,_audit_detail)
+                                    st.caption("Los pedidos activos y sus validaciones se consultan desde AppSheet en solo lectura; esta carga no publica ni reemplaza el lote.")
+                                elif _bridge_url and _bridge_token:
                                     try:
                                         _bridge_health=appsheet_bridge_call("health")
                                         _bridge_tables=appsheet_bridge_call("read").get("data",{})
