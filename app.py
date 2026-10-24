@@ -823,6 +823,10 @@ def _merge_store_states(remote,local):
     """Fusión conservadora si dos sesiones guardan casi al mismo tiempo."""
     merged=dict(remote or {})
     merged.update({k:v for k,v in (local or {}).items() if k not in STORE_SHARDS})
+    merged["supervisor_assignments"]={
+        **((remote or {}).get("supervisor_assignments",{}) or {}),
+        **((local or {}).get("supervisor_assignments",{}) or {}),
+    }
     merged["pickers"]=_merge_picker_store((remote or {}).get("pickers",{}),(local or {}).get("pickers",{}))
 
     remote_audits=(remote or {}).get("order_audits",[]) or []
@@ -971,6 +975,7 @@ def _load_store_from_sources():
     defaults={
         "pickers":{},"feedback_rows":[],"recursos_formatos":[],"procesos":[],
         "excluded_orders":[],"master_overrides":{},"master_excluded":[],
+        "supervisor_assignments":{},
         "seguimientos_documentos":[],"supervisores":[],"upload_meta":{},
         "attendance_summary":None,"attendance_meta":{},"attendance_links":{},
         "attendance_shift_config":{"Mañana":[6,7,8,9,10],"Intermedio":[11],"Tarde":[13,14],"Nocturno":[22]},
@@ -1741,6 +1746,49 @@ def effective_roster(roster, store):
         r=pd.concat([r[has_email].drop_duplicates("_EMAIL_KEY",keep="last"), r[~has_email].drop_duplicates("_KEY",keep="last")],ignore_index=True)
     return r
 
+def supervisor_assignment_key(row):
+    """Identidad persistente para asignar un responsable a una persona."""
+    ek=email_key(row.get("CORREO",""))
+    if ek:
+        return "email:"+ek
+    name=person_key(row.get("PICKER",""))
+    return "name:"+name if name else ""
+
+def apply_supervisor_assignments(frame, assignments):
+    """Aplica las asignaciones guardadas sin editar la plantilla ni los reportes."""
+    if frame is None or not isinstance(frame,pd.DataFrame) or frame.empty:
+        return frame
+    mapping=assignments if isinstance(assignments,dict) else {}
+    x=frame.copy()
+    if "SUPERVISOR" not in x.columns:
+        x["SUPERVISOR"]="No asignado"
+
+    # Si cambia el nombre de un líder pero conserva su correo, se muestra el nombre vigente.
+    current_leaders={}
+    if {"PICKER","PERSONAL_TIPO"}.issubset(x.columns):
+        leader_mask=x["PERSONAL_TIPO"].fillna("").astype(str).map(norm).isin({"supervisor","subgerente","jefe"})
+        for _,leader in x.loc[leader_mask].iterrows():
+            leader_key=supervisor_assignment_key(leader)
+            leader_name=str(leader.get("PICKER","")).strip()
+            if leader_key and leader_name:
+                current_leaders[leader_key]=leader_name
+
+    for index,row in x.iterrows():
+        record=mapping.get(supervisor_assignment_key(row))
+        if not record:
+            continue
+        if isinstance(record,dict):
+            leader_key=str(record.get("SUPERVISOR_KEY","")).strip()
+            supervisor=current_leaders.get(
+                leader_key,
+                str(record.get("SUPERVISOR","")).strip(),
+            )
+        else:
+            supervisor=str(record).strip()
+        if supervisor:
+            x.at[index,"SUPERVISOR"]=supervisor
+    return x
+
 def canonicalize_incidents(inc,base):
     """Asocia FNR/MC por correo de forma vectorizada; fallback conservador solo en pendientes."""
     if inc is None or inc.empty:
@@ -2088,11 +2136,13 @@ def prepare_source_frames(base_data,fnr_data,mc_data,roster_data,personnel_confi
         raise ValueError("La plantilla consolidada no contiene correos válidos.")
     base=apply_roster(base,roster)
     base=apply_manual_personnel(base,config)
+    base=apply_supervisor_assignments(base,config.get("supervisor_assignments",{}))
     base_match=(base.get("_MASTER_MATCH",pd.Series(False,index=base.index)).fillna(False).astype(bool)
                 | base.get("_MANUAL_MATCH",pd.Series(False,index=base.index)).fillna(False).astype(bool))
     base["CATEGORIA"]=np.where(base_match,"Picker","Sin registrar")
     base=_dedupe_columns(base)
     roster=effective_roster(roster,config)
+    roster=apply_supervisor_assignments(roster,config.get("supervisor_assignments",{}))
     fnr=canonicalize_incidents(fnr,roster)
     mc=canonicalize_incidents(mc,roster)
     identity=roster.rename(columns={"TURNO_MAESTRO":"TURNO","AREA_MAESTRO":"AREA_BASE"}).copy()
@@ -2115,6 +2165,7 @@ def prepare_history_frames(base_data,fnr_data,mc_data,roster,personnel_config_js
     hist_mc=parse_inc(choose(sheets_from_bytes(mc_data),["mc","mala"]),"MC")
     hist_base=apply_roster(hist_base,roster)
     hist_base=apply_manual_personnel(hist_base,config)
+    hist_base=apply_supervisor_assignments(hist_base,config.get("supervisor_assignments",{}))
     matched=(hist_base.get("_MASTER_MATCH",pd.Series(False,index=hist_base.index)).fillna(False).astype(bool)
              | hist_base.get("_MANUAL_MATCH",pd.Series(False,index=hist_base.index)).fillna(False).astype(bool))
     hist_base["CATEGORIA"]=np.where(matched,"Picker","Sin registrar")
@@ -3829,6 +3880,7 @@ store.setdefault("procesos", [])
 store.setdefault("recursos_formatos", [])
 store.setdefault("seguimientos_documentos", [])
 store.setdefault("supervisores", [])
+store.setdefault("supervisor_assignments", {})
 store.setdefault("upload_meta", {})
 store.setdefault("attendance_summary", None)
 store.setdefault("attendance_meta", {})
@@ -4016,6 +4068,7 @@ try:
     personnel_config_json=json.dumps({
         "master_overrides":store.get("master_overrides",{}),
         "master_excluded":store.get("master_excluded",[]),
+        "supervisor_assignments":store.get("supervisor_assignments",{}),
     },ensure_ascii=False,sort_keys=True)
     base,fnr,mc,roster=prepare_source_frames(
         ub.getvalue(),uf.getvalue(),um.getvalue(),up.getvalue(),personnel_config_json
@@ -4366,7 +4419,10 @@ fnr_view=select_summary_people(fnr,s_view)
 mc_view=select_summary_people(mc,s_view)
 
 attendance_summary=store.get("attendance_summary") or {}
-attendance_people=attendance_summary.get("personas",[]) if isinstance(attendance_summary,dict) else []
+attendance_people=[
+    dict(_person) for _person in (attendance_summary.get("personas",[]) if isinstance(attendance_summary,dict) else [])
+    if isinstance(_person,dict)
+]
 attendance_by_name={}
 for _person in attendance_people:
     _k=token_key(_person.get("Persona",""))
@@ -4395,6 +4451,12 @@ if isinstance(s,pd.DataFrame) and "PICKER" in s.columns:
             ):
                 _bucket.append(_candidate)
 app_people_names=sorted({z["PICKER"] for _bucket in app_people_by_name.values() for z in _bucket},key=lambda z:z.upper())
+# La asignación vigente en el maestro se refleja también en la tabla de asistencia guardada,
+# sin reescribir el registro original.
+for _person in attendance_people:
+    _current_matches=app_people_by_name.get(token_key(_person.get("Persona","")),[])
+    if len(_current_matches)==1:
+        _person["Supervisor"]=_current_matches[0].get("SUPERVISOR","No asignado")
 
 with st.expander("🔳 Generador de códigos QR",expanded=False):
     st.caption("Genera códigos CYN-PCABA-U1–U30 o un QR personalizado sin ocupar espacio en la portada.")
@@ -5609,6 +5671,121 @@ if _tab_active(g):
             )
         else:
             st.info("La plantilla actual no contiene personas con cargo Supervisor, Subgerente o Jefe.")
+        with st.expander("🧭 Asignar supervisor a Pickers y Layout",expanded=False):
+            st.caption("Usa la lista de TURNOS LÍDERES de Outbound OKI. Puedes asignar varios colaboradores al mismo responsable; el cambio se aplica a FNR/MC, Seguimiento y asistencia sin modificar los Excel originales.")
+            _assignment_roster=roster.copy() if isinstance(roster,pd.DataFrame) else pd.DataFrame()
+            _assignment_types=_assignment_roster.get("PERSONAL_TIPO",pd.Series("",index=_assignment_roster.index)).fillna("").astype(str).map(norm)
+            _assignable=_assignment_roster.loc[_assignment_types.isin({"picker","layout"})].copy()
+            if not _assignable.empty:
+                _assignable["_ASSIGN_KEY"]=_assignable.apply(supervisor_assignment_key,axis=1)
+                _assignable=_assignable[_assignable["_ASSIGN_KEY"].astype(str).str.strip().ne("")].drop_duplicates("_ASSIGN_KEY",keep="last")
+            _leader_lookup={}
+            if not _leaders.empty:
+                for _,_leader in _leaders.iterrows():
+                    _leader_key=supervisor_assignment_key(_leader)
+                    _leader_name=str(_leader.get("PICKER","")).strip()
+                    if not _leader_key or not _leader_name:
+                        continue
+                    _leader_lookup[_leader_key]={
+                        "nombre":_leader_name,
+                        "cargo":str(_leader.get("PERSONAL_TIPO","Líder")).strip() or "Líder",
+                        "turno":str(_leader.get("TURNO_MAESTRO","Sin turno")).strip() or "Sin turno",
+                    }
+            if _assignable.empty:
+                st.info("No hay Pickers o Layout disponibles en la plantilla cargada.")
+            elif not _leader_lookup:
+                st.warning("No encontré líderes en Outbound OKI. Revisa que el bloque TURNOS LÍDERES tenga cargo, turno y nombre.")
+            else:
+                _assignable["TURNO_MAESTRO"]=_assignable.get("TURNO_MAESTRO",pd.Series("",index=_assignable.index)).fillna("").astype(str).str.strip()
+                _assignable["SUPERVISOR"]=_assignable.get("SUPERVISOR",pd.Series("No asignado",index=_assignable.index)).fillna("").astype(str).str.strip()
+                _assignable.loc[_assignable["SUPERVISOR"].eq(""),"SUPERVISOR"]="No asignado"
+                _assignable["PICKER"]=_assignable.get("PICKER",pd.Series("",index=_assignable.index)).fillna("").astype(str).str.strip()
+                _assignable["CORREO"]=_assignable.get("CORREO",pd.Series("",index=_assignable.index)).fillna("").astype(str).str.strip()
+                _turn_options=["Todos"]+sorted([z for z in _assignable["TURNO_MAESTRO"].unique() if z],key=lambda z:z.upper())
+                _filter_col1,_filter_col2=st.columns([1,2])
+                with _filter_col1:
+                    _assignment_turn=st.selectbox("Filtrar por turno",_turn_options,key="supervisor_assignment_turn")
+                with _filter_col2:
+                    _assignment_search=st.text_input("Buscar Picker o Layout",placeholder="Escribe parte del nombre o correo",key="supervisor_assignment_search")
+                _assignment_view=_assignable.copy()
+                if _assignment_turn!="Todos":
+                    _assignment_view=_assignment_view[_assignment_view["TURNO_MAESTRO"]==_assignment_turn]
+                if _assignment_search.strip():
+                    _query=norm(_assignment_search)
+                    _assignment_view=_assignment_view[
+                        _assignment_view["PICKER"].map(norm).str.contains(_query,regex=False)
+                        | _assignment_view["CORREO"].map(norm).str.contains(_query,regex=False)
+                    ]
+                _assigned_count=int((~_assignable["SUPERVISOR"].map(norm).isin({"","no_asignado","no_especificado","nan","none"})).sum())
+                _metric1,_metric2,_metric3=st.columns(3)
+                _metric1.metric("Personas",f"{len(_assignable):,}")
+                _metric2.metric("Con responsable",f"{_assigned_count:,}")
+                _metric3.metric("Sin asignar",f"{len(_assignable)-_assigned_count:,}")
+                _person_labels={}
+                for _,_person in _assignment_view.iterrows():
+                    _person_key=supervisor_assignment_key(_person)
+                    _person_name=str(_person.get("PICKER","")).strip()
+                    _person_turn=str(_person.get("TURNO_MAESTRO","Sin turno")).strip() or "Sin turno"
+                    _person_email=str(_person.get("CORREO","")).strip()
+                    _person_labels[_person_key]=f"{_person_name} · {_person_turn}"+(f" · {_person_email}" if _person_email else "")
+                _leader_labels={
+                    "": "— Sin supervisor —",
+                    **{
+                        _key:f"{_value['nombre']} · {_value['cargo']} · {_value['turno']}"
+                        for _key,_value in _leader_lookup.items()
+                    },
+                }
+                with st.form("supervisor_assignment_form",clear_on_submit=True):
+                    _selected_people=st.multiselect(
+                        "Pickers o Layout",
+                        options=list(_person_labels),
+                        format_func=lambda _key:_person_labels.get(_key,_key),
+                        key="supervisor_assignment_people",
+                    )
+                    _selected_leader=st.selectbox(
+                        "Asignar responsable",
+                        options=[""]+list(_leader_lookup),
+                        format_func=lambda _key:_leader_labels.get(_key,_key),
+                        key="supervisor_assignment_leader",
+                    )
+                    if st.form_submit_button("💾 Guardar asignación",type="primary"):
+                        if not _selected_people:
+                            st.warning("Selecciona al menos un Picker o Layout.")
+                        else:
+                            _now=datetime.now(ZoneInfo("America/Mexico_City")).strftime("%Y-%m-%d %H:%M")
+                            _assignment_store=store.setdefault("supervisor_assignments",{})
+                            for _person_key in _selected_people:
+                                if _selected_leader:
+                                    _leader=_leader_lookup[_selected_leader]
+                                    _assignment_store[_person_key]={
+                                        "SUPERVISOR":_leader["nombre"],
+                                        "SUPERVISOR_KEY":_selected_leader,
+                                        "CARGO":_leader["cargo"],
+                                        "TURNO":_leader["turno"],
+                                        "FECHA":_now,
+                                        "ORIGEN":"TURNOS LÍDERES · Outbound OKI",
+                                    }
+                                else:
+                                    _assignment_store[_person_key]={
+                                        "SUPERVISOR":"No asignado",
+                                        "SUPERVISOR_KEY":"",
+                                        "FECHA":_now,
+                                        "ORIGEN":"TURNOS LÍDERES · Outbound OKI",
+                                    }
+                            try:
+                                save_store(store)
+                            except Exception as _assignment_error:
+                                st.error(f"No se guardó la asignación. Revisa la conexión con el respaldo en nube. {_assignment_error}")
+                            else:
+                                st.session_state["_supervisor_assignment_flash"]=f"Asignación guardada para {len(_selected_people):,} persona(s)."
+                                st.rerun()
+                _assignment_flash=st.session_state.pop("_supervisor_assignment_flash",None)
+                if _assignment_flash:
+                    st.success(_assignment_flash)
+                _assignment_display=_assignment_view[["PICKER","PERSONAL_TIPO","TURNO_MAESTRO","SUPERVISOR","CORREO"]].rename(columns={
+                    "PICKER":"Persona","PERSONAL_TIPO":"Cargo","TURNO_MAESTRO":"Turno","SUPERVISOR":"Responsable","CORREO":"Correo",
+                })
+                st.dataframe(_assignment_display,use_container_width=True,hide_index=True,height=340)
         with st.expander("➕ Dar de alta supervisor",expanded=False):
             with st.form("alta_supervisor_form",clear_on_submit=True):
                 sc1,sc2=st.columns(2)
@@ -5703,6 +5880,7 @@ if _tab_active(i):
         if attendance_absence_upload is not None and attendance_tardy_upload is not None:
             _abs_bytes=attendance_absence_upload.getvalue(); _late_bytes=attendance_tardy_upload.getvalue()
             _attendance_roster=template_roster_from_upload(up.getvalue(),include_other_roles=True)
+            _attendance_roster=apply_supervisor_assignments(_attendance_roster,store.get("supervisor_assignments",{}))
             _att_context=json.dumps({
                 "shift":store.get("attendance_shift_config",{}),
                 "roster":[
@@ -5734,12 +5912,18 @@ if _tab_active(i):
                     st.error(f"No pude leer los reportes: {_att_error}")
             else:
                 attendance_summary=store.get("attendance_summary") or {}
-                attendance_people=attendance_summary.get("personas",[]) if isinstance(attendance_summary,dict) else []
+                attendance_people=[
+    dict(_person) for _person in (attendance_summary.get("personas",[]) if isinstance(attendance_summary,dict) else [])
+    if isinstance(_person,dict)
+]
         elif attendance_absence_upload is not None or attendance_tardy_upload is not None:
             st.info("Selecciona también el otro archivo para poder cruzar las faltas y los retardos por persona.")
 
         attendance_summary=store.get("attendance_summary") or attendance_summary
-        attendance_people=attendance_summary.get("personas",[]) if isinstance(attendance_summary,dict) else []
+        attendance_people=[
+    dict(_person) for _person in (attendance_summary.get("personas",[]) if isinstance(attendance_summary,dict) else [])
+    if isinstance(_person,dict)
+]
         if not attendance_people:
             st.info("Carga el reporte de faltas y el de retardos para ver el resumen.")
         else:
