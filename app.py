@@ -5706,7 +5706,7 @@ if _tab_active(g):
                 with _filter_col1:
                     _assignment_turn=st.selectbox("Filtrar por turno",_turn_options,key="supervisor_assignment_turn")
                 with _filter_col2:
-                    _assignment_search=st.text_input("Buscar Picker o Layout",placeholder="Escribe parte del nombre o correo",key="supervisor_assignment_search")
+                    _assignment_search=st.text_input("Buscar Picker o Layout",placeholder="Escribe parte del nombre o código de empleado",key="supervisor_assignment_search")
                 _assignment_view=_assignable.copy()
                 if _assignment_turn!="Todos":
                     _assignment_view=_assignment_view[_assignment_view["TURNO_MAESTRO"]==_assignment_turn]
@@ -5714,7 +5714,7 @@ if _tab_active(g):
                     _query=norm(_assignment_search)
                     _assignment_view=_assignment_view[
                         _assignment_view["PICKER"].map(norm).str.contains(_query,regex=False)
-                        | _assignment_view["CORREO"].map(norm).str.contains(_query,regex=False)
+                        | _assignment_view["CORREO"].map(extract_code).astype(str).str.contains(_query,regex=False)
                     ]
                 _assigned_count=int((~_assignable["SUPERVISOR"].map(norm).isin({"","no_asignado","no_especificado","nan","none"})).sum())
                 _metric1,_metric2,_metric3=st.columns(3)
@@ -5722,12 +5722,21 @@ if _tab_active(g):
                 _metric2.metric("Con responsable",f"{_assigned_count:,}")
                 _metric3.metric("Sin asignar",f"{len(_assignable)-_assigned_count:,}")
                 _person_labels={}
+                _label_counts={}
                 for _,_person in _assignment_view.iterrows():
                     _person_key=supervisor_assignment_key(_person)
                     _person_name=str(_person.get("PICKER","")).strip()
                     _person_turn=str(_person.get("TURNO_MAESTRO","Sin turno")).strip() or "Sin turno"
-                    _person_email=str(_person.get("CORREO","")).strip()
-                    _person_labels[_person_key]=f"{_person_name} · {_person_turn}"+(f" · {_person_email}" if _person_email else "")
+                    _base_label=f"{_person_name} · {_person_turn}"
+                    _person_labels[_person_key]=_base_label
+                    _label_counts[_base_label]=_label_counts.get(_base_label,0)+1
+                for _,_person in _assignment_view.iterrows():
+                    _person_key=supervisor_assignment_key(_person)
+                    _base_label=_person_labels.get(_person_key,"")
+                    if _label_counts.get(_base_label,0)>1:
+                        _employee_code=extract_code(_person.get("CORREO",""))
+                        _short_id=_employee_code or hashlib.sha1(_person_key.encode("utf-8")).hexdigest()[:6].upper()
+                        _person_labels[_person_key]=f"{_base_label} · ID {_short_id}"
                 _leader_labels={
                     "": "— Sin supervisor —",
                     **{
@@ -5782,8 +5791,8 @@ if _tab_active(g):
                 _assignment_flash=st.session_state.pop("_supervisor_assignment_flash",None)
                 if _assignment_flash:
                     st.success(_assignment_flash)
-                _assignment_display=_assignment_view[["PICKER","PERSONAL_TIPO","TURNO_MAESTRO","SUPERVISOR","CORREO"]].rename(columns={
-                    "PICKER":"Persona","PERSONAL_TIPO":"Cargo","TURNO_MAESTRO":"Turno","SUPERVISOR":"Responsable","CORREO":"Correo",
+                _assignment_display=_assignment_view[["PICKER","PERSONAL_TIPO","TURNO_MAESTRO","SUPERVISOR"]].rename(columns={
+                    "PICKER":"Persona","PERSONAL_TIPO":"Cargo","TURNO_MAESTRO":"Turno","SUPERVISOR":"Responsable",
                 })
                 st.dataframe(_assignment_display,use_container_width=True,hide_index=True,height=340)
         with st.expander("➕ Dar de alta supervisor",expanded=False):
