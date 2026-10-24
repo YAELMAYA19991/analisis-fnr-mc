@@ -1779,14 +1779,43 @@ def apply_supervisor_assignments(frame, assignments):
             continue
         if isinstance(record,dict):
             leader_key=str(record.get("SUPERVISOR_KEY","")).strip()
-            supervisor=current_leaders.get(
-                leader_key,
-                str(record.get("SUPERVISOR","")).strip(),
-            )
+            current_name=current_leaders.get(leader_key,"")
+            # Si la plantilla tiene el correo en NOMBRE, conserva el nombre validado guardado.
+            if current_name and "@" in current_name:
+                current_name=""
+            supervisor=current_name or str(record.get("SUPERVISOR","")).strip()
         else:
             supervisor=str(record).strip()
         if supervisor:
             x.at[index,"SUPERVISOR"]=supervisor
+    return x
+
+def repair_leader_display_names(leaders, context_frame):
+    """Recupera el nombre visible desde etiquetas de supervisor ya usadas, solo si es único."""
+    if leaders is None or not isinstance(leaders,pd.DataFrame) or leaders.empty:
+        return leaders
+    if context_frame is None or not isinstance(context_frame,pd.DataFrame) or "SUPERVISOR" not in context_frame.columns:
+        return leaders
+    x=leaders.copy()
+    known_names=[]
+    for value in context_frame["SUPERVISOR"].dropna().astype(str):
+        name=value.strip()
+        if not name or "@" in name or norm(name) in {"no_asignado","no_especificado","excluido","nan","none"}:
+            continue
+        if name not in known_names:
+            known_names.append(name)
+    if not known_names:
+        return x
+    for index,row in x.iterrows():
+        display=str(row.get("PICKER","")).strip()
+        if "@" not in display:
+            continue
+        tokens=email_name_tokens(row.get("CORREO","") or display)
+        if not tokens:
+            continue
+        matches=[name for name in known_names if tokens.issubset(name_tokens(name))]
+        if len(matches)==1:
+            x.at[index,"PICKER"]=matches[0]
     return x
 
 def canonicalize_incidents(inc,base):
@@ -5659,6 +5688,7 @@ if _tab_active(g):
         if isinstance(roster,pd.DataFrame) and not roster.empty and "PERSONAL_TIPO" in roster.columns:
             _leader_mask=roster["PERSONAL_TIPO"].fillna("").astype(str).map(norm).isin({"supervisor","subgerente","jefe"})
             _leaders=roster.loc[_leader_mask].copy()
+        _leaders=repair_leader_display_names(_leaders,s_view)
         st.markdown("#### Líderes de Outbound OKI · plantilla")
         if not _leaders.empty:
             _leader_columns=[c for c in ["PICKER","PERSONAL_TIPO","TURNO_MAESTRO","CORREO","AREA_MAESTRO"] if c in _leaders.columns]
