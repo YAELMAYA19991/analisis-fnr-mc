@@ -12,14 +12,7 @@ from email.message import EmailMessage
 import numpy as np
 import pandas as pd
 import streamlit as st
-import qrcode
 from zoneinfo import ZoneInfo
-from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER
-from reportlab.lib.pagesizes import A4, landscape
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import mm
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
 
 st.set_page_config(page_title="Control FNR & Mala Calidad", page_icon="🥑", layout="wide", initial_sidebar_state="expanded")
 
@@ -1377,6 +1370,52 @@ def person_context_key(row):
     ek=email_key(row.get("CORREO",""))
     return "correo:"+ek if ek else "persona:"+(person_key(row.get("PICKER","")) or "sin-nombre")
 
+
+_PERSON_CONTEXT_TRANSLATION=str.maketrans("áéíóúüñ","aeiouun")
+_PERSON_CONTEXT_KEY_CACHE={}
+
+
+def _person_context_key_series(frame):
+    """Calcula las llaves de identidad en columnas para evitar apply(axis=1)."""
+    if frame is None or frame.empty:
+        return pd.Series([],index=getattr(frame,"index",[]),dtype=object)
+    category=frame.get("CATEGORIA",pd.Series("Picker",index=frame.index)).map(
+        lambda value:str(value or "Picker").strip()
+    )
+    raw_name=frame.get("PICKER",pd.Series("",index=frame.index)).map(
+        lambda value:str(value).strip().lower().translate(_PERSON_CONTEXT_TRANSLATION)
+    )
+    picker_key=raw_name.str.replace(r"[^a-z0-9]","",regex=True)
+    if "CORREO_KEY" in frame.columns:
+        email_key_series=frame["CORREO_KEY"].map(
+            lambda value: ("" if str(value or "").strip().lower().replace(" ","") in {"nan","none","nat"}
+                           else str(value or "").strip().lower().replace(" ",""))
+        )
+    else:
+        email_key_series=frame.get("CORREO",pd.Series("",index=frame.index)).map(email_key)
+    keys=np.where(
+        category.eq("Sin registrar"),
+        "sin-registrar:"+picker_key.where(picker_key.ne(""),"sin-nombre"),
+        np.where(
+            email_key_series.ne(""),
+            "correo:"+email_key_series,
+            "persona:"+picker_key.where(picker_key.ne(""),"sin-nombre"),
+        ),
+    )
+    return pd.Series(keys,index=frame.index)
+
+
+def person_context_keys(frame,cache=False):
+    """Versión por columnas de person_context_key; puede reutilizar llaves en una ejecución."""
+    if cache and isinstance(frame,pd.DataFrame):
+        saved=_PERSON_CONTEXT_KEY_CACHE.get(id(frame))
+        if saved is not None and saved[0] is frame:
+            return saved[1]
+    keys=_person_context_key_series(frame)
+    if cache and isinstance(frame,pd.DataFrame):
+        _PERSON_CONTEXT_KEY_CACHE[id(frame)]=(frame,keys)
+    return keys
+
 def clean(df):
     x=df.copy(); x.columns=[norm(c) for c in x.columns]; return x
 
@@ -2231,8 +2270,9 @@ def summary(base,fnr,mc):
         _email_present=q["CORREO"].map(lambda v:bool(extract_email_address(v)))
         _placeholder=_label.isin({"sin registrar","picker","total","total general","gran total","grand total"}) | _label.str.startswith("filtros aplicados")
         q=q.loc[~(_placeholder & ~_email_present)].copy()
-        q["CORREO_KEY"]=q["CORREO"].map(email_key)
-        q["_PERSON_KEY"]=q.apply(person_context_key,axis=1)
+        if "CORREO_KEY" not in q.columns:
+            q["CORREO_KEY"]=q["CORREO"].map(email_key)
+        q["_PERSON_KEY"]=person_context_keys(q)
         return q
 
     b=prepare(base,False)
@@ -3132,6 +3172,12 @@ def appsheet_order_payload(detail, summary, existing_articles):
 
 def build_saved_order_audit_pdf(record):
     """PDF final con resultado y revisión real guardada por pedido."""
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
     out=io.BytesIO()
     doc=SimpleDocTemplate(out,pagesize=landscape(A4),leftMargin=12*mm,rightMargin=12*mm,topMargin=11*mm,bottomMargin=11*mm,
                           title=f"Auditoría {record.get('pedido','')}",author="Control FNR & Mala Calidad - Coyoacán")
@@ -3629,6 +3675,13 @@ def audit_hourly_critical_queue(available,percentage=20,population=None):
 @st.cache_data(show_spinner="Preparando paquete de auditoría…",max_entries=6,ttl=900)
 def build_bulk_audit_pdf(audit_detail,risk_summary,selected_orders,source_name=""):
     """Genera un solo PDF imprimible con una sección por pedido seleccionado."""
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+
     selected_orders=[str(x) for x in selected_orders if str(x).strip()]
     if not selected_orders:
         return b""
@@ -3896,7 +3949,10 @@ def exclude_registered_supervisors(base, fnr, mc, store):
     if not email_keys and not name_keys: return base,fnr,mc
     def mask(df):
         if df is None or df.empty: return pd.Series(False,index=getattr(df,"index",[]))
-        emails=df.get("CORREO",pd.Series("",index=df.index)).map(email_key)
+        if "CORREO_KEY" in df.columns:
+            emails=df["CORREO_KEY"].fillna("").astype(str).str.strip().str.lower().str.replace(" ","",regex=False)
+        else:
+            emails=df.get("CORREO",pd.Series("",index=df.index)).map(email_key)
         names=df.get("PICKER",pd.Series("",index=df.index)).map(person_key)
         return emails.isin(email_keys) | (emails.eq("") & names.isin(name_keys))
     return base.loc[~mask(base)].copy(), fnr.loc[~mask(fnr)].copy(), mc.loc[~mask(mc)].copy()
@@ -4202,13 +4258,13 @@ s=summary(base,fnr,mc)
 # Estado de cruce de TODOS los archivos: Pickers/Líneas + FNR + MC.
 # La llave es CORREO_KEY; cualquier registro sin coincidencia con la plantilla
 # se concentra en la pestaña 🧰 Herramientas para asignación manual.
-def _cross_frame(df, fuente):
+def _cross_frame(df, fuente, ident_override=None):
     if df is None or df.empty:
         return pd.DataFrame(columns=["FUENTE","CATEGORIA","PICKER","CORREO","CORREO_KEY","TURNO","SUPERVISOR","AREA_BASE","IDENTIFICADO"])
     y=df.copy()
     y["CORREO_KEY"]=y.get("CORREO",pd.Series("",index=y.index)).map(email_key)
     if fuente=="Pickers / Líneas":
-        ident=y.get("_MASTER_MATCH",False)
+        ident=ident_override if ident_override is not None else y.get("_MASTER_MATCH",False)
         area=y.get("AREA_BASE",pd.Series("",index=y.index))
     else:
         ident=y.get("_TEMPLATE_MATCH",y.get("_EMAIL_MATCH",False))
@@ -4226,13 +4282,41 @@ def _cross_frame(df, fuente):
     })
     return out
 
-cross_status=pd.concat([
-    _cross_frame(base,"Pickers / Líneas"),
-    _cross_frame(fnr,"FNR"),
-    _cross_frame(mc,"Mala Calidad"),
-],ignore_index=True)
 master_match=base.get("_MASTER_MATCH",pd.Series(False,index=base.index)).copy()
 base_display=base.drop(columns=["_MASTER_MATCH"],errors="ignore")
+
+
+def _cross_status_signature():
+    digest=hashlib.sha256()
+    digest.update(b"cross-status-v2")
+    for upload in [ub,uf,um,up]:
+        payload=upload.getvalue() if hasattr(upload,"getvalue") else bytes(upload or b"")
+        digest.update(len(payload).to_bytes(8,"big"))
+        digest.update(payload)
+    scope={
+        "personnel_config":personnel_config_json,
+        "excluded_orders":sorted(excluded,key=lambda value:(type(value).__name__,repr(value))),
+        "supervisores":store.get("supervisores",[]) or [],
+    }
+    digest.update(json.dumps(scope,ensure_ascii=False,sort_keys=True,default=str).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _build_cross_status():
+    return pd.concat([
+        _cross_frame(base,"Pickers / Líneas",master_match),
+        _cross_frame(fnr,"FNR"),
+        _cross_frame(mc,"Mala Calidad"),
+    ],ignore_index=True)
+
+
+def _cached_cross_status():
+    signature=_cross_status_signature()
+    saved=st.session_state.get("_cross_status_cache")
+    if not isinstance(saved,dict) or saved.get("signature")!=signature:
+        saved={"signature":signature,"data":_build_cross_status()}
+        st.session_state["_cross_status_cache"]=saved
+    return saved["data"]
 s=s.drop(columns=["_MASTER_MATCH"],errors="ignore")
 # Registrar automáticamente pickers vistos en la operación solo si aparecen por primera vez.
 _picker_registry_before=set((store.get("pickers",{}) or {}).keys())
@@ -4355,24 +4439,44 @@ def _context_identity_view(roster,base=None,fnr=None,mc=None):
     r["CATEGORIA"]=np.where(_leader_role_mask,"Supervisor","Picker")
     r["_CONTEXT_KEY"]=r["CORREO_KEY"].map(lambda z:"correo:"+str(z))
     r=r[r["CORREO_KEY"].ne("")].copy()
-    extra=[]
+    extra_frames=[]
     for source in [base,fnr,mc]:
-        if source is None or source.empty: continue
-        q=source.copy()
-        if "CATEGORIA" not in q: continue
-        q=q[q["CATEGORIA"].astype(str).eq("Sin registrar")]
-        for _,row in q.iterrows():
-            name=str(row.get("PICKER","") or "").strip() or "Sin registrar"
-            extra.append({
-                "PICKER":name,
-                "TURNO":str(row.get("TURNO",row.get("TURNO_REF","No especificado")) or "No especificado").strip(),
-                "SUPERVISOR":str(row.get("SUPERVISOR",row.get("SUPERVISOR_REF","No asignado")) or "No asignado").strip(),
-                "AREA_BASE":str(row.get("AREA_BASE",row.get("AREA_REF",row.get("AREA","No especificada"))) or "No especificada").strip(),
-                "CORREO":"","CORREO_KEY":"","CATEGORIA":"Sin registrar",
-                "_CONTEXT_KEY":"sin-registrar:"+(person_key(name) or "sin-nombre"),
-            })
-    if extra:
-        r=pd.concat([r,pd.DataFrame(extra)],ignore_index=True,sort=False)
+        if source is None or source.empty or "CATEGORIA" not in source: continue
+        q=source.loc[source["CATEGORIA"].astype(str).eq("Sin registrar")]
+        if q.empty: continue
+
+        def source_column(primary,fallback,default):
+            if primary in q.columns: return q[primary]
+            if fallback in q.columns: return q[fallback]
+            return pd.Series(default,index=q.index)
+
+        name=q.get("PICKER",pd.Series("",index=q.index)).map(
+            lambda value:str(value or "").strip()
+        )
+        name=name.where(name.ne(""),"Sin registrar")
+        turn=source_column("TURNO","TURNO_REF","No especificado").map(
+            lambda value:str(value or "No especificado").strip()
+        )
+        supervisor=source_column("SUPERVISOR","SUPERVISOR_REF","No asignado").map(
+            lambda value:str(value or "No asignado").strip()
+        )
+        area_default=q.get("AREA","No especificada")
+        area=source_column("AREA_BASE","AREA_REF",area_default).map(
+            lambda value:str(value or "No especificada").strip()
+        )
+        extra_frames.append(pd.DataFrame({
+            "PICKER":name,
+            "TURNO":turn,
+            "SUPERVISOR":supervisor,
+            "AREA_BASE":area,
+            "CORREO":"",
+            "CORREO_KEY":"",
+            "CATEGORIA":"Sin registrar",
+            "_CONTEXT_KEY":name.map(lambda value:"sin-registrar:"+(person_key(value) or "sin-nombre")),
+        },index=q.index))
+    if extra_frames:
+        extra=pd.concat(extra_frames,ignore_index=True,sort=False)
+        r=pd.concat([r,extra],ignore_index=True,sort=False)
     return r.drop_duplicates("_CONTEXT_KEY",keep="last")
 
 def _records_for_context(df, ctx, identity_df, include_turn=True):
@@ -4389,10 +4493,10 @@ def _records_for_context(df, ctx, identity_df, include_turn=True):
     out=df.copy()
     ids=ids.copy()
     if "_CONTEXT_KEY" not in ids:
-        ids["_CONTEXT_KEY"]=ids.apply(person_context_key,axis=1)
+        ids["_CONTEXT_KEY"]=person_context_keys(ids)
     keys=set(ids["_CONTEXT_KEY"].astype(str))
-    out["_CONTEXT_KEY"]=out.apply(person_context_key,axis=1)
-    return out[out["_CONTEXT_KEY"].isin(keys)].copy()
+    out["_CONTEXT_KEY"]=person_context_keys(df,cache=True)
+    return out[out["_CONTEXT_KEY"].astype(str).isin(keys)].copy()
 
 def apply_context(df, ctx, include_turn=True, identity_df=None):
     if identity_df is not None:
@@ -4405,12 +4509,9 @@ def select_summary_people(df,summary_df):
     """Filtra registros por identidad estable (correo; nombre solo para no registrados)."""
     if df is None or df.empty or summary_df is None or summary_df.empty:
         return df.iloc[0:0].copy() if isinstance(df,pd.DataFrame) else pd.DataFrame()
-    allowed_df=summary_df.copy()
-    source=df.copy()
-    allowed_df["_PERSON_KEY"]=allowed_df.apply(person_context_key,axis=1)
-    source["_PERSON_KEY"]=source.apply(person_context_key,axis=1)
-    allowed=set(allowed_df["_PERSON_KEY"].astype(str))
-    return source[source["_PERSON_KEY"].astype(str).isin(allowed)].drop(columns=["_PERSON_KEY"],errors="ignore").copy()
+    allowed=set(person_context_keys(summary_df,cache=True).astype(str))
+    source_keys=person_context_keys(df,cache=True).astype(str)
+    return df.loc[source_keys.isin(allowed)].drop(columns=["_PERSON_KEY"],errors="ignore").copy()
 
 def context_reference(df, ctx, identity_df=None):
     """Base de comparación: supervisor/área de la plantilla, todos los turnos."""
@@ -4589,6 +4690,7 @@ with st.expander("🔳 Generador de códigos QR",expanded=False):
         with _qr_preview_col:
             if _qr_content.strip():
                 try:
+                    import qrcode
                     _qr_code=qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M,box_size=8,border=4)
                     _qr_code.add_data(_qr_content.strip())
                     _qr_code.make(fit=True)
@@ -5810,7 +5912,7 @@ if _tab_active(x):
         st.caption("Herramientas de administración fuera del análisis operativo diario.")
         st.markdown("### ✉️ Cruce de correos")
         st.caption("El cruce intenta primero CORREO y, si falta o no coincide, usa una coincidencia conservadora por nombre. El personal que no aparece en la plantilla se conserva en resultados como Sin registrar.")
-        cross=cross_status.copy()
+        cross=_cached_cross_status().copy()
         if not cross.empty:
             cross["MANUAL"]=cross["CORREO_KEY"].map(lambda z: bool(store.get("master_overrides",{}).get(str(z))))
             cross["ID_PERSONA"]=cross.apply(lambda r: str(r.get("CORREO_KEY","")).strip() or ("nombre:"+person_key(r.get("PICKER",""))),axis=1)
