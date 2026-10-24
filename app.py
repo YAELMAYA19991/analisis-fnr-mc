@@ -5545,9 +5545,9 @@ if _tab_active(o):
             except Exception as _audit_error:
                 st.error(f"No pude leer el archivo de pedidos: {_audit_error}")
 
-        with st.expander("📤 Subir una ronda auditada desde AppSheet",expanded=True):
-            st.caption("Al cerrar una ronda en AppSheet, exporta el libro fuente de Google Sheets como Excel (.xlsx) y súbelo aquí. La página agrega o actualiza auditorías por ID, conserva las rondas anteriores y no sustituye ni edita Pedidos/Artículos.")
-            st.caption("Pasos: abre el libro conectado a AppSheet en Google Sheets, elige Archivo > Descargar > Microsoft Excel (.xlsx) y carga el libro completo con las pestañas Articulos y Validaciones.")
+        with st.expander("📤 Respaldo: importar una ronda desde AppSheet",expanded=False):
+            st.caption("La sincronización automática de arriba guarda en esta página cada pedido cuando todas sus líneas están validadas. Usa este respaldo manual solo si necesitas importar un Excel descargado de Google Sheets; conserva el historial y no modifica Pedidos ni Artículos.")
+            st.caption("Respaldo manual: en Google Sheets elige Archivo > Descargar > Microsoft Excel (.xlsx) y carga el libro con las pestañas Articulos y Validaciones.")
             _appsheet_export_file=st.file_uploader(
                 "Libro de auditorías descargado de Google Sheets",
                 type=["xlsx"],
