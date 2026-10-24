@@ -5329,8 +5329,9 @@ if _tab_active(o):
             except Exception as _audit_error:
                 st.error(f"No pude leer el archivo de pedidos: {_audit_error}")
 
-        with st.expander("📥 Importar auditorías desde AppSheet (sin puente)",expanded=False):
-            st.caption("Descarga el Google Sheet fuente desde Archivo > Descargar > Microsoft Excel (.xlsx). Se archivan las auditorías y validaciones ligadas antes de reemplazar el lote activo.")
+        with st.expander("📤 Subir una ronda auditada desde AppSheet",expanded=True):
+            st.caption("Al cerrar una ronda en AppSheet, exporta el libro fuente de Google Sheets como Excel (.xlsx) y súbelo aquí. La página agrega o actualiza auditorías por ID, conserva las rondas anteriores y no sustituye ni edita Pedidos/Artículos.")
+            st.caption("Pasos: abre el libro conectado a AppSheet en Google Sheets, elige Archivo > Descargar > Microsoft Excel (.xlsx) y carga el libro completo con las pestañas Articulos y Validaciones.")
             _appsheet_export_file=st.file_uploader(
                 "Libro de auditorías descargado de Google Sheets",
                 type=["xlsx"],
@@ -5369,15 +5370,20 @@ if _tab_active(o):
                             store["order_audits"]=_previous_audits
                             raise
                         st.success(
-                            f"Importación lista: {_new_count:,} auditorías nuevas y "
-                            f"{_updated_count:,} actualizadas; archivo leído sin editarlo."
+                            f"Ronda cargada: {_new_count:,} auditorías nuevas y "
+                            f"{_updated_count:,} actualizadas. El historial anterior se conservó."
                         )
                 except Exception as _import_error:
                     st.error(f"No pude importar las auditorías de AppSheet: {_import_error}")
 
         _saved_audits=store.get("order_audits",[]) or []
-        with st.expander(f"📚 Historial de auditorías ({len(_saved_audits)})",expanded=False):
+        with st.expander(f"📚 Pedidos auditados e historial completo ({len(_saved_audits)})",expanded=False):
             if _saved_audits:
+                _valid_order_ids={norm(rec.get("pedido","")) for rec in _saved_audits if audit_record_is_complete(rec) and str(rec.get("pedido","")).strip()}
+                _all_order_ids={norm(rec.get("pedido","")) for rec in _saved_audits if str(rec.get("pedido","")).strip()}
+                _hc1,_hc2=st.columns(2)
+                _hc1.metric("Pedidos validados",f"{len(_valid_order_ids):,}")
+                _hc2.metric("Pendientes",f"{len(_all_order_ids-_valid_order_ids):,}")
                 _history=pd.DataFrame([{
                     "Pedido":rec.get("pedido",""),
                     "Fecha":rec.get("fecha_auditoria",""),
@@ -5391,7 +5397,10 @@ if _tab_active(o):
                     "Observaciones":rec.get("observaciones",""),
                 } for rec in _saved_audits])
                 _history=_history.sort_values("Fecha",ascending=False)
-                _history_search=st.text_input("Buscar en el historial",key="audit_history_search_simple")
+                _history_filter=st.radio("Mostrar",["Todos","Validados","Pendientes"],horizontal=True,key="audit_history_status_filter")
+                if _history_filter=="Validados": _history=_history[_history["Estado"]=="Validado"]
+                elif _history_filter=="Pendientes": _history=_history[_history["Estado"]=="Pendiente"]
+                _history_search=st.text_input("Buscar número de pedido",key="audit_history_search_simple")
                 if _history_search.strip():
                     _history=_history[_history["Pedido"].astype(str).str.contains(re.escape(_history_search.strip()),case=False,na=False)]
                 st.dataframe(_history,use_container_width=True,hide_index=True)
