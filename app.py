@@ -2779,6 +2779,51 @@ def appsheet_bridge_call(action, **payload):
     return result
 
 
+def appsheet_normalize_slot(value):
+    """Normaliza slots que Sheets devuelve como fracción o fecha ISO de 1899."""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError,ValueError):
+        pass
+
+    if isinstance(value,(int,float,np.integer,np.floating)) and not isinstance(value,(bool,np.bool_)):
+        number=float(value)
+        if 0<=number<1:
+            total_minutes=int(round(number*24*60))%1440
+            return f"{total_minutes//60}:{total_minutes%60:02d}"
+
+    text=str(value).strip()
+    if not text:
+        return ""
+    text=re.sub(r"\s*:\s*",":",text)
+
+    plain=re.fullmatch(
+        r"0?([0-9]|1[0-9]|2[0-3]):([0-5][0-9])(?::[0-5][0-9](?:\.\d+)?)?",
+        text,
+    )
+    if plain:
+        return f"{int(plain.group(1))}:{plain.group(2)}"
+
+    if re.fullmatch(r"(?:0)?\.\d+",text):
+        number=float(text)
+        if 0<=number<1:
+            total_minutes=int(round(number*24*60))%1440
+            return f"{total_minutes//60}:{total_minutes%60:02d}"
+
+    try:
+        parsed=datetime.fromisoformat(text.replace("Z","+00:00"))
+        if parsed.date() in {datetime(1899,12,30).date(),datetime(1899,12,31).date()}:
+            if parsed.tzinfo is not None:
+                parsed=parsed.astimezone(ZoneInfo("America/Mexico_City"))
+            return f"{parsed.hour}:{parsed.minute:02d}"
+    except (TypeError,ValueError,OverflowError):
+        pass
+    return text
+
+
 def appsheet_active_orders_csv(tables):
     """Prepara en memoria las filas activas de AppSheet para la cola de auditoría."""
     if not isinstance(tables,dict):
@@ -2808,7 +2853,9 @@ def appsheet_active_orders_csv(tables):
         parent=orders.get(order_id,{})
         record={
             "Orden":order_id or _value(parent,"ID_Pedido","Pedido"),
-            "Slot":_value(parent,"Slot","Horario") or _value(row,"Slot","Horario"),
+            "Slot":appsheet_normalize_slot(
+                _value(parent,"Slot","Horario") or _value(row,"Slot","Horario")
+            ),
             "Zona":_value(row,"Zona","Zone","Area"),
             "Código":_value(row,"Codigo_Barras","Código","Codigo","Barcode"),
             "Producto":_value(row,"Articulo","Artículo","Producto","Product"),
@@ -3180,12 +3227,9 @@ def appsheet_batch_fingerprint(tables):
         return str(value)
 
     def _canonical_value(table,field,value):
-        rendered=_js_string(value).strip(trim_chars)
         if table=="Pedidos" and field=="Slot":
-            match=re.fullmatch(r"0?([0-9]|1[0-9]|2[0-3]):([0-5][0-9])",rendered)
-            if match:
-                return f"{int(match.group(1))}:{match.group(2)}"
-        return rendered
+            return appsheet_normalize_slot(value).strip(trim_chars)
+        return _js_string(value).strip(trim_chars)
 
     def _rows(table,fields):
         out=[]
