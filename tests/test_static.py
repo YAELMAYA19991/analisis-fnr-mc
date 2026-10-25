@@ -37,10 +37,10 @@ class AppStaticTests(unittest.TestCase):
 
     def test_compact_order_audit_workflow(self):
         self.assertIn("Auditoría rápida de pedidos",self.text)
-        self.assertIn("1. Cargar pedidos (Excel o CSV)",self.text)
+        self.assertIn("1. Cargar pedidos (Excel o CSV, opcional si están en AppSheet)",self.text)
         self.assertIn("3. Seleccionar pedido",self.text)
         self.assertIn("Guardar revisión",self.text)
-        self.assertIn("📚 Historial de auditorías",self.text)
+        self.assertIn("📚 Pedidos auditados e historial completo",self.text)
 
     def test_hourly_critical_audit_selection(self):
         self.assertIn("def audit_hourly_critical_queue",self.text)
