@@ -5,7 +5,7 @@
 # ================================================================
 
 
-import io, re, json, os, smtplib, ssl, zipfile, hashlib, urllib.request, urllib.error, urllib.parse, html, uuid
+import io, re, json, os, time, smtplib, ssl, zipfile, hashlib, urllib.request, urllib.error, urllib.parse, html, uuid
 from difflib import SequenceMatcher
 from datetime import datetime, timedelta
 from email.message import EmailMessage
@@ -2705,8 +2705,11 @@ def audit_record_is_complete(record):
 
 
 def order_audit_upload_changed():
-    """Identifica una selección nueva sin repetir el reemplazo en cada rerun."""
+    """Identifica una selección nueva y pausa el sondeo hasta terminar la carga."""
     st.session_state["_order_audit_upload_event_id"]=uuid.uuid4().hex
+    st.session_state["_appsheet_upload_pending"]=(
+        st.session_state.get("order_audit_upload") is not None
+    )
 
 
 def appsheet_bridge_settings():
@@ -2976,8 +2979,13 @@ def persist_completed_appsheet_audits(store,tables):
     ]
     existing=[dict(row) for row in (store.get("order_audits",[]) or []) if isinstance(row,dict)]
 
-    def _signature(record):
-        return json.dumps(record,sort_keys=True,ensure_ascii=False,default=str,separators=(",",":"))
+    def _signature(record, fields):
+        # Ignora metadatos añadidos al archivar (lote_id, copias originales):
+        # compara solo los campos que AppSheet acaba de devolver.
+        return json.dumps(
+            {field:record.get(field) for field in sorted(fields)},
+            sort_keys=True,ensure_ascii=False,default=str,separators=(",",":")
+        )
 
     old_by_id={str(row.get("id","") or ""):row for row in existing if row.get("id")}
     new_count=0
@@ -2987,7 +2995,7 @@ def persist_completed_appsheet_audits(store,tables):
         previous=old_by_id.get(key)
         if not previous:
             new_count+=1
-        elif _signature(previous)!=_signature(row):
+        elif _signature(previous,row.keys())!=_signature(row,row.keys()):
             updated_count+=1
     if new_count or updated_count:
         merged=merge_order_audit_records(existing,completed)
@@ -3247,7 +3255,7 @@ def appsheet_order_payload(detail, summary, existing_articles):
 
 
 def appsheet_publish_uploaded_batch(
-    detail,summary,store,force_replace=False,upload_identity="",session_state=None,max_attempts=3
+    detail,summary,store,force_replace=False,upload_identity="",session_state=None,max_attempts=8
 ):
     """Publica una carga nueva, archiva la ronda activa y reintenta conflictos de lectura."""
     table_names=("Pedidos","Articulos","Validaciones","Auditorias","Diferencias")
@@ -3268,6 +3276,7 @@ def appsheet_publish_uploaded_batch(
     def _mark_success():
         if upload_identity:
             session_state["_appsheet_last_upload_identity"]=str(upload_identity)
+        session_state["_appsheet_upload_pending"]=False
 
     if not force_replace:
         tables,payload,incoming_fp,current_fp,state_fp,has_rows,same_batch=_read_batch()
@@ -3385,10 +3394,11 @@ def appsheet_publish_uploaded_batch(
             if "lote cambió desde la lectura" in str(exc).casefold():
                 last_conflict=exc
                 if attempt<max_attempts:
+                    time.sleep(min(0.75*attempt,4.0))
                     continue
                 raise RuntimeError(
-                    f"AppSheet cambió durante {max_attempts} intentos. No se borró ningún dato. "
-                    "El archivo sigue seleccionado; actualiza la página para reintentar."
+                    f"AppSheet recibió cambios simultáneos durante {max_attempts} intentos. "
+                    "No se borró ningún dato. El archivo sigue cargado para volver a intentar."
                 ) from exc
             raise
 
@@ -3408,8 +3418,8 @@ def appsheet_publish_uploaded_batch(
 
     if last_conflict:
         raise RuntimeError(
-            f"AppSheet cambió durante {max_attempts} intentos. No se borró ningún dato. "
-            "El archivo sigue seleccionado; actualiza la página para reintentar."
+            f"AppSheet recibió cambios simultáneos durante {max_attempts} intentos. "
+            "No se borró ningún dato. El archivo sigue cargado para volver a intentar."
         ) from last_conflict
     raise RuntimeError("No se pudo publicar el lote nuevo en AppSheet.")
 
@@ -5234,6 +5244,9 @@ if _tab_active(o):
             except (TypeError,ValueError):
                 _last_poll=0.0
             st.caption("AppSheet se consulta automáticamente cada 30 segundos mientras esta página está abierta.")
+            if st.session_state.get("_appsheet_upload_pending",False):
+                st.caption("La consulta automática se reanuda cuando termine la carga del archivo seleccionado.")
+                return
             if _last_poll and _now-_last_poll<25:
                 return
             st.session_state["_appsheet_auto_sync_last_poll"]=_now
@@ -5663,7 +5676,11 @@ if _tab_active(o):
                                             _bridge_remote_audits=[]
                                     except Exception as _bridge_error:
                                         st.warning(f"No pude sincronizar el lote con AppSheet: {_bridge_error}")
+                                        if _new_file_upload:
+                                            st.caption("El lote anterior sigue intacto. Cuando termine la sincronización del picker, vuelve a intentarlo aquí.")
+                                            st.button("🔁 Reintentar sincronización",key="appsheet_retry_current_order_upload")
                                 else:
+                                    st.session_state["_appsheet_upload_pending"]=False
                                     st.caption("AppSheet: integración preparada; falta habilitar la conexión segura para sincronizar cargas y validaciones.")
                                 _saved_audits=merge_order_audit_records(_saved_audits,_bridge_remote_audits)
                                 _audit_scope_identity=(
