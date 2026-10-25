@@ -39,7 +39,7 @@ class SleepRecorder:
         self.calls.append(seconds)
 
 
-def environment(conflicts=0,incoming=None):
+def environment(conflicts=0,incoming=None,has_active=False):
     saved=[]
     timer=SleepRecorder()
     namespace={
@@ -52,6 +52,9 @@ def environment(conflicts=0,incoming=None):
         "time":timer,
     }
     current={name:[] for name in ("Pedidos","Articulos","Validaciones","Auditorias","Diferencias")}
+    if has_active:
+        current["Pedidos"]=[{"ID_Pedido":"OLD-123"}]
+        current["Articulos"]=[{"ID_Articulo":"OLD-A-123"}]
     payload={"Pedidos":[{"ID_Pedido":"P-123"}],"Articulos":[{"ID_Articulo":"A-123"}]}
     calls={"publish":0}
     def bridge(action,**data):
@@ -112,6 +115,17 @@ class AppSheetSyncTests(unittest.TestCase):
         state["order_audit_upload"]=None
         ns["order_audit_upload_changed"]()
         self.assertFalse(state["_appsheet_upload_pending"])
+
+    def test_retry_does_not_rewrite_an_unchanged_archive(self):
+        ns,saved,_,calls,_=environment(conflicts=2,has_active=True)
+        result=ns["appsheet_publish_uploaded_batch"](
+            None,None,{"order_audits":[],"appsheet_archive_log":[]},
+            force_replace=True,upload_identity="event-1",session_state={}
+        )
+        self.assertEqual(result["status"],"replaced")
+        self.assertEqual(result["attempts"],3)
+        self.assertEqual(calls["publish"],3)
+        self.assertEqual(len(saved),1)
 
     def test_transient_concurrent_writes_retry_and_complete(self):
         ns,_,timer,calls,_=environment(conflicts=2)
