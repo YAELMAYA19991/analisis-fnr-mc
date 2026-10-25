@@ -3034,7 +3034,43 @@ def appsheet_archive_preflight(tables, detail):
             errors.append("Hay diferencias sin artículo o auditoría relacionados.")
             break
     archived=appsheet_rows_to_audits(tables,detail)
-    archived_audit_ids={str(row.get("appsheet_audit_id","")) for row in archived if row.get("appsheet_audit_id")}
+    audit_rows_by_order={}
+    for source in audits:
+        order=str(source.get("ID_Pedido","") or "").strip()
+        if order:
+            audit_rows_by_order.setdefault(order,[]).append(dict(source))
+    validation_rows_by_order={}
+    for source in validations:
+        article_id=str(source.get("ID_Articulo","") or "").strip()
+        order=article_order.get(article_id) or str(source.get("ID_Pedido","") or "").strip()
+        if order:
+            validation_rows_by_order.setdefault(order,[]).append(dict(source))
+    difference_rows_by_order={}
+    for source in differences:
+        article_id=str(source.get("ID_Articulo","") or "").strip()
+        order=article_order.get(article_id)
+        if order:
+            difference_rows_by_order.setdefault(order,[]).append(dict(source))
+    for record in archived:
+        order=str(record.get("pedido","") or "").strip()
+        raw_audits=audit_rows_by_order.get(order,[])
+        record["appsheet_audit_ids"]=list(dict.fromkeys(
+            str(source.get("ID_Auditoria","") or "").strip()
+            for source in raw_audits if str(source.get("ID_Auditoria","") or "").strip()
+        ))
+        record["appsheet_auditorias_originales"]=raw_audits
+        record["appsheet_validaciones_originales"]=validation_rows_by_order.get(order,[])
+        record["appsheet_diferencias_originales"]=difference_rows_by_order.get(order,[])
+    archived_audit_ids=set()
+    for record in archived:
+        archived_audit_ids.update(
+            str(audit_id or "").strip()
+            for audit_id in (
+                [record.get("appsheet_audit_id","")]
+                + list(record.get("appsheet_audit_ids",[]) or [])
+            )
+            if str(audit_id or "").strip()
+        )
     if any(audit_id not in archived_audit_ids for audit_id in audit_ids):
         errors.append("No se pudieron convertir todas las auditorías de AppSheet al historial.")
     if validations and not archived:
