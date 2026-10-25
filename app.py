@@ -3260,16 +3260,17 @@ def appsheet_publish_uploaded_batch(
         payload=appsheet_order_payload(detail,summary,tables.get("Articulos",[]) or [])
         incoming_fp=appsheet_batch_fingerprint(payload)
         current_fp=appsheet_batch_fingerprint(tables)
+        state_fp=str(result.get("fingerprint",result.get("stateFingerprint","")) or "").strip()
         has_rows=any(tables.get(name,[]) for name in table_names)
         same_batch=has_rows and incoming_fp==current_fp
-        return tables,payload,incoming_fp,current_fp,has_rows,same_batch
+        return tables,payload,incoming_fp,current_fp,state_fp,has_rows,same_batch
 
     def _mark_success():
         if upload_identity:
             session_state["_appsheet_last_upload_identity"]=str(upload_identity)
 
     if not force_replace:
-        tables,payload,incoming_fp,current_fp,has_rows,same_batch=_read_batch()
+        tables,payload,incoming_fp,current_fp,state_fp,has_rows,same_batch=_read_batch()
         if same_batch:
             status="same"
         elif has_rows:
@@ -3283,11 +3284,22 @@ def appsheet_publish_uploaded_batch(
         }
 
     health=appsheet_bridge_call("health")
-    replace_ready=bool((health.get("capabilities") or {}).get("replaceBatch"))
+    capabilities=health.get("capabilities") or {}
+    replace_ready=bool(capabilities.get("replaceBatch"))
+    if not bool(capabilities.get("serverFingerprint")):
+        raise RuntimeError(
+            "El puente de Google todavía no devuelve la huella segura del servidor. "
+            "Actualiza y vuelve a desplegar appsheet_bridge.gs; no se borró ni modificó información."
+        )
     last_conflict=None
 
     for attempt in range(1,max_attempts+1):
-        tables,payload,incoming_fp,current_fp,has_rows,same_batch=_read_batch()
+        tables,payload,incoming_fp,current_fp,state_fp,has_rows,same_batch=_read_batch()
+        if not state_fp:
+            raise RuntimeError(
+                "El puente de Google no devolvió la huella segura del lote. "
+                "No se borró ni modificó información."
+            )
 
         if not replace_ready:
             if has_rows:
@@ -3324,6 +3336,7 @@ def appsheet_publish_uploaded_batch(
             archive_log=[dict(item) for item in previous_log if isinstance(item,dict)]
             log_entry={
                 "fingerprint":current_fp,
+                "state_fingerprint":state_fp,
                 "upload_identity":str(upload_identity or ""),
                 "fecha":datetime.now(ZoneInfo("America/Mexico_City")).isoformat(timespec="seconds"),
                 "pedidos":len(tables.get("Pedidos",[]) or []),
@@ -3366,7 +3379,7 @@ def appsheet_publish_uploaded_batch(
         try:
             appsheet_bridge_call(
                 "publish",replaceBatch=True,archiveConfirmed=True,
-                expectedFingerprint=current_fp,**payload
+                expectedFingerprint=state_fp,**payload
             )
         except Exception as exc:
             if "lote cambió desde la lectura" in str(exc).casefold():
