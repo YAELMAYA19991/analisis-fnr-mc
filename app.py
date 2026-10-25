@@ -3257,7 +3257,7 @@ def appsheet_publish_uploaded_batch(
             if has_rows:
                 return {
                     "status":"replace_unavailable","tables":tables,"payload":payload,
-                    "incoming_fingerprint":incoming_fp,"active_matches_upload":same_batch,
+                    "incoming_fingerprint":incoming_fp,"active_matches_upload":False,
                     "archived_count":0,"attempts":attempt,
                 }
             appsheet_bridge_call("publish",**payload)
@@ -5610,6 +5610,8 @@ if _tab_active(o):
                                                 "Conservé el lote anterior y sus auditorías."
                                             )
                                         _bridge_remote_audits=appsheet_rows_to_audits(_bridge_tables,_audit_detail)
+                                        if not _bridge_sync.get("active_matches_upload",False):
+                                            _bridge_remote_audits=[]
                                     except Exception as _bridge_error:
                                         st.warning(f"No pude sincronizar el lote con AppSheet: {_bridge_error}")
                                 else:
