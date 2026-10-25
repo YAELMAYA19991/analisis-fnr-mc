@@ -3145,7 +3145,7 @@ def read_appsheet_export_workbook(uploaded_file):
 
 
 def appsheet_batch_fingerprint(tables):
-    """Replica huellaLote del puente de Apps Script, incluyendo ceros y orden UTF-16."""
+    """Genera una huella estable; normaliza Slot cuando Sheets quita el cero inicial."""
     tables=tables if isinstance(tables,dict) else {}
     trim_chars=" \t\n\r\v\f\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
 
@@ -3179,10 +3179,18 @@ def appsheet_batch_fingerprint(tables):
             return rendered
         return str(value)
 
+    def _canonical_value(table,field,value):
+        rendered=_js_string(value).strip(trim_chars)
+        if table=="Pedidos" and field=="Slot":
+            match=re.fullmatch(r"0?([0-9]|1[0-9]|2[0-3]):([0-5][0-9])",rendered)
+            if match:
+                return f"{int(match.group(1))}:{match.group(2)}"
+        return rendered
+
     def _rows(table,fields):
         out=[]
         for row in tables.get(table,[]) or []:
-            values=[_js_string(row.get(field,"")).strip(trim_chars) for field in fields]
+            values=[_canonical_value(table,field,row.get(field,"")) for field in fields]
             out.append(values)
         out.sort(key=lambda row:tuple(value.encode("utf-16-be",errors="surrogatepass") for value in row))
         return out
