@@ -3358,32 +3358,42 @@ def appsheet_publish_uploaded_batch(
             existing_log_index=next(
                 (
                     index for index,item in enumerate(archive_log)
-                    if str(item.get("fingerprint",""))==current_fp
-                    and str(item.get("upload_identity",""))==str(upload_identity or "")
+                    if (
+                        str(item.get("upload_identity",""))==str(upload_identity or "")
+                        if upload_identity
+                        else str(item.get("fingerprint",""))==current_fp
+                    )
                 ),
                 None,
             )
             if existing_log_index is None:
                 archive_log.append(log_entry)
             else:
-                archive_log[existing_log_index]=log_entry
+                existing_log=archive_log[existing_log_index]
+                # Un reintento del mismo archivo conserva la fecha de la primera captura
+                # y actualiza la misma entrada si AppSheet agregó auditorías nuevas.
+                log_entry["fecha"]=existing_log.get("fecha") or log_entry["fecha"]
+                if existing_log!=log_entry:
+                    archive_log[existing_log_index]=log_entry
             archive_log=archive_log[-500:]
+            archive_changed=(merged_audits!=previous_audits or archive_log!=previous_log)
             had_audits="order_audits" in store
             had_log="appsheet_archive_log" in store
             store["order_audits"]=merged_audits
             store["appsheet_archive_log"]=archive_log
-            try:
-                save_store(store)
-            except Exception:
-                if had_audits:
-                    store["order_audits"]=previous_audits
-                else:
-                    store.pop("order_audits",None)
-                if had_log:
-                    store["appsheet_archive_log"]=previous_log
-                else:
-                    store.pop("appsheet_archive_log",None)
-                raise
+            if archive_changed:
+                try:
+                    save_store(store)
+                except Exception:
+                    if had_audits:
+                        store["order_audits"]=previous_audits
+                    else:
+                        store.pop("order_audits",None)
+                    if had_log:
+                        store["appsheet_archive_log"]=previous_log
+                    else:
+                        store.pop("appsheet_archive_log",None)
+                    raise
 
         try:
             appsheet_bridge_call(
