@@ -37,7 +37,7 @@ function doPost(e) {
       required.forEach(name => {
         counts[name] = Math.max(0, ss.getSheetByName(name).getLastRow() - 1);
       });
-      return respuesta({ok:true,message:'Puente y hoja conectados',tables:counts,capabilities:{replaceBatch:true}});
+      return respuesta({ok:true,message:'Puente y hoja conectados',tables:counts,capabilities:{replaceBatch:true,serverFingerprint:true}});
     }
     if (!lock.tryLock(25000)) return respuesta({ok:false,error:'Ocupado; reintentar'});
     const ss = SpreadsheetApp.openById(AUDIT_SHEET);
@@ -46,7 +46,7 @@ function doPost(e) {
       ['Pedidos','Articulos','Validaciones','Auditorias','Diferencias'].forEach(name => {
         data[name] = registros(ss.getSheetByName(name));
       });
-      return respuesta({ok:true,data:data});
+      return respuesta({ok:true,data:data,fingerprint:huellaLote(data)});
     }
     if (body.action === 'publish') {
       if (body.replaceBatch === true) {
@@ -102,21 +102,20 @@ function doPost(e) {
 }
 
 function huellaLote(tables) {
-  function rowValues(table, fields) {
-    const rows = (tables[table] || []).map(row => fields.map(field => String(row[field] == null ? '' : row[field]).trim()));
-    rows.sort((a,b) => {
-      for (let i = 0; i < a.length; i++) {
-        if (a[i] < b[i]) return -1;
-        if (a[i] > b[i]) return 1;
-      }
-      return 0;
+  const names = ['Pedidos','Articulos','Validaciones','Auditorias','Diferencias'];
+  const payload = {};
+  names.forEach(name => {
+    const rows = (tables[name] || []).map(row => {
+      const normalized = {};
+      Object.keys(row || {}).sort().forEach(key => {
+        const value = row[key];
+        normalized[key] = value == null ? '' : value;
+      });
+      return JSON.stringify(normalized);
     });
-    return rows;
-  }
-  const payload = {
-    Pedidos: rowValues('Pedidos',['ID_Pedido','Slot']),
-    Articulos: rowValues('Articulos',['ID_Articulo','ID_Pedido','Codigo_Barras','Zona','Articulo','Picker','Cantidad_Pedida','Cantidad_Pickeada'])
-  };
+    rows.sort();
+    payload[name] = rows;
+  });
   const digest = Utilities.computeDigest(
     Utilities.DigestAlgorithm.SHA_256,
     JSON.stringify(payload),
