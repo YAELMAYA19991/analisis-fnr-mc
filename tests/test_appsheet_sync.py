@@ -4,6 +4,8 @@ import copy
 import json
 import unittest
 import uuid
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -43,7 +45,7 @@ def environment(conflicts=0,incoming=None,has_active=False):
     saved=[]
     timer=SleepRecorder()
     namespace={
-        "json":json,"uuid":uuid,
+        "json":json,"uuid":uuid,"datetime":datetime,"ZoneInfo":ZoneInfo,
         "pd":SimpleNamespace(DataFrame=lambda:None),
         "st":SimpleNamespace(session_state={}),
         "appsheet_rows_to_audits":lambda tables,detail:[dict(x) for x in tables.get("_incoming",[])],
