@@ -2704,6 +2704,11 @@ def audit_record_is_complete(record):
     return bool(checked)
 
 
+def order_audit_upload_changed():
+    """Identifica una selección nueva sin repetir el reemplazo en cada rerun."""
+    st.session_state["_order_audit_upload_event_id"]=uuid.uuid4().hex
+
+
 def appsheet_bridge_settings():
     """La conexión permanece apagada hasta configurar dos secretos en Streamlit."""
     try:
@@ -3096,13 +3101,48 @@ def read_appsheet_export_workbook(uploaded_file):
 
 
 def appsheet_batch_fingerprint(tables):
-    """Huella estable del lote activo, basada solo en los campos que identifican su contenido."""
+    """Replica huellaLote del puente de Apps Script, incluyendo ceros y orden UTF-16."""
     tables=tables if isinstance(tables,dict) else {}
+    trim_chars=" \t\n\r\v\f\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
+
+    def _js_string(value):
+        if value is None:
+            return ""
+        if isinstance(value,bool):
+            return "true" if value else "false"
+        if isinstance(value,int):
+            return str(value)
+        if isinstance(value,float):
+            if value!=value:
+                return "NaN"
+            if value==float("inf"):
+                return "Infinity"
+            if value==float("-inf"):
+                return "-Infinity"
+            if value==0:
+                return "0"
+            if value.is_integer() and abs(value)<1e16:
+                return str(int(value))
+            rendered=repr(value).lower()
+            if "e" in rendered:
+                mantissa,exponent_text=rendered.split("e",1)
+                exponent=int(exponent_text)
+                if -6<=exponent<21:
+                    from decimal import Decimal
+                    return format(Decimal(rendered),"f")
+                sign="+" if exponent>=0 else "-"
+                return f"{mantissa}e{sign}{abs(exponent)}"
+            return rendered
+        return str(value)
+
     def _rows(table,fields):
         out=[]
         for row in tables.get(table,[]) or []:
-            out.append([str(row.get(field,"") or "").strip() for field in fields])
-        return sorted(out)
+            values=[_js_string(row.get(field,"")).strip(trim_chars) for field in fields]
+            out.append(values)
+        out.sort(key=lambda row:tuple(value.encode("utf-16-be",errors="surrogatepass") for value in row))
+        return out
+
     payload={
         "Pedidos":_rows("Pedidos",["ID_Pedido","Slot"]),
         "Articulos":_rows("Articulos",[
@@ -3168,6 +3208,161 @@ def appsheet_order_payload(detail, summary, existing_articles):
     return {"Pedidos":order_rows,"Articulos":article_rows}
 
 
+
+
+def appsheet_publish_uploaded_batch(
+    detail,summary,store,force_replace=False,upload_identity="",session_state=None,max_attempts=3
+):
+    """Publica una carga nueva, archiva la ronda activa y reintenta conflictos de lectura."""
+    table_names=("Pedidos","Articulos","Validaciones","Auditorias","Diferencias")
+    session_state=session_state if session_state is not None else {}
+    max_attempts=max(1,int(max_attempts or 1))
+
+    def _read_batch():
+        result=appsheet_bridge_call("read")
+        tables=result.get("data",{}) or {}
+        payload=appsheet_order_payload(detail,summary,tables.get("Articulos",[]) or [])
+        incoming_fp=appsheet_batch_fingerprint(payload)
+        current_fp=appsheet_batch_fingerprint(tables)
+        has_rows=any(tables.get(name,[]) for name in table_names)
+        same_batch=has_rows and incoming_fp==current_fp
+        return tables,payload,incoming_fp,current_fp,has_rows,same_batch
+
+    def _mark_success():
+        if upload_identity:
+            session_state["_appsheet_last_upload_identity"]=str(upload_identity)
+
+    if not force_replace:
+        tables,payload,incoming_fp,current_fp,has_rows,same_batch=_read_batch()
+        if same_batch:
+            status="same"
+        elif has_rows:
+            status="different_active"
+        else:
+            status="empty_active"
+        return {
+            "status":status,"tables":tables,"payload":payload,
+            "incoming_fingerprint":incoming_fp,"active_matches_upload":same_batch,
+            "archived_count":0,"attempts":0,
+        }
+
+    health=appsheet_bridge_call("health")
+    replace_ready=bool((health.get("capabilities") or {}).get("replaceBatch"))
+    last_conflict=None
+
+    for attempt in range(1,max_attempts+1):
+        tables,payload,incoming_fp,current_fp,has_rows,same_batch=_read_batch()
+
+        if not replace_ready:
+            if has_rows:
+                return {
+                    "status":"replace_unavailable","tables":tables,"payload":payload,
+                    "incoming_fingerprint":incoming_fp,"active_matches_upload":same_batch,
+                    "archived_count":0,"attempts":attempt,
+                }
+            appsheet_bridge_call("publish",**payload)
+            _mark_success()
+            verified=appsheet_bridge_call("read")
+            verified_tables=verified.get("data",{}) or {}
+            if appsheet_batch_fingerprint(verified_tables)!=incoming_fp:
+                raise RuntimeError("La carga se publicó, pero AppSheet no confirmó el lote nuevo.")
+            return {
+                "status":"published","tables":verified_tables,"payload":payload,
+                "incoming_fingerprint":incoming_fp,"active_matches_upload":True,
+                "archived_count":0,"attempts":attempt,
+            }
+
+        archive_records,archive_errors=appsheet_archive_preflight(tables,detail)
+        if archive_errors:
+            raise RuntimeError("No limpié el lote anterior: "+" ".join(archive_errors))
+
+        archived_count=len(archive_records)
+        if has_rows:
+            previous_audits=store.get("order_audits",[]) or []
+            previous_log=store.get("appsheet_archive_log",[]) or []
+            previous_upload_identity=str(session_state.get("_appsheet_last_upload_identity","") or "")
+            archive_scope=previous_upload_identity or ("archived:"+current_fp)
+            for record in archive_records:
+                record.setdefault("lote_id",archive_scope)
+            merged_audits=merge_order_audit_records(previous_audits,archive_records)
+            archive_log=[dict(item) for item in previous_log if isinstance(item,dict)]
+            log_entry={
+                "fingerprint":current_fp,
+                "upload_identity":str(upload_identity or ""),
+                "fecha":datetime.now(ZoneInfo("America/Mexico_City")).isoformat(timespec="seconds"),
+                "pedidos":len(tables.get("Pedidos",[]) or []),
+                "articulos":len(tables.get("Articulos",[]) or []),
+                "validaciones":len(tables.get("Validaciones",[]) or []),
+                "auditorias":len(tables.get("Auditorias",[]) or []),
+                "diferencias":len(tables.get("Diferencias",[]) or []),
+                "auditorias_archivadas":archived_count,
+            }
+            existing_log_index=next(
+                (
+                    index for index,item in enumerate(archive_log)
+                    if str(item.get("fingerprint",""))==current_fp
+                    and str(item.get("upload_identity",""))==str(upload_identity or "")
+                ),
+                None,
+            )
+            if existing_log_index is None:
+                archive_log.append(log_entry)
+            else:
+                archive_log[existing_log_index]=log_entry
+            archive_log=archive_log[-500:]
+            had_audits="order_audits" in store
+            had_log="appsheet_archive_log" in store
+            store["order_audits"]=merged_audits
+            store["appsheet_archive_log"]=archive_log
+            try:
+                save_store(store)
+            except Exception:
+                if had_audits:
+                    store["order_audits"]=previous_audits
+                else:
+                    store.pop("order_audits",None)
+                if had_log:
+                    store["appsheet_archive_log"]=previous_log
+                else:
+                    store.pop("appsheet_archive_log",None)
+                raise
+
+        try:
+            appsheet_bridge_call(
+                "publish",replaceBatch=True,archiveConfirmed=True,
+                expectedFingerprint=current_fp,**payload
+            )
+        except Exception as exc:
+            if "lote cambió desde la lectura" in str(exc).casefold():
+                last_conflict=exc
+                if attempt<max_attempts:
+                    continue
+                raise RuntimeError(
+                    f"AppSheet cambió durante {max_attempts} intentos. No se borró ningún dato. "
+                    "El archivo sigue seleccionado; actualiza la página para reintentar."
+                ) from exc
+            raise
+
+        _mark_success()
+        verified=appsheet_bridge_call("read")
+        verified_tables=verified.get("data",{}) or {}
+        if appsheet_batch_fingerprint(verified_tables)!=incoming_fp:
+            raise RuntimeError(
+                "AppSheet confirmó la carga, pero el lote cambió antes de verificarlo. "
+                "Conservé el historial y no intenté sobrescribir una carga concurrente."
+            )
+        return {
+            "status":"replaced","tables":verified_tables,"payload":payload,
+            "incoming_fingerprint":incoming_fp,"active_matches_upload":True,
+            "archived_count":archived_count,"attempts":attempt,
+        }
+
+    if last_conflict:
+        raise RuntimeError(
+            f"AppSheet cambió durante {max_attempts} intentos. No se borró ningún dato. "
+            "El archivo sigue seleccionado; actualiza la página para reintentar."
+        ) from last_conflict
+    raise RuntimeError("No se pudo publicar el lote nuevo en AppSheet.")
 
 
 def build_saved_order_audit_pdf(record):
@@ -5074,6 +5269,7 @@ if _tab_active(o):
             "1. Cargar pedidos (Excel o CSV, opcional si están en AppSheet)",
             type=["xlsx","xls","csv"],
             key="order_audit_upload",
+            on_change=order_audit_upload_changed,
             help="Si no eliges un archivo, la página lee el lote activo de AppSheet en modo solo lectura. El archivo original tampoco se modifica.",
         )
         _audit_source_appsheet=False
@@ -5357,6 +5553,15 @@ if _tab_active(o):
                                             key="appsheet_manual_order_package",
                                         )
 
+                                _upload_event_id=str(st.session_state.get("_order_audit_upload_event_id","") or "")
+                                _upload_content_hash=hashlib.sha256(
+                                    str(getattr(audit_upload,"name","")).encode("utf-8")+b":"+_audit_raw
+                                ).hexdigest()
+                                _audit_upload_identity=f"{_upload_event_id}:{_upload_content_hash}"
+                                _new_file_upload=(
+                                    not _audit_source_appsheet
+                                    and _audit_upload_identity!=str(st.session_state.get("_appsheet_last_upload_identity","") or "")
+                                )
                                 _saved_audits=store.get("order_audits",[]) or []
                                 _bridge_remote_audits=[]
                                 _bridge_url,_bridge_token=appsheet_bridge_settings()
@@ -5367,65 +5572,63 @@ if _tab_active(o):
                                     st.caption("Los pedidos activos y sus validaciones se consultan desde AppSheet en solo lectura; esta carga no publica ni reemplaza el lote.")
                                 elif _bridge_url and _bridge_token:
                                     try:
-                                        _bridge_health=appsheet_bridge_call("health")
-                                        _bridge_tables=appsheet_bridge_call("read").get("data",{})
-                                        _bridge_payload=appsheet_order_payload(_audit_detail,_risk_summary,_bridge_tables.get("Articulos",[]))
-                                        _incoming_fp=appsheet_batch_fingerprint(_bridge_payload)
-                                        _current_fp=appsheet_batch_fingerprint(_bridge_tables)
-                                        _has_old_rows=any(_bridge_tables.get(name,[]) for name in ["Pedidos","Articulos","Validaciones","Auditorias","Diferencias"])
-                                        _same_batch=_has_old_rows and _incoming_fp==_current_fp
-                                        _replace_ready=bool((_bridge_health.get("capabilities") or {}).get("replaceBatch"))
-                                        if not _has_old_rows:
-                                            appsheet_bridge_call("publish",**_bridge_payload)
-                                            st.session_state["_appsheet_last_publish"]=_incoming_fp
-                                            st.success(f"AppSheet recibió {len(_bridge_payload['Pedidos']):,} pedidos y {len(_bridge_payload['Articulos']):,} artículos.")
-                                        elif _same_batch:
-                                            st.caption("AppSheet ya contiene este mismo lote; no se volvió a importar.")
-                                            st.session_state["_appsheet_last_publish"]=_incoming_fp
-                                        elif not _replace_ready:
-                                            st.warning("Hay un lote anterior en AppSheet. No lo reemplacé porque el puente activo todavía no confirma la función de archivado y limpieza segura; el lote anterior sigue intacto.")
-                                        else:
-                                            _archive_records,_archive_errors=appsheet_archive_preflight(_bridge_tables,_audit_detail)
-                                            if _archive_errors:
-                                                st.error("No limpié el lote anterior: "+ " ".join(_archive_errors))
-                                            else:
-                                                _merged_audits=merge_order_audit_records(_saved_audits,_archive_records)
-                                                _archive_log=list(store.get("appsheet_archive_log",[]) or [])
-                                                if not any(str(x.get("fingerprint",""))==_current_fp for x in _archive_log if isinstance(x,dict)):
-                                                    _archive_log.append({
-                                                        "fingerprint":_current_fp,
-                                                        "fecha":datetime.now(ZoneInfo("America/Mexico_City")).isoformat(timespec="seconds"),
-                                                        "pedidos":len(_bridge_tables.get("Pedidos",[]) or []),
-                                                        "articulos":len(_bridge_tables.get("Articulos",[]) or []),
-                                                        "validaciones":len(_bridge_tables.get("Validaciones",[]) or []),
-                                                        "auditorias":len(_bridge_tables.get("Auditorias",[]) or []),
-                                                        "diferencias":len(_bridge_tables.get("Diferencias",[]) or []),
-                                                    })
-                                                store["order_audits"]=_merged_audits
-                                                store["appsheet_archive_log"]=_archive_log
-                                                save_store(store)
-                                                appsheet_bridge_call(
-                                                    "publish",replaceBatch=True,archiveConfirmed=True,
-                                                    expectedFingerprint=_current_fp,**_bridge_payload
-                                                )
-                                                _verified_tables=appsheet_bridge_call("read").get("data",{})
-                                                if appsheet_batch_fingerprint(_verified_tables)!=_incoming_fp:
-                                                    raise RuntimeError("La carga terminó, pero la verificación del lote nuevo no coincidió.")
-                                                st.session_state["_appsheet_last_publish"]=_incoming_fp
-                                                st.success(
-                                                    f"Lote anterior archivado en la página y reemplazado: "
-                                                    f"{len(_bridge_payload['Pedidos']):,} pedidos y "
-                                                    f"{len(_bridge_payload['Articulos']):,} artículos."
-                                                )
-                                                _bridge_tables=_verified_tables
+                                        _bridge_sync=appsheet_publish_uploaded_batch(
+                                            _audit_detail,_risk_summary,store,
+                                            force_replace=_new_file_upload,
+                                            upload_identity=_audit_upload_identity,
+                                            session_state=st.session_state,
+                                        )
+                                        _bridge_tables=_bridge_sync.get("tables",{}) or {}
+                                        _sync_status=_bridge_sync.get("status")
+                                        if _sync_status=="published":
+                                            st.success(
+                                                f"AppSheet recibió {len(_bridge_sync['payload']['Pedidos']):,} pedidos y "
+                                                f"{len(_bridge_sync['payload']['Articulos']):,} artículos."
+                                            )
+                                        elif _sync_status=="replaced":
+                                            st.success(
+                                                f"Lote anterior archivado en el historial y reemplazado: "
+                                                f"{len(_bridge_sync['payload']['Pedidos']):,} pedidos y "
+                                                f"{len(_bridge_sync['payload']['Articulos']):,} artículos. "
+                                                f"Auditorías anteriores archivadas: {_bridge_sync.get('archived_count',0):,}."
+                                            )
+                                        elif _sync_status=="same":
+                                            st.caption("AppSheet ya contiene el lote de este archivo; no se repitió la carga.")
+                                        elif _sync_status=="different_active":
+                                            st.warning(
+                                                "El lote activo de AppSheet es distinto del archivo seleccionado. "
+                                                "No lo reemplacé porque no detecté una carga nueva; vuelve a cargar el archivo para iniciar esa ronda."
+                                            )
+                                        elif _sync_status=="empty_active":
+                                            st.warning(
+                                                "AppSheet no tiene un lote activo y este archivo ya se había procesado. "
+                                                "Vuelve a cargarlo para publicarlo como una ronda nueva."
+                                            )
+                                        elif _sync_status=="replace_unavailable":
+                                            st.warning(
+                                                "El puente activo no confirma el reemplazo seguro. "
+                                                "Conservé el lote anterior y sus auditorías."
+                                            )
                                         _bridge_remote_audits=appsheet_rows_to_audits(_bridge_tables,_audit_detail)
                                     except Exception as _bridge_error:
                                         st.warning(f"No pude sincronizar el lote con AppSheet: {_bridge_error}")
                                 else:
                                     st.caption("AppSheet: integración preparada; falta habilitar la conexión segura para sincronizar cargas y validaciones.")
                                 _saved_audits=merge_order_audit_records(_saved_audits,_bridge_remote_audits)
+                                _audit_scope_identity=(
+                                    appsheet_batch_fingerprint(_bridge_tables)
+                                    if _audit_source_appsheet
+                                    else _audit_upload_identity
+                                )
+                                _active_saved_audits=[
+                                    record for record in _saved_audits
+                                    if str(record.get("lote_id","") or "")==str(_audit_scope_identity or "")
+                                ]
+                                _current_round_audits=merge_order_audit_records(
+                                    _active_saved_audits,_bridge_remote_audits
+                                )
                                 _audited_orders={
-                                    norm(a.get("pedido","")) for a in _saved_audits
+                                    norm(a.get("pedido","")) for a in _current_round_audits
                                     if audit_record_is_complete(a) and str(a.get("pedido","")).strip()
                                 }
                                 _risk_summary["Ya auditado"]=_risk_summary["Número de pedido"].map(lambda v:norm(v) in _audited_orders)
@@ -5614,6 +5817,7 @@ if _tab_active(o):
                                                     "factores_foco":str(_order_row.get("Factores","")),
                                                     "alarma":str(_order_row.get("Alarma","")),
                                                     "fuente_archivo":audit_upload.name,
+                                                    "lote_id":str(_audit_scope_identity or ""),
                                                 }
                                                 store.setdefault("order_audits",[]).append(_audit_record)
                                                 try:
