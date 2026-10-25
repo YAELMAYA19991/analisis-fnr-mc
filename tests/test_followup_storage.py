@@ -11,7 +11,7 @@ SOURCE=APP.read_text(encoding="utf-8")
 TREE=ast.parse(SOURCE)
 NAMES={
     "norm","person_key","name_tokens","token_key","picker_record",
-    "_unique_records","_merge_picker_store","_followup_event_objects",
+    "email_key","extract_email_address","_unique_records","_merge_picker_store","_followup_event_objects",
     "_load_followup_journal","save_followup_entry",
 }
 NODES=[node for node in TREE.body if isinstance(node,ast.FunctionDef) and node.name in NAMES]
