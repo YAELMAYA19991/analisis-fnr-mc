@@ -2674,24 +2674,23 @@ def _audit_archive_parsed_version(key,filename,tipo):
     return hashlib.sha256(raw).hexdigest(),_audit_parse_history_bytes(raw,tipo)
 
 
-def audit_history_30days(current_fnr,current_mc,roster,base,store,today=None):
-    """Fuente exclusiva para el riesgo histórico de auditoría: 30 días completos previos."""
-    today=today or datetime.now(ZoneInfo("America/Mexico_City")).date()
+@st.cache_data(show_spinner=False,ttl=300,max_entries=4)
+def _audit_history_30days_cached(current_fnr,current_mc,roster,today_iso,fnr_names,mc_names):
+    """Reutiliza el histórico combinado mientras no cambien archivos, plantilla o versiones."""
+    today=datetime.fromisoformat(today_iso).date()
+    identity=roster.rename(columns={"TURNO_MAESTRO":"TURNO","AREA_MAESTRO":"AREA_BASE"}).copy()
     result={}
     metadata={}
-    for key,tipo,now_bytes in [
-        ("detalle_fnr","FNR",current_fnr),
-        ("detalle_mc","MC",current_mc),
+    for key,tipo,now_bytes,names in [
+        ("detalle_fnr","FNR",current_fnr,fnr_names),
+        ("detalle_mc","MC",current_mc,mc_names),
     ]:
         versions=[]
         seen_hash=set()
-        # Incluir la versión actual incluso si todavía no aparece en el índice remoto.
         current_hash=hashlib.sha256(now_bytes).hexdigest()
         versions.append(canonicalize_incidents(_audit_parse_history_bytes(now_bytes,tipo),roster))
         seen_hash.add(current_hash)
-        names=_audit_history_archive_names(key,today.isoformat())
         for name in names:
-            # Cachea el archivo y omite copias exactas de una versión anterior.
             fingerprint,parsed=_audit_archive_parsed_version(key,name,tipo)
             if fingerprint in seen_hash:
                 continue
@@ -2699,17 +2698,24 @@ def audit_history_30days(current_fnr,current_mc,roster,base,store,today=None):
             versions.append(canonicalize_incidents(parsed,roster))
         frame,stats=audit_dedupe_30day_versions(versions,today)
         if not frame.empty:
-            identity=roster.rename(columns={"TURNO_MAESTRO":"TURNO","AREA_MAESTRO":"AREA_BASE"}).copy()
             frame=attach(frame,identity)
             frame["CORREO_KEY"]=frame.get("CORREO",pd.Series("",index=frame.index)).map(email_key)
         result[tipo]=frame
         metadata[tipo]=stats
-    _,result["FNR"],result["MC"]=exclude_registered_supervisors(
-        base,result["FNR"],result["MC"],store
-    )
     return result["FNR"],result["MC"],metadata
 
 
+def audit_history_30days(current_fnr,current_mc,roster,base,store,today=None):
+    """Calcula el histórico de 30 días y excluye supervisores con la configuración vigente."""
+    today=today or datetime.now(ZoneInfo("America/Mexico_City")).date()
+    today_iso=today.isoformat()
+    fnr_names=tuple(_audit_history_archive_names("detalle_fnr",today_iso))
+    mc_names=tuple(_audit_history_archive_names("detalle_mc",today_iso))
+    fnr,mc,metadata=_audit_history_30days_cached(
+        current_fnr,current_mc,roster,today_iso,fnr_names,mc_names,
+    )
+    _,fnr,mc=exclude_registered_supervisors(base,fnr,mc,store)
+    return fnr,mc,metadata
 def audit_record_is_complete(record):
     """Solo una revisión confirmada puede retirar un pedido de la lista pendiente."""
     if not isinstance(record,dict):
