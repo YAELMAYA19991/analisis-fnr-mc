@@ -2807,6 +2807,20 @@ def appsheet_bridge_call(action, **payload):
     return result
 
 
+
+@st.cache_data(show_spinner=False,ttl=60)
+def appsheet_saved_audit_hours():
+    """Lee el rango global persistido en la tabla ConfiguracionHorario."""
+    try:
+        result=appsheet_bridge_call("getAuditHours")
+        start=int(result.get("hourStart"))
+        end=int(result.get("hourEnd"))
+        if not (0<=start<=end<=23):
+            raise ValueError("El rango guardado en AppSheet no es válido.")
+        return {"range":(start,end),"error":""}
+    except Exception as exc:
+        return {"range":(7,22),"error":str(exc)}
+
 def appsheet_normalize_slot(value):
     """Normaliza slots que Sheets devuelve como fracción o fecha ISO de 1899."""
     if value is None:
@@ -5794,16 +5808,41 @@ if _tab_active(o):
                                 }
                                 _risk_summary["Ya auditado"]=_risk_summary["Número de pedido"].map(lambda v:norm(v) in _audited_orders)
 
+                                _saved_hour_config=appsheet_saved_audit_hours()
+                                _saved_hour_range=_saved_hour_config["range"]
                                 _hour_start, _hour_end = st.slider(
                                     "2. Horario a revisar",
                                     min_value=7,
                                     max_value=22,
-                                    value=(7,22),
+                                    value=_saved_hour_range,
                                     step=1,
                                     format="%02d:00",
                                     key="audit_hour_range_v3",
                                     help="Elige la primera y la última hora que quieres incluir.",
                                 )
+                                _selected_hour_range=(int(_hour_start),int(_hour_end))
+                                if _saved_hour_config["error"]:
+                                    st.caption("No se pudo leer el rango guardado en AppSheet; se muestra 07–22. " + _saved_hour_config["error"])
+                                if _selected_hour_range!=_saved_hour_range:
+                                    if st.button("Guardar horario en AppSheet",key="save_audit_hour_range_appsheet"):
+                                        try:
+                                            appsheet_bridge_call(
+                                                "setAuditHours",
+                                                hourStart=_selected_hour_range[0],
+                                                hourEnd=_selected_hour_range[1],
+                                            )
+                                            appsheet_saved_audit_hours.clear()
+                                            _saved_hour_range=_selected_hour_range
+                                            _saved_hour_config={"range":_selected_hour_range,"error":""}
+                                            st.success(
+                                                f"Horario {_hour_start:02d}:00–{_hour_end:02d}:59 guardado en AppSheet. "
+                                                "Sincroniza la app para ver el filtro actualizado."
+                                            )
+                                        except Exception as _range_error:
+                                            st.error("No se pudo guardar el horario en AppSheet: " + str(_range_error))
+                                    st.caption("Este horario es global: define qué pedidos pendientes ven los usuarios de AppSheet.")
+                                else:
+                                    st.caption(f"Horario global guardado en AppSheet: {_hour_start:02d}:00–{_hour_end:02d}:59.")
                                 _hour_start_min = _hour_start * 60
                                 _hour_end_min = (_hour_end + 1) * 60
                                 _slot_start_minutes = pd.to_numeric(
