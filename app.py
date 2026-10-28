@@ -2215,6 +2215,7 @@ def attach(inc,base):
 @st.cache_data(show_spinner="Procesando los Excel por primera vez…",max_entries=2,ttl=86400)
 def prepare_source_frames(base_data,fnr_data,mc_data,roster_data,personnel_config_json):
     """Procesa y cruza las fuentes una vez por versión de archivos/configuración."""
+    _processing_cache_version = "incident-area-department-v2"
     config=json.loads(personnel_config_json)
     base=parse_base(choose(sheets_from_bytes(base_data),["picker","lineas","resumen"]))
     fnr=parse_inc(choose(sheets_from_bytes(fnr_data),["fnr","detalle"]),"FNR")
@@ -2247,6 +2248,7 @@ def prepare_history_frames(base_data,fnr_data,mc_data,roster,personnel_config_js
     Se usa la plantilla consolidada actual como identidad canónica para poder
     comparar al mismo picker entre periodos sin pedir un cuarto archivo.
     """
+    _processing_cache_version = "incident-area-department-v2"
     config=json.loads(personnel_config_json)
     hist_base=parse_base(choose(sheets_from_bytes(base_data),["picker","lineas","resumen"]))
     hist_fnr=parse_inc(choose(sheets_from_bytes(fnr_data),["fnr","detalle"]),"FNR")
