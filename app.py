@@ -3942,7 +3942,7 @@ def order_risk_analysis(audit_lines,picker_summary,fnr_inc,mc_inc,prior_audits=N
     order_summary=pd.DataFrame(summary_rows)
     if not order_summary.empty:
         def _slot_hour(value):
-            match=re.search(r"(?<!\\d)(\\d{1,2}):(\\d{2})(?!\\d)",str(value or ""))
+            match=re.search(r"(?<!\d)(\d{1,2}):(\d{2})(?!\d)",str(value or ""))
             if not match: return "Sin hora"
             hour=int(match.group(1))
             return f"{hour:02d}:00–{hour:02d}:59"
@@ -5850,7 +5850,7 @@ if _tab_active(o):
                                 if not _coverage_summary.empty:
                                     _n_done=int(_coverage_summary["Ya auditado"].sum())
                                     _q1,_q2,_q3=st.columns(3)
-                                    _q1.metric("Pedidos en esta cobertura",f"{len(_coverage_summary):,}")
+                                    _q1.metric("Pedidos en horario",f"{len(_coverage_summary):,}")
                                     _q2.metric("Pendientes",f"{len(_available):,}")
                                     _q3.metric("Ya auditados",f"{_n_done:,}")
                                 st.caption("Las sugerencias usan señales históricas FNR/MC y picker/artículo para ordenar la revisión; sirven como guía, no determinan la causa.")
