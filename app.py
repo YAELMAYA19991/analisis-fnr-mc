@@ -2104,6 +2104,25 @@ def roster_from_uploads(uploads):
     r=pd.concat(frames,ignore_index=True)
     return r.drop_duplicates("PICKER",keep="last")
 
+def incident_area_label(value):
+    """Normaliza el área declarada en el archivo FNR/MC, sin usar la asignación del master."""
+    if value is None or pd.isna(value):
+        return "No especificada"
+    label=str(value).strip()
+    key=norm(label)
+    if key in {"","nan","none","nat","no_especificada","no_especificado"}:
+        return "No especificada"
+    canonical={
+        "outbound_oki":"Outbound OKI",
+        "picker":"PICKER",
+        "salchichoneria":"Salchichonería",
+        "pan_y_tortillas_para_cada_dia":"Pan y tortillas para cada día",
+        "pan_y_tortillas":"Pan y tortillas",
+        "granel":"Granel",
+    }
+    return canonical.get(key,label)
+
+
 def parse_inc(df,tipo):
     """Lee FNR/MC con o sin correo.
 
@@ -2128,6 +2147,7 @@ def parse_inc(df,tipo):
         "SKU":df[sku].fillna("").astype(str).str.strip() if sku else "",
         "ORDER_NUMBER":df[order].astype(str).str.strip() if order else "",
         "AREA":df[ar].astype(str).str.strip() if ar else "No especificada",
+        "_AREA_INCIDENTE":df[ar].map(incident_area_label) if ar else "No especificada",
         "TURNO":df[sh].astype(str).str.strip() if sh else "No especificado",
         "FECHA":df[fe] if fe else "",
         "INCIDENCIAS":pd.to_numeric(df[qty],errors="coerce").fillna(1) if qty else 1,
@@ -4175,9 +4195,9 @@ def safe_pct(num, den, decimals=2):
     return out.astype("float64").round(decimals)
 
 def groups(inc,base,key):
-    """Agrupa FNR/MC por turno o área usando el contexto ya cruzado por correo.
-    Acepta TURNO_REF/TURNO y AREA_REF/AREA para evitar que una diferencia de
-    nombre interno deje vacía la segmentación.
+    """Agrupa FNR/MC por turno o por el área del reporte de incidencia.
+    Para las áreas no usa la clasificación personal de Plantilla/Pickers como
+    sustituto de un denominador real de líneas por departamento.
     """
     x=_dedupe_columns(inc)
     base=_dedupe_columns(base)
@@ -4201,18 +4221,21 @@ def groups(inc,base,key):
         else:
             den=None
     else:
-        area_col=next((c for c in ["AREA_REF","AREA","AREA_BASE","_MASTER_AREA","AREA_MAESTRO"] if c in x.columns),None)
+        # El área de la incidencia viene del detalle FNR/MC. AREA_REF y AREA_BASE
+        # describen la asignación del picker y no deben reclasificar el incidente.
+        if "_AREA_INCIDENTE" in x.columns:
+            area_col="_AREA_INCIDENTE"
+        elif "AREA" in x.columns and "AREA_REF" not in x.columns:
+            area_col="AREA"
+        else:
+            area_col=None
         if area_col is None:
             x["GRUPO"]="No especificada"
         else:
-            x["GRUPO"]=x[area_col].fillna("No especificada").astype(str).str.strip()
-            x.loc[x["GRUPO"].eq(""),"GRUPO"]="No especificada"
-        den_col="AREA_BASE" if "AREA_BASE" in base.columns else None
-        if den_col and (base[den_col].astype(str).str.strip()!="No especificada").any():
-            den=(base.groupby(den_col,as_index=False)["LINEAS"].sum()
-                 .rename(columns={den_col:"GRUPO"}))
-        else:
-            den=None
+            x["GRUPO"]=x[area_col].map(incident_area_label)
+        # La base actual es por picker; sus líneas no son un denominador de
+        # departamento cuando una persona trabaja en varias áreas.
+        den=None
 
     g=x.groupby("GRUPO",as_index=False)["INCIDENCIAS"].sum()
     total_inc=float(pd.to_numeric(g["INCIDENCIAS"],errors="coerce").fillna(0).sum())
