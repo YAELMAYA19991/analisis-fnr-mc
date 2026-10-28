@@ -5049,8 +5049,8 @@ with st.expander("🔳 Generador de códigos QR",expanded=False):
     
 st.divider()
 
-_tab_labels=["🏠 Bodega y turnos / áreas","👤 Pickers y supervisores","📅 Faltas y retardos","🛡️ Seguimiento","📌 Pendientes","📦 Auditoría de pedidos","🧰 Herramientas"]
-a,b,i,h,j,o,x=st.tabs(_tab_labels,on_change="rerun",key="control_fnr_mc_tabs_v7")
+_tab_labels=["🏠 Bodega y turnos / áreas","👤 Pickers y supervisores","📅 Faltas y retardos","🛡️ Seguimiento","📦 Auditoría de pedidos","🧰 Herramientas"]
+a,b,i,h,o,x=st.tabs(_tab_labels,on_change="rerun",key="control_fnr_mc_tabs_v8")
 # Agrupa las secciones en una sola pestaña y conserva sus formularios y cálculos.
 e=a  # Turnos / Áreas comparte la pestaña de Bodega.
 g=b  # Supervisores comparte la pestaña de Pickers.
@@ -7199,71 +7199,3 @@ if _tab_active(x):
         backup_json=json.dumps(store,ensure_ascii=False,indent=2).encode("utf-8")
         st.download_button("Descargar respaldo de configuración",backup_json,f"Respaldo_Control_FNR_{periodo}.json","application/json",key="tools_config_backup")
 
-if _tab_active(j):
-    with j:
-        st.subheader("📌 Tablero de pendientes y procesos")
-        st.caption("Aquí el responsable puede publicar procesos nuevos, pendientes operativos y material visual de referencia. Todo queda guardado.")
-
-        with st.expander("➕ Crear nuevo proceso / pendiente", expanded=False):
-            with st.form("nuevo_proceso_form", clear_on_submit=True):
-                p1,p2=st.columns([2,1])
-                with p1:
-                    proc_titulo=st.text_input("Nombre del proceso / pendiente",placeholder="Ej. Validación de pedidos 07:00–12:00")
-                    proc_obj=st.text_area("Objetivo / qué se debe hacer",height=90)
-                    proc_pasos=st.text_area("Pasos o instrucciones",height=130,placeholder="1. ...\n2. ...\n3. ...")
-                with p2:
-                    proc_resp=st.text_input("Responsable")
-                    proc_prior=st.selectbox("Prioridad",["Alta","Media","Baja"])
-                    proc_status=st.selectbox("Estado",["Pendiente","En proceso","Completado"])
-                    proc_fecha=st.date_input("Fecha objetivo",value=datetime.now().date())
-                    proc_imgs=st.file_uploader("Imágenes referenciales",type=["png","jpg","jpeg","webp"],accept_multiple_files=True,key="proc_imgs_new")
-                if st.form_submit_button("Guardar proceso",type="primary"):
-                    if not proc_titulo.strip():
-                        st.warning("Escribe un nombre para el proceso.")
-                    else:
-                        pid=new_process_id()
-                        paths=[]
-                        for img in proc_imgs or []:
-                            paths.append(save_process_image(img.getvalue(),pid,img.name))
-                        store.setdefault("procesos",[]).append({
-                            "id":pid,"titulo":proc_titulo.strip(),"objetivo":proc_obj.strip(),"pasos":proc_pasos.strip(),
-                            "responsable":proc_resp.strip(),"prioridad":proc_prior,"estado":proc_status,
-                            "fecha_objetivo":str(proc_fecha),"creado":datetime.now().strftime("%Y-%m-%d %H:%M"),"imagenes":paths})
-                        save_store(store); st.success("Proceso guardado."); st.rerun()
-
-        procesos=store.get("procesos",[])
-        if not procesos:
-            st.info("Todavía no hay procesos o pendientes publicados.")
-        else:
-            status_order=["Pendiente","En proceso","Completado"]
-            for status_name in status_order:
-                items=[p for p in procesos if p.get("estado")==status_name]
-                st.markdown(f"### {status_name} · {len(items)}")
-                cols=st.columns(3)
-                if not items:
-                    st.caption("Sin elementos en esta columna.")
-                for idx,proc in enumerate(items):
-                    with cols[idx%3]:
-                        priority=proc.get("prioridad","Media")
-                        st.markdown(f"<div class='justo-card'><div class='justo-kicker'>{_h(priority)}</div><div class='justo-title'>{_h(proc.get('titulo','Sin título'))}</div><div class='justo-muted'>Responsable: {_h(proc.get('responsable') or 'Sin asignar')} · Fecha: {_h(proc.get('fecha_objetivo') or 'Sin fecha')}</div></div>",unsafe_allow_html=True)
-                        if proc.get("objetivo"): st.write(proc["objetivo"])
-                        if proc.get("pasos"):
-                            with st.expander("Ver instrucciones"):
-                                st.write(proc["pasos"])
-                        imgs=load_process_images(proc)
-                        if imgs:
-                            st.image([data for _,data in imgs],caption=[os.path.basename(path) for path,_ in imgs],use_container_width=True)
-                        new_status=st.selectbox("Cambiar estado",status_order,index=status_order.index(proc.get("estado","Pendiente")) if proc.get("estado") in status_order else 0,key=f"proc_status_{proc['id']}")
-                        ec1,ec2=st.columns(2)
-                        with ec1:
-                            if st.button("Guardar estado",key=f"proc_save_{proc['id']}"):
-                                for pp in store["procesos"]:
-                                    if pp.get("id")==proc.get("id"): pp["estado"]=new_status
-                                save_store(store); st.rerun()
-                        with ec2:
-                            if st.button("Eliminar",key=f"proc_del_{proc['id']}"):
-                                st.session_state["confirm_delete_process_id"]=proc.get("id")
-                                st.rerun()
-                        if st.session_state.get("confirm_delete_process_id")==proc.get("id"):
-                            st.warning(f"¿Eliminar el proceso ‘{proc.get('titulo','Sin título')}’?")
-                            yes_col,no_col=st.columns(2)
