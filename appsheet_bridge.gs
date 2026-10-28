@@ -30,17 +30,52 @@ function doPost(e) {
     if (!token || body.token !== token) return respuesta({ok:false,error:'No autorizado'});
     if (body.action === 'health') {
       const ss = SpreadsheetApp.openById(AUDIT_SHEET);
-      const required = ['Pedidos','Articulos','Validaciones','Auditorias','Diferencias'];
+      const required = ['Pedidos','Articulos','Validaciones','Auditorias','Diferencias','ConfiguracionHorario'];
       const missing = required.filter(name => !ss.getSheetByName(name));
       if (missing.length) throw new Error('Faltan hojas requeridas: ' + missing.join(', '));
       const counts = {};
       required.forEach(name => {
         counts[name] = Math.max(0, ss.getSheetByName(name).getLastRow() - 1);
       });
-      return respuesta({ok:true,message:'Puente y hoja conectados',tables:counts,capabilities:{replaceBatch:true,serverFingerprint:true}});
+      return respuesta({ok:true,message:'Puente y hoja conectados',tables:counts,capabilities:{replaceBatch:true,serverFingerprint:true,hourRange:true}});
     }
     if (!lock.tryLock(25000)) return respuesta({ok:false,error:'Ocupado; reintentar'});
     const ss = SpreadsheetApp.openById(AUDIT_SHEET);
+    if (body.action === 'getAuditHours') {
+      const sheet = ss.getSheetByName('ConfiguracionHorario');
+      if (!sheet) throw new Error('Falta la tabla ConfiguracionHorario.');
+      const config = registros(sheet).find(row => String(row.ID_Config || '') === 'GLOBAL');
+      if (!config) throw new Error('No existe la configuración GLOBAL del horario.');
+      const hourStart = Number(config.Hora_Inicio);
+      const hourEnd = Number(config.Hora_Fin);
+      if (!Number.isInteger(hourStart) || !Number.isInteger(hourEnd) ||
+          hourStart < 0 || hourEnd > 23 || hourStart > hourEnd) {
+        throw new Error('El rango de horario guardado no es válido.');
+      }
+      return respuesta({ok:true,hourStart:hourStart,hourEnd:hourEnd});
+    }
+    if (body.action === 'setAuditHours') {
+      const hourStart = Number(body.hourStart);
+      const hourEnd = Number(body.hourEnd);
+      if (!Number.isInteger(hourStart) || !Number.isInteger(hourEnd) ||
+          hourStart < 0 || hourEnd > 23 || hourStart > hourEnd) {
+        throw new Error('El rango debe usar horas enteras de 0 a 23 y la hora inicial no puede superar la final.');
+      }
+      const sheet = ss.getSheetByName('ConfiguracionHorario');
+      if (!sheet) throw new Error('Falta la tabla ConfiguracionHorario.');
+      guardar(sheet,[{
+        ID_Config:'GLOBAL',
+        Hora_Inicio:hourStart,
+        Hora_Fin:hourEnd,
+        Actualizado_En:new Date()
+      }]);
+      return respuesta({
+        ok:true,
+        hourStart:hourStart,
+        hourEnd:hourEnd,
+        message:'Horario global de pedidos actualizado.'
+      });
+    }
     if (body.action === 'read') {
       const data = {};
       ['Pedidos','Articulos','Validaciones','Auditorias','Diferencias'].forEach(name => {
