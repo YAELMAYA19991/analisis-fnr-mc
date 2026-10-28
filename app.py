@@ -5049,7 +5049,7 @@ with st.expander("🔳 Generador de códigos QR",expanded=False):
     
 st.divider()
 
-_tab_labels=["🏠 Bodega y turnos / áreas","👤 Pickers y supervisores","📅 Faltas y retardos","🛡️ Seguimiento","📦 Auditoría de pedidos","🧰 Herramientas"]
+_tab_labels=["🏠 Bodega y turnos / áreas","👤 Pickers y supervisores","📅 Faltas y retardos","🛡️ Seguimiento","📦 Consulta de pedidos","🧰 Herramientas"]
 a,b,i,h,o,x=st.tabs(_tab_labels,on_change="rerun",key="control_fnr_mc_tabs_v8")
 # Agrupa las secciones en una sola pestaña y conserva sus formularios y cálculos.
 e=a  # Turnos / Áreas comparte la pestaña de Bodega.
@@ -5380,8 +5380,8 @@ if _tab_active(o):
         _auto_sync_notice=st.session_state.pop("_appsheet_auto_sync_notice",None)
         if _auto_sync_notice:
             st.success(_auto_sync_notice)
-        st.subheader("📦 Auditoría rápida de pedidos")
-        st.caption("Carga el archivo de pedidos, elige uno de la lista y guarda el resultado. Los archivos originales solo se consultan; las auditorías quedan guardadas por separado.")
+        st.subheader("📦 Consulta de pedidos")
+        st.caption("Carga el archivo para consultar pedidos, artículos y antecedentes. Registra la revisión y las diferencias desde AppSheet; aquí los pedidos y artículos se mantienen de solo lectura.")
 
         if st.button("🔌 Probar conexión AppSheet (solo lectura)", key="appsheet_readonly_test"):
             try:
