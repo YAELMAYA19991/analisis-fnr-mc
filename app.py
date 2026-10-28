@@ -5794,13 +5794,29 @@ if _tab_active(o):
                                 }
                                 _risk_summary["Ya auditado"]=_risk_summary["Número de pedido"].map(lambda v:norm(v) in _audited_orders)
 
-                                _coverage_label=st.selectbox(
-                                    "2. Pedidos a revisar",
-                                    ["Todo el día","Mi turno: slots antes de 10:00","Equipo de día: slots desde 10:00"],
-                                    key="audit_coverage_simple_v2",
+                                _hour_start, _hour_end = st.slider(
+                                    "2. Horario a revisar",
+                                    min_value=7,
+                                    max_value=22,
+                                    value=(7,22),
+                                    step=1,
+                                    format="%02d:00",
+                                    key="audit_hour_range_v3",
+                                    help="Elige la primera y la última hora que quieres incluir.",
                                 )
-                                _coverage_mode="early" if _coverage_label.startswith("Mi turno") else "day" if _coverage_label.startswith("Equipo") else "all"
-                                _coverage_summary=audit_coverage_filter(_risk_summary,_coverage_mode)
+                                _hour_start_min = _hour_start * 60
+                                _hour_end_min = (_hour_end + 1) * 60
+                                _slot_start_minutes = pd.to_numeric(
+                                    _risk_summary["_slot_min"], errors="coerce"
+                                )
+                                _coverage_summary = _risk_summary[
+                                    _slot_start_minutes.ge(_hour_start_min)
+                                    & _slot_start_minutes.lt(_hour_end_min)
+                                ].copy()
+                                st.caption(
+                                    f"Se incluyen slots desde {_hour_start:02d}:00 hasta "
+                                    f"{_hour_end:02d}:59."
+                                )
                                 with st.expander("Ajustar cantidad sugerida",expanded=False):
                                     _audit_percent=st.slider(
                                         "Porcentaje máximo por hora",5,30,20,1,
@@ -5828,7 +5844,7 @@ if _tab_active(o):
                                 if "Puntaje selección" in _queue.columns:
                                     _queue=_queue.sort_values(["Puntaje selección","Número de pedido"],ascending=[False,True])
                                 if _queue.empty and _queue_mode=="Sugeridos primero" and not _available.empty:
-                                    st.info("No hay alertas prioritarias para esta hora. Cambia a «Todos los pendientes» para revisar el resto.")
+                                    st.info("No hay alertas prioritarias en el horario seleccionado. Cambia a «Todos los pendientes» para revisar el resto.")
                                 if _bad_time_orders:
                                     st.caption(f"{_bad_time_orders:,} pedidos no tienen una hora reconocible y no entran en la lista.")
                                 if not _coverage_summary.empty:
